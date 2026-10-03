@@ -512,6 +512,9 @@ def summarize(wf: dict[str, Any]) -> dict[str, Any]:
 TRACE_READ_S = 5.0  # 每次最多讀幾秒的追蹤串流
 TRACE_IDLE_S = 1.5  # 這麼久沒有新資料就當作已讀到最新
 TRACE_TAIL_BYTES = 256 * 1024  # 只需要最後的事件，保留尾端就好
+# 讀到這麼新（秒）的事件就代表已追上目前進度，不必等串流的新資料。要比事件間隔短，否則 epoch 剛開始時
+# 第一段資料就算「新」，會漏掉後面的步數；步數間隔較長時由 TRACE_IDLE_S 停止
+TRACE_FRESH_S = 3
 
 
 def _parse_time(value: str | None) -> float | None:
@@ -523,21 +526,46 @@ def _parse_time(value: str | None) -> float | None:
         return None
 
 
+def _trace_access(url: str) -> tuple[bool, bool]:
+    """追蹤串流（可以讀, 要不要帶金鑰）。Civitai 會把串流放在別的子網域（實測 orchestration-new.civitai.com，
+    不需要金鑰）：同網域的 https 網址不帶金鑰讀取，金鑰只送給設定的 orchestration 主機，其他網址不讀。"""
+    u, orch = httpx.URL(url), httpx.URL(settings.civitai_orchestration_url)
+    if u.host == orch.host:
+        return True, True
+    parts = orch.host.split(".")
+    domain = ".".join(parts[1:]) if len(parts) >= 3 and not orch.host.replace(".", "").isdigit() else ""
+    return bool(domain and u.scheme == "https" and u.host.endswith("." + domain)), False
+
+
+def _caught_up(buf: bytearray) -> bool:
+    """最後一個完整事件的時間（t，毫秒）已經是剛剛：歷史事件讀完了。"""
+    end = buf.rfind(b"\n")
+    if end <= 0:
+        return False
+    try:
+        ts = json.loads(bytes(buf[buf.rfind(b"\n", 0, end) + 1:end])).get("t")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(ts, (int, float)) and time.time() - ts / 1000 < TRACE_FRESH_S
+
+
 def _read_trace(url: str) -> list[dict[str, Any]]:
     """讀取 epoch 的即時追蹤（trace: "events" 的 NDJSON）。串流在 epoch 訓練期間不會結束，讀到暫時沒有新資料就停。"""
-    if httpx.URL(url).host != httpx.URL(settings.civitai_orchestration_url).host:
-        return []  # 金鑰只送給 Civitai 的 orchestration 主機
+    allowed, with_key = _trace_access(url)
+    if not allowed:
+        return []
     buf = bytearray()
     deadline = time.monotonic() + TRACE_READ_S
     try:
-        with _client() as c, c.stream("GET", url, timeout=httpx.Timeout(15, read=TRACE_IDLE_S)) as r:
+        client = _client() if with_key else httpx.Client(timeout=120)
+        with client as c, c.stream("GET", url, timeout=httpx.Timeout(15, read=TRACE_IDLE_S)) as r:
             if r.status_code != 200:  # 404：worker 還沒寫第一行
                 return []
             for chunk in r.iter_bytes():
                 buf += chunk
                 if len(buf) > 2 * TRACE_TAIL_BYTES:
                     del buf[:-TRACE_TAIL_BYTES]
-                if time.monotonic() > deadline:
+                if time.monotonic() > deadline or _caught_up(buf):
                     break
     except httpx.HTTPError:  # 讀取逾時代表目前沒有新資料，已讀到的仍可用
         pass

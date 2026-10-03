@@ -1378,7 +1378,8 @@ function civitaiProgressHTML(run) {
   const pr = (run.summary || {}).progress;
   if (!CIVITAI_ACTIVE.includes(civitaiRunStatus(run)) || !pr) return '';
   const phases = { loading_base_model: t('civitai.ph_loading_base_model'), creating_session: t('civitai.ph_creating_session'),
-    copying_previous_epoch: t('civitai.ph_copying_previous_epoch'), running: t('civitai.ph_running'), uploading: t('civitai.ph_uploading') };
+    copying_previous_epoch: t('civitai.ph_copying_previous_epoch'), running: t('civitai.ph_running'), training: t('civitai.ph_running'),
+    uploading: t('civitai.ph_uploading') };
   const parts = [];
   if (pr.stage === 'queued') {
     parts.push(pr.queue_ahead != null ? t('civitai.queue_ahead', { n: pr.queue_ahead }) : t('civitai.queue_waiting'));
