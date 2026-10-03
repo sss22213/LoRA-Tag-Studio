@@ -1,0 +1,8 @@
+data/
+import/
+models/
+.env
+.git/
+**/__pycache__/
+*.pyc
+*.zip

@@ -1,0 +1,339 @@
+# LoRA Tag Studio
+
+[English](README.md) | **繁體中文**
+
+自架的 LoRA 訓練資料集工具：上傳圖片或整個資料夾，自動產生標註（WD14 的 Danbooru 標籤，加上視覺語言模型寫的自然語言描述），在網頁上檢查、修改後，匯出 Civitai、kohya_ss 或 Hugging Face 可以直接訓練的資料集，也可以直接送到 Civitai 雲端訓練。
+
+- **依底模給出正確的標註方式**：SD1.5（動漫 / 寫實）、SDXL、Pony V6、Illustrious、NoobAI、Animagine、Anima、FLUX.1 各有不同的 caption 格式、標籤順序、分級標籤、品質標籤與訓練建議。
+- **兩種標註器**：WD14（SmilingWolf v3，ONNX，CPU / GPU）產生 Danbooru 標籤；VLM（Ollama / JoyCaption / Claude / 任何 OpenAI 相容端點）產生自然語言描述，也可以用 JoyCaption 的 Danbooru 模式補充或取代標籤。
+- **支援 NSFW**：WD14 完整輸出 NSFW 標籤、各底模分級標籤自動換算、VLM 露骨描述模式、可選的無審查 JoyCaption 服務。
+- **WebUI**：拖放上傳資料夾 / zip、圖庫篩選、標籤編輯（拖曳排序、自動完成）、標籤統計、批次加入 / 移除 / 取代、角色特徵修剪、黑名單。
+- **直接送到 Civitai 雲端訓練**：上傳圖片與 caption、試算 Buzz、確認後開始訓練、查看進度，並下載每個 epoch 的 LoRA（Civitai Orchestration API）。
+- **給其他 LLM 使用**：REST API（OpenAPI 規格可直接當 tool server）＋ MCP 伺服器（Claude Desktop / Claude Code / Cursor / Open WebUI）。
+- **多國語言**：WebUI、錯誤訊息、標註指南與匯出的 README 支援繁體中文、English、日本語、한국어、简体中文，依瀏覽器語言自動切換，右上角可手動選擇。
+
+---
+
+## 需求
+
+- Docker 與 Docker Compose v2。
+- NVIDIA GPU（選用）：[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) 與驅動 ≥ 580（onnxruntime-gpu 1.30 為 CUDA 13 版本，支援 RTX 50 系列）。
+- 模型第一次使用時才下載，需要的空間：WD14 eva02-large 約 1.2GB、Ollama `qwen2.5vl:7b` 約 6GB、JoyCaption 約 17GB。
+- JoyCaption 約需 17GB VRAM（bf16）。
+
+## 快速開始
+
+```bash
+git clone https://github.com/sss22213/LoRA-Tag-Studio.git
+cd LoRA-Tag-Studio
+cp .env.example .env          # 視需要修改，各變數說明見「設定」
+docker compose up -d --build  # CPU 版
+```
+
+開啟 <http://localhost:7870>。第一次標註時會自動下載 WD14 模型，存在 `models` volume。
+
+| 組合 | 指令 |
+|---|---|
+| CPU，只用 WD14 標籤 | `docker compose up -d --build` |
+| CPU + Ollama 自然語言描述 | `docker compose --profile vlm up -d --build` |
+| NVIDIA GPU + Ollama | `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile vlm up -d --build` |
+| NVIDIA GPU + JoyCaption（NSFW） | `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d --build`（並在 `.env` 改 `VLM_*` 三行，見 [NSFW](#nsfw)） |
+
+> 也可以在 `.env` 設定 `COMPOSE_FILE` / `COMPOSE_PROFILES`，之後只要 `docker compose up -d`。
+
+`--profile vlm` 會啟動 Ollama 並自動下載 `VLM_MODEL`（預設 `qwen2.5vl:7b`）。想換模型：
+
+```bash
+docker compose exec ollama ollama pull qwen2.5vl:32b   # 並把 .env 的 VLM_MODEL 改成同名
+```
+
+---
+
+## 使用流程
+
+1. **建立專案**：選擇目標底模、LoRA 類型（角色 / 畫風 / 概念）、trigger word。設定會自動套用該底模的建議值。
+2. **上傳**：拖放圖片或整個資料夾、zip 皆可；同名 `.txt` 會被當作既有 caption 匯入（方便修改舊資料集）。
+   大量圖片可放到 `./import/<資料夾>`，再用「更多匯入 → 從伺服器資料夾匯入」。
+3. **標註**：按「▶ 標註未完成」。WD14 產生標籤，natural / hybrid 模式再由 VLM 產生描述。
+4. **檢查與修正**
+   - 點圖片開啟編輯器：× 刪除標籤、拖曳排序、Enter 新增、← → 換張，自動儲存。
+   - 「標籤統計」：看全資料集的標籤頻率，一鍵全部移除 / 取代 / 加入黑名單。
+   - Shift / Ctrl + 點擊多選 → 批次加標籤、移除、重新標註。
+   - 修改門檻或修剪群組後，用「套用到現有 ▾ → 重新套用門檻 + 修剪 + 黑名單」直接從 WD14 原始分數重建標籤（不需重新推論）。
+5. **匯出**：「⬇ 匯出資料集」→ Civitai zip。到 Civitai → Train a LoRA → Dataset 上傳 zip，caption 會一併帶入，底模選擇匯出視窗提示的選項。
+   也可匯出 kohya_ss 資料夾結構（`img/10_trigger class/`）或 Hugging Face `metadata.jsonl`。
+
+---
+
+## 各底模的標註方式
+
+| 底模 | Caption 風格 | 特殊標籤 | Clip skip |
+|---|---|---|---|
+| SD 1.5 動漫 | Danbooru 標籤，≤75 tokens | NSFW 圖加 `nsfw` | 2 |
+| SD 1.5 寫實 | 短句 + 關鍵標籤（`ohwx woman, a photo of …`） | `nsfw` | 1 |
+| SDXL / 寫實 XL | 1–2 句自然語言 + 少量標籤 | `nsfw` | – |
+| Pony V6 XL | Danbooru 標籤 | `source_anime`、`rating_safe/questionable/explicit`；生成時 `score_9, score_8_up, …` | 2 |
+| Illustrious XL | Danbooru 標籤：人數 → 角色 → 作品 → 畫師 → 一般 | `general/sensitive/nsfw/explicit`（選用） | 2 |
+| NoobAI-XL | 同 Illustrious，可含 e621 標籤 | `general/sensitive/nsfw/explicit` | 2 |
+| Animagine XL 3.1 / 4.0 | `1girl, 角色, 作品, rating, 其餘` | `safe/sensitive/nsfw/explicit` | – |
+| Anima（Base / Aesthetic / Turbo） | Danbooru 標籤（小寫、空格；也可句子或混合）：分級 → 人數 → 角色 → 作品 → @畫師 → 一般 | `safe/sensitive/nsfw/explicit`（放最前面）；畫師要加 `@` | – |
+| FLUX.1 dev | 詳細自然語言（2–5 句），trigger 當主詞，不打亂 | – | – |
+
+完整說明（範例 caption、Civitai 訓練參數、A1111 生成 prompt 範本、NSFW 注意事項）在 WebUI 的「底模標註指南」，或 `GET /api/profiles/<key>/guide.md`。
+
+> **Anima**：原版 A1111 無法使用，生成請用 ComfyUI 或 Forge Neo。訓練請用 Anima-Base，搭配 sd-scripts（`anima_train_network.py`，匯出選 kohya 格式）或 diffusion-pipe；Civitai 上傳時底模選「Anima」。sd-scripts 的範例使用 `--cache_text_encoder_outputs`，這時不能 `--shuffle_caption`，所以此底模的建議是不打亂 caption。
+
+**LoRA 類型與修剪**
+
+- **角色**：預設移除髮色、瞳色標籤，讓 trigger 學會這些固定特徵；服裝、表情、動作保留。
+- **畫風**：移除畫風 / 媒材標籤（anime coloring、sketch、watercolor…）與角色名，只描述內容。
+- **概念**：保留全部，手動刪除描述該概念本身的標籤。
+
+---
+
+## NSFW
+
+- WD14 直接輸出 Danbooru 的 NSFW 標籤，不做過濾；分級（general / sensitive / questionable / explicit）會依底模換算成 `rating_explicit`、`nsfw`、`explicit` 等寫法（「加入分級標籤」開關）。
+- 想做成 SFW 版本：在「修剪 / 黑名單」勾選「NSFW 標籤」修剪群組。有碼 / 無碼標籤（`censored`、`mosaic censoring`、`uncensored`）預設保留，生成時才能控制。
+- 自然語言描述：勾選「NSFW 露骨描述」並使用無審查 VLM。建議 `--profile joycaption`（JoyCaption Beta One，8B，bf16 約需 17GB VRAM），`.env` 設定：
+  ```
+  VLM_BACKEND=openai
+  VLM_BASE_URL=http://joycaption:8000/v1   # compose 服務名稱 + vLLM 埠
+  VLM_MODEL=joycaption                     # 對應 --served-model-name
+  VLM_API_KEY=EMPTY                        # vLLM 預設不驗證，填任意值
+  ```
+  並把 Ollama 那三行註解掉。第一次啟動會下載約 17GB 模型，`docker compose logs -f joycaption` 出現 `Application startup complete` 才可使用；右上角 VLM 狀態會轉為可用。
+  JoyCaption 服務由 `docker/joycaption.Dockerfile` 建置：以 `vllm/vllm-openai:v0.30.0` 為基底並固定 transformers 5.16.1（0.30.0 內附的 5.17 會讓 Llava 模型無法載入，見 vllm-project/vllm#58755）。
+  Claude 與多數商用模型會拒絕描述露骨內容；被拒答時該圖會標記錯誤並保留 WD14 標籤。
+- WebUI 預設模糊 NSFW / 露骨縮圖（工具列的「模糊 NSFW」可關閉）。
+- 依 Civitai 政策，**未成年特徵標籤（loli、shota、child…）與性內容同時出現的圖片會被標記並自動排除匯出**。
+
+## 白色色塊（遮擋其他人的白色矩形）
+
+為了讓畫面只剩一個人而用白色矩形蓋掉其他人時，caption 沒寫到的色塊會被學進 LoRA，生成時也會畫出來。
+
+- **偵測**：匯入時自動偵測；舊專案用圖庫工具列的「▭ 白色色塊」→「偵測白色色塊」補偵測一次。有色塊的圖片卡片右上角會顯示 ▭。
+- **一鍵加入關鍵字**：同一個選單的「一鍵加入關鍵字」，或設定 →「標籤格式 / 分級」的「有白色色塊的圖片加上關鍵字」。有色塊的圖片會在 caption 最後加上關鍵字（預設 `white rectangle`，可修改）；因為是在組 caption 時加上，重新標註也不會消失，關閉後立即恢復。訓練完成後，生成時把這個關鍵字放進負面提示即可去掉色塊。
+- **找出、批次處理**：「只顯示有色塊的圖」、「選取有色塊的圖」（再用批次工具列加標籤或刪除）、「刪除有色塊的圖」。
+- **誤判修正**：編輯器上方的「▭ 有白色色塊／沒有白色色塊」按鈕可手動標記，↺ 改回偵測結果；重新偵測會保留手動標記。
+- 送 Civitai 訓練時，範例提示會去掉這個關鍵字，並把它加進範例的負面提示。
+- 偵測方式：找出幾乎純白（RGB ≥ 248）、面積至少 4% 的矩形；有紋理的白牆、過曝窗戶通常不會被當成色塊。
+- API：`POST /api/projects/{id}/blocks/scan`；MCP：`detect_white_blocks`；設定 `block_tag_auto` / `block_tag`。
+
+## 用 VLM 產生 Danbooru 標籤（JoyCaption）
+
+JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danbooru 標籤（WD14 / VLM）」→「用 VLM 產生 Danbooru 標籤」：
+
+| 模式 | 結果 |
+|---|---|
+| 關閉（預設） | 只用 WD14 |
+| 補充 | WD14 標籤 + VLM 的角色 / 作品 / 畫師標籤 |
+| 合併 | WD14 + VLM 的全部標籤 |
+| 只用 VLM | 只用 VLM 的標籤，WD14 只負責分級（safe / nsfw…） |
+
+- 每張圖會多一次 VLM 呼叫，與「啟用 VLM 描述」無關；VLM 的原始輸出存在資料庫，調整模式或門檻後用「套用到現有 → 重新套用門檻 + 修剪 + 黑名單」即可，不必再呼叫 VLM。
+- **VLM 常編出不存在的角色名與作品名**（實測香風智乃的動畫截圖被判成數個不存在的角色）。WD14 已認出角色、而 VLM 判斷不同時，會自動忽略 VLM 的角色 / 作品標籤；「只用 VLM」模式不做這個檢查。
+- 畫師標籤預設不採用（「採用 VLM 判斷的畫師標籤」）；Anima 會自動加上 `@`。
+- VLM 標籤沒有信心分數，門檻只套用在 WD14。動漫圖通常仍以 WD14 為主；VLM 標籤適合 WD14 不認得的新角色或冷門概念。
+- REST `POST /api/quick-tag(/json)` 與 MCP `quick_tag_image` 可帶 `vlm_tags`；專案設定可用 `update_project_settings` 修改。
+
+## 送到 Civitai 雲端訓練
+
+用 Civitai 的 [Orchestration API](https://developer.civitai.com/orchestration/) 在雲端訓練，不必自己準備 GPU：
+
+1. 在 civitai.com → 帳號設定 → API Keys 建立金鑰，填入 `.env` 的 `CIVITAI_API_KEY`，重建 app 容器。金鑰只留在伺服器端，不會送到瀏覽器。
+2. 專案頁按「☁ Civitai 訓練」，選擇訓練類型；表單只顯示該類型有的參數，並直接填入該類型的數值（送出的就是畫面上的數字），即時估算 Buzz。
+3. 「上傳並試算費用」：圖片以 JPEG 上傳（每張都經過 Civitai 內容審核，被擋下的會列出來），接著用 `whatif` 試算 Buzz，**不會扣款**。
+4. 按「確認開始訓練」才會送出並扣 Buzz；之後在「訓練紀錄」看進度、審核結果、每個 epoch 的 LoRA 下載連結與範例圖，也可以取消。
+
+**訓練進度**：首頁上方的「Civitai 雲端訓練」列出所有專案中正在訓練的任務（以及 24 小時內結束的），專案卡片與專案頁的 Civitai 按鈕也會顯示百分比；點進去會直接打開該專案的訓練紀錄。每 15 秒更新：
+
+- 排隊中：前面還有幾個任務、預計開始時間。
+- 訓練中：百分比、目前階段（載入底模、訓練、上傳…）、完成的 epoch 與剩下幾個、目前步數與剩下幾步、每步秒數、已進行時間、預估剩餘時間與完成時刻。
+- 步數與每步秒數來自 Civitai 的即時追蹤（送出時開啟 `trace: "events"`），剩餘時間 ≈ 剩餘步數 × 每步秒數，epoch 之間的範例圖生成與上傳可能再多一點時間；沒有追蹤資料時改用完成的 epoch 數或 Civitai 的估計。
+- API：`GET /api/civitai/active`；MCP：`list_active_civitai_trainings`，`get_civitai_training` 也包含 `progress`。
+
+**訓練類型**：Civitai AI Toolkit 支援、可以用圖片資料集訓練的全部 26 種。
+
+| 分類 | 訓練類型 |
+|---|---|
+| 圖片 | SD 1.5、SDXL、Anima、Flux.1 dev / schnell、Flux.2 Klein 4B / 9B、Chroma1-HD、ERNIE-Image、Qwen-Image（latest / 2509）、Qwen Image 2.1、Z-Image Turbo / Base、Boogu、HiDream O1、Ideogram 4、Krea 2、Mage-Flow、Ming |
+| 影片（可用圖片訓練） | LTX-2、LTX-2.3、LTX-2.5、Wan 2.1 / 2.2（Civitai 標示為預覽版）、MiniMax H3 |
+
+- 預設依專案底模選擇：SD 1.5 → `sd1`；SDXL / Pony / Illustrious / NoobAI / Animagine → `sdxl`，並分別用 SDXL 1.0、Pony Diffusion V6 XL、Illustrious-XL v0.1、NoobAI-XL eps 1.1、Animagine XL 4.0 當訓練底模；Anima → `anima`（Anima-Base v1.0）；FLUX.1 dev → `flux1-dev`。
+- 數值與價格取自 [Civitai 文件](https://developer.civitai.com/orchestration/recipes/)；文件沒列出的類型（Anima、Qwen 2.1、Boogu、HiDream O1、Ideogram 4、Krea 2、Mage-Flow、Ming、LTX-2.5、MiniMax H3）填入 AI Toolkit 的通用數值，費用以試算為準。
+- 音樂類型（ACE-Step、YuE2）需要音訊資料，這個工具只處理圖片，不支援。
+
+**參數欄位**（依 Civitai 規格 `v2-consumers.json`，各類型不同）：
+
+| 參數 | 適用類型 |
+|---|---|
+| 步數、epochs、學習率、學習率排程、optimizer、network dim / alpha、noise offset、flip、shuffle / keep tokens、接續訓練的 LoRA、範例提示 / 負面提示 / CFG / LoRA 強度 | 全部 |
+| batch size | 上限 SD 1.5 / SDXL 4；Flux.2 Klein 4B、ERNIE、Z-Image 2；其他固定 1 |
+| 自訂訓練底模 | 只有 SD 1.5、SDXL、Anima（其他類型的底模由 Civitai 固定） |
+| trigger word | SD 1.5、SDXL、Flux.1、Flux.2 Klein、Chroma、Z-Image（其他類型 trigger 寫在每張 caption 開頭） |
+| Min SNR γ、同時訓練文字編碼器、文字編碼器學習率 | 只有 SD 1.5、SDXL（其他類型文件寫明不訓練文字編碼器） |
+
+- 預設值：學習率排程 cosine；noise offset SDXL 0.1、其他 0；Min SNR γ 5；文字編碼器學習率 5e-5；範例 LoRA 強度 1.0；範例 CFG 用 Civitai 生成 API 對該底模的預設（SDXL 7、Flux.1 3.5、Klein 5、Qwen 2.5、Anima 4…），Flux.1 schnell 與 MiniMax H3 沒有公開數值，留空由 Civitai 決定。
+- 訓練底模與接續訓練的 LoRA 可填 AIR、模型版本 ID 或含 `modelVersionId` 的 civitai.com 網址（用 Site API 解析）。會檢查底模的類型是否相符；LoRA 會檢查是不是 LoRA，以及 SD / Flux / Klein / Chroma / ERNIE / Qwen / Z-Image / Anima 是否同一種底模（Wan / LTX 在網站上的名稱不同，交給 Civitai 試算時驗證）。
+- Civitai 網站訓練器的 resolution、repeats、clip skip 等設定不在 API 裡，無法指定；訓練解析度由 Civitai 依底模決定。Flux.2 Klein 的編輯訓練（`isEditTraining`）需要成對的參考圖，不支援。
+- 只上傳匯出時也會包含的圖片（依 Civitai 政策排除「未成年特徵 + 性內容」）；caption 與匯出的 `.txt` 相同，shuffle / keep tokens 預設依標註設定帶入。
+
+**上傳與重新訓練**
+
+- 已上傳的圖片以圖片內容辨識，會記住約 25 天，重新送訓練時不必再上傳。caption 是隨訓練請求送出的，所以**只改標籤不需要重傳**；換了圖片、改了「上傳圖片長邊」、換了金鑰才會重傳，Civitai 不認得時也會自動重傳。
+- 「強制重新上傳所有圖片」（API / MCP：`force_upload`）會全部重傳，例如圖片檔在系統外被改過、或想讓 Civitai 重新審核時。
+- **用相同參數重新訓練**：訓練紀錄每一筆都有這個按鈕，會把那次的訓練參數、範例提示與上傳設定填回表單（標籤用目前的；排隊優先度維持表單的選擇），一樣要試算、確認後才送出。API / MCP 的訓練狀態裡 `request` 就是那次的參數。
+
+**排隊優先度**：「一般」等於 Civitai 網站訓練器的 High Priority 開關（這裡的預設）；「低」是網站沒開時的值，API 不指定時也是低；「高」只有 API 能選，效果依帳號等級。實測試算的價格三者相同，實際價格以試算為準。
+
+**費用、取消與退款**
+
+- 試算可能已套用 Civitai 的折扣，這時表單會同時顯示折扣前的原價：實際扣款可能以原價結算（送出時預扣、結束時追加）。訓練紀錄顯示的是 Civitai 交易紀錄的實際扣款。
+- 取消訓練送出的是 `status: canceled`（與 Civitai 網站相同），訓練會停止且無法接續。取消是非同步的：Civitai 要等訓練機器停下來才會改成「已取消」（可能要幾分鐘），這段時間會顯示「取消中」。Civitai 文件只說明還沒開始的任務可能退款；取消後訓練紀錄會顯示實際退回的 Buzz（結束後一小時內持續查詢）。
+- 訓練費用依 Civitai 當下的價格（例如 SDXL / SD1 每步 0.2 Buzz + 每個 epoch 10 Buzz，且不低於預設配置的 80%），以試算結果為準。
+
+**API / MCP**：`GET /api/civitai` 列出每個類型的 `fields`、`defaults`、`max_batch`；送出該類型沒有的參數會回錯誤。MCP 流程：`get_civitai_training_types` → `prepare_civitai_training`（可帶 `training_type`、`priority`、`force_upload` 與上表的參數）→ `get_civitai_preparation`（取得試算費用）→ 使用者確認費用後才 `submit_civitai_training` → `get_civitai_training`。
+
+---
+
+## 給其他 LLM 使用
+
+WebUI 的「API / MCP」頁面有可直接複製的設定。
+
+### MCP
+
+Streamable HTTP 端點：`http://<host>:7870/mcp`
+
+```bash
+# Claude Code
+claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
+```
+
+```jsonc
+// Cursor / VS Code / 其他支援 HTTP 的客戶端
+{ "mcpServers": { "lora-tag-studio": { "type": "http", "url": "http://localhost:7870/mcp" } } }
+```
+
+共 25 個工具：
+
+| 類別 | 工具 |
+|---|---|
+| 底模與快速標註 | `list_profiles`、`get_tagging_guide`、`quick_tag_image` |
+| 專案與匯入 | `list_projects`、`create_project`、`get_project`、`update_project_settings`、`add_images_from_urls`、`list_server_import_folders`、`import_server_folder` |
+| 標註與編輯 | `start_tagging`、`get_job_status`、`list_captions`、`get_image`、`update_image_caption`、`bulk_edit_tags`、`get_tag_stats`、`detect_white_blocks` |
+| 匯出 | `export_dataset` |
+| Civitai 訓練 | `get_civitai_training_types`、`prepare_civitai_training`、`get_civitai_preparation`、`submit_civitai_training`、`get_civitai_training`、`list_active_civitai_trainings` |
+
+### REST / OpenAPI
+
+- Swagger UI：`/docs`，規格：`/openapi.json`（可直接加到 Open WebUI 的 OpenAPI Tool Server、GPTs Actions 等）
+- 給 LLM 閱讀的說明：`/llms.txt`
+
+```bash
+# 單張圖片直接產生 caption（不建專案）
+curl -X POST http://localhost:7870/api/quick-tag/json -H "Content-Type: application/json" \
+  -d '{"image_url":"https://example.com/a.png","profile":"pony_v6","trigger":"mychar"}'
+
+# 完整流程
+curl -X POST http://localhost:7870/api/projects -H "Content-Type: application/json" \
+  -d '{"name":"my-char","profile":"illustrious","lora_type":"character","trigger":"mychar"}'
+curl -X POST http://localhost:7870/api/projects/<id>/upload -F "files=@dataset.zip"
+curl -X POST http://localhost:7870/api/projects/<id>/tag -H "Content-Type: application/json" -d '{"only_untagged":true}'
+curl http://localhost:7870/api/jobs/<job_id>
+curl -OJ "http://localhost:7870/api/projects/<id>/export?format=civitai"
+```
+
+設定 `API_KEY` 後，所有 `/api` 與 `/mcp` 請求需帶 `Authorization: Bearer <API_KEY>`（或 `X-API-Key`）；WebUI 會提示輸入並存在 cookie。
+
+**回應語言**：API 的訊息、底模名稱與指南依序採用 `?lang=`、`X-Lang` header、`Accept-Language`，都沒有時用 `DEFAULT_LANG`（預設 `en`）。MCP 使用 `DEFAULT_LANG`，`get_tagging_guide` 另可傳 `language`。可用代碼：`zh-TW`、`en`、`ja`、`ko`、`zh-CN`（`GET /api/i18n` 列出）。
+
+---
+
+## 設定（.env）
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `APP_PORT` | `7870` | 對外埠（避開 A1111 的 7860） |
+| `API_KEY` | 空 | 設定後啟用驗證，對外開放時務必設定 |
+| `PUBLIC_BASE_URL` | 空 | 回傳給 LLM 的下載連結前綴，例如 `http://192.168.1.10:7870` |
+| `DEFAULT_LANG` | `en` | API / MCP 未指定語言時的語言：`zh-TW` / `en` / `ja` / `ko` / `zh-CN`（WebUI 依瀏覽器自動選擇） |
+| `WD14_MODEL` | `SmilingWolf/wd-eva02-large-tagger-v3` | 預設 WD14 模型（專案可個別覆寫） |
+| `ORT_DEVICE` | `auto` | `auto` / `cpu` / `cuda` |
+| `TAG_CONCURRENCY` | `2` | 同時處理的圖片數（使用遠端 VLM 時可調高） |
+| `HF_TOKEN` | 空 | 選填的 Hugging Face token（提高下載速率） |
+| `VLM_BACKEND` | `openai` | `openai`（OpenAI 相容）/ `anthropic` / `none` |
+| `VLM_BASE_URL` / `VLM_MODEL` / `VLM_API_KEY` | Ollama | OpenAI 相容端點設定 |
+| `VLM_TIMEOUT` | `180` | VLM 請求逾時秒數 |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT` | 空 / `claude-opus-5-5` / `low` | `VLM_BACKEND=anthropic` 時使用（已啟用伺服器端 refusal fallback） |
+| `ALLOW_PRIVATE_URLS` | `0` | 「從網址匯入」是否允許內網位址（預設關閉以避免 SSRF） |
+| `CIVITAI_API_KEY` | 空 | Civitai 雲端訓練用的金鑰（只留在伺服器端） |
+| `JOYCAPTION_GPU_UTIL` | `0.7` | vLLM 預先佔用的 VRAM 比例 |
+| `JOYCAPTION_VLLM_IMAGE` / `JOYCAPTION_TRANSFORMERS` | `vllm/vllm-openai:v0.30.0` / `5.16.1` | JoyCaption 的 vLLM 映像檔與 transformers 版本；修改後需 `--build` |
+
+資料位置：`./data`（SQLite、圖片、縮圖、匯出 zip），`./import`（唯讀的伺服器匯入資料夾）。兩者都不會進 git。
+
+---
+
+## 專案結構
+
+```
+app/
+  main.py            FastAPI 進入點、API 金鑰驗證、語言協商、MCP 掛載、/llms.txt
+  i18n.py            語系檔載入、語言協商、翻譯
+  locales/*.json     各語言文字（server：後端 / 指南，ui：WebUI）  ← 翻譯改這裡
+  api.py             REST API
+  mcp_server.py      MCP 工具
+  profiles.py        各底模的預設值、分級對應、標註指南   ← 要新增 / 調整底模改這裡
+  pipeline.py        單張圖片標註流程
+  jobs.py            背景標註佇列
+  services.py        API / MCP 共用邏輯
+  exporter.py        Civitai / kohya / jsonl 匯出
+  civitai.py         送到 Civitai 雲端訓練（Orchestration API）
+  storage.py         上傳、資料夾 / zip 匯入、縮圖
+  db.py              SQLite
+  tagging/
+    wd14.py          WD14 ONNX 推論
+    vlm.py           OpenAI 相容 / Claude 自然語言描述
+    postprocess.py   門檻、排序、修剪群組、黑名單、caption 組合
+    blocks.py        白色色塊（遮擋用的白色矩形）偵測
+web/                 WebUI（純 HTML/CSS/JS，無需建置）
+docker/
+  joycaption.Dockerfile  JoyCaption 用的 vLLM 映像檔
+scripts/
+  check_locales.py   檢查各語系檔的鍵與 {佔位符} 是否與 en.json 一致
+```
+
+## 開發
+
+本機執行（不用 Docker，Python 3.12）：
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt onnxruntime
+DATA_DIR=./data IMPORT_DIR=./import VLM_BACKEND=none uvicorn app.main:app --reload --port 7870
+```
+
+**修改或新增語言**：編輯 `app/locales/<代碼>.json`（缺少的鍵會退回英文），新增語言只要放一個新的 JSON，`_meta.order` 決定選單順序。改完執行 `python3 scripts/check_locales.py`（只需標準函式庫），再重新 `--build`。
+
+---
+
+## 疑難排解
+
+- **VLM 顯示無法連線**：確認有加 `--profile vlm`，且 `docker compose logs ollama-pull` 顯示模型已下載完成。
+- **VLM 回 404**：模型名稱與 `ollama list` 不一致。
+- **GPU 沒有被使用**：右上角顯示「WD14 · CPU」時，確認使用了 `docker-compose.gpu.yml` 並重新 `--build`，以及 `docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi` 能正常執行。
+- **JoyCaption 記憶體不足**：調低 `JOYCAPTION_GPU_UTIL` 或改用較小的 VLM；WD14 GPU 版約佔 1–2GB。
+- **JoyCaption 啟動失敗 `cannot import name 'PixtralRotaryEmbedding'`**：使用了未修正的 `vllm/vllm-openai` 映像檔。確認 `docker-compose.yml` 的 joycaption 使用 `build:`，並執行 `docker compose ... --profile joycaption up -d --build`。
+- **WebUI 顯示 `common.server_unreachable` 之類的鍵名**：映像檔內沒有語系檔（`app/locales/*.json`），重新 `--build`；`docker compose logs app` 啟動時會列出已載入的語言。
+- **caption 超過 75 tokens**：SD1.5 / SDXL 的 CLIP 一次讀 75 tokens，降低「最多標籤數」或提高門檻；kohya 可用 `--max_token_length=225`。
+
+## 注意事項
+
+- 本專案與 Civitai 沒有關係。雲端訓練會扣你自己 Civitai 帳號的 Buzz，確認前請先看試算。
+- 請確認你有權使用拿來訓練的圖片，並遵守所用服務的內容規範。
+- 模型（WD14、JoyCaption、Ollama 的模型）在執行時從原作者處下載，適用各自的授權。
+
+## 授權
+
+[MIT](LICENSE)

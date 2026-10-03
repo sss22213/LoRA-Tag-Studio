@@ -1,0 +1,10 @@
+# onnxruntime 由 Dockerfile 依 ORT_PACKAGE 安裝（CPU: onnxruntime / GPU: onnxruntime-gpu[cuda,cudnn]）
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+pillow==12.3.0
+numpy==2.5.3
+huggingface_hub==2.0.0
+httpx==0.28.1
+anthropic==1.9.0
+mcp==2.2.0

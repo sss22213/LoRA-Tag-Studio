@@ -1,0 +1,18 @@
+# 金鑰與本機設定
+.env
+
+# 執行資料（專案、圖片、資料庫、匯出）與伺服器匯入資料夾
+data/
+import/*
+!import/.gitkeep
+models/
+
+# Python
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 其他
+*.log
+.DS_Store

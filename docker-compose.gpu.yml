@@ -1,0 +1,25 @@
+# NVIDIA GPU 加速（需安裝 NVIDIA Container Toolkit，驅動 >= 580 / CUDA 13）
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile vlm up -d --build
+services:
+  app:
+    build:
+      args:
+        ORT_PACKAGE: onnxruntime-gpu[cuda,cudnn]==1.30.0
+    environment:
+      ORT_DEVICE: ${ORT_DEVICE:-cuda}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,0 +1,100 @@
+name: lora-tag-studio
+
+# 用法：
+#   CPU                     docker compose up -d --build
+#   + Ollama VLM            docker compose --profile vlm up -d --build
+#   + JoyCaption (NSFW VLM) docker compose --profile joycaption up -d --build   （需 NVIDIA GPU）
+#   GPU 加速 WD14 / Ollama   加上 -f docker-compose.yml -f docker-compose.gpu.yml
+#   也可以在 .env 設定 COMPOSE_FILE / COMPOSE_PROFILES，之後只需 docker compose up -d
+
+services:
+  app:
+    build:
+      context: .
+      args:
+        ORT_PACKAGE: ${ORT_PACKAGE:-onnxruntime==1.30.0}
+    image: lora-tag-studio:latest
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-7870}:7870"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # 讓容器連到主機上的 Ollama / LM Studio
+    environment:
+      API_KEY: ${API_KEY:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      DEFAULT_LANG: ${DEFAULT_LANG:-en}
+      WD14_MODEL: ${WD14_MODEL:-SmilingWolf/wd-eva02-large-tagger-v3}
+      ORT_DEVICE: ${ORT_DEVICE:-auto}
+      TAG_CONCURRENCY: ${TAG_CONCURRENCY:-2}
+      VLM_BACKEND: ${VLM_BACKEND:-openai}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://ollama:11434/v1}
+      VLM_MODEL: ${VLM_MODEL:-qwen2.5vl:7b}
+      VLM_API_KEY: ${VLM_API_KEY:-ollama}
+      VLM_TIMEOUT: ${VLM_TIMEOUT:-180}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+      ANTHROPIC_EFFORT: ${ANTHROPIC_EFFORT:-low}
+      HF_TOKEN: ${HF_TOKEN:-}
+      ALLOW_PRIVATE_URLS: ${ALLOW_PRIVATE_URLS:-0}
+      CIVITAI_API_KEY: ${CIVITAI_API_KEY:-}
+    volumes:
+      - ./data:/data              # 專案、圖片、標註資料庫、匯出 zip
+      - ./import:/import:ro       # 伺服器資料夾匯入（把圖片資料夾放這裡）
+      - models:/models            # WD14 模型快取
+
+  # ---------------------------------------------------------------- 本機 VLM（一般用途）
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["vlm"]
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+    volumes:
+      - ollama:/root/.ollama
+
+  # 首次啟動時自動下載 VLM_MODEL（完成後自動結束）
+  ollama-pull:
+    image: ollama/ollama:latest
+    profiles: ["vlm"]
+    depends_on: [ollama]
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "until ollama list >/dev/null 2>&1; do sleep 2; done; ollama pull ${VLM_MODEL:-qwen2.5vl:7b}"]
+
+  # ---------------------------------------------------------------- JoyCaption（無審查，適合 NSFW 資料集）
+  # 使用時請在 .env 設定：
+  #   VLM_BASE_URL=http://joycaption:8000/v1  VLM_MODEL=joycaption  VLM_API_KEY=EMPTY
+  joycaption:
+    build:
+      context: ./docker
+      dockerfile: joycaption.Dockerfile
+      args:
+        VLLM_IMAGE: ${JOYCAPTION_VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}
+        TRANSFORMERS_VERSION: ${JOYCAPTION_TRANSFORMERS:-5.16.1}
+    profiles: ["joycaption"]
+    restart: unless-stopped
+    ipc: host
+    entrypoint: ["vllm", "serve"]
+    command:
+      - fancyfeast/llama-joycaption-beta-one-hf-llava
+      - --served-model-name=joycaption
+      - --max-model-len=4096
+      - --gpu-memory-utilization=${JOYCAPTION_GPU_UTIL:-0.7}
+      - --enable-prefix-caching
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  models:
+  ollama:
+  hf-cache:
