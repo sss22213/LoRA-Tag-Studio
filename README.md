@@ -8,6 +8,7 @@ A self-hosted tool that turns a folder of images into a LoRA training dataset. I
 - **Two taggers**: WD14 (SmilingWolf v3, ONNX, CPU or GPU) for Danbooru tags, and a VLM (Ollama, JoyCaption, Claude or any OpenAI-compatible endpoint) for natural-language descriptions. JoyCaption's Danbooru mode can also add to or replace the WD14 tags.
 - **NSFW support**: WD14 outputs NSFW tags unfiltered, rating tags are converted per base model, there is an explicit-description mode for VLMs, and an optional uncensored JoyCaption service.
 - **Web UI**: drag-and-drop folders or zips, gallery filters, a tag editor (drag to reorder, autocomplete), tag statistics, bulk add / remove / replace, trait pruning for character LoRAs, and a blacklist.
+- **waifu2x upscaling and denoising**: images whose short side is too small are upscaled before training, so the LoRA does not learn blur, and JPEG noise can be removed without changing the size. Originals are kept and can be restored.
 - **Civitai cloud training**: upload images and captions, get a Buzz estimate, start training after you confirm, follow the progress, and download the LoRA of every epoch (Civitai Orchestration API).
 - **Usable by other LLMs**: a REST API (its OpenAPI spec works as a tool server) and an MCP server (Claude Desktop, Claude Code, Cursor, Open WebUI).
 - **Five languages**: the web UI, error messages, tagging guides and exported READMEs are available in English, 繁體中文, 日本語, 한국어 and 简体中文. The UI follows the browser language and can be switched in the top-right corner.
@@ -46,6 +47,17 @@ Open <http://localhost:7870>. The WD14 model is downloaded the first time you ta
 ```bash
 docker compose exec ollama ollama pull qwen2.5vl:32b   # then set VLM_MODEL in .env to the same name
 ```
+
+### Stopping
+
+```bash
+docker compose --profile vlm --profile joycaption down
+```
+
+- Include the profiles even if you only started one of them; naming a profile that is not running does no harm. Without them, `down` skips the Ollama / JoyCaption containers and stops with `Network lora-tag-studio_default  Resource is still in use`.
+- To stop only one service and keep the rest running: `docker compose --profile joycaption stop joycaption`. Start it again with `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption`. To free JoyCaption's VRAM without stopping it, see [Freeing VRAM](#freeing-vram).
+- **Do not add `-v`**: it deletes the `models`, `ollama` and `hf-cache` volumes, so WD14, the Ollama model and JoyCaption (about 17 GB) have to be downloaded again. Your projects in `./data` are not affected by `down`.
+- If `.env` sets `COMPOSE_PROFILES`, a plain `docker compose down` covers those profiles.
 
 ---
 
@@ -102,7 +114,7 @@ The full guide for each base model (example captions, Civitai training settings,
   VLM_MODEL=joycaption                     # matches --served-model-name
   VLM_API_KEY=EMPTY                        # vLLM does not check the key by default
   ```
-  Comment out the three Ollama lines. The first start downloads about 17 GB; JoyCaption is ready when `docker compose logs -f joycaption` shows `Application startup complete`, and the VLM status in the top-right corner turns available.
+  Comment out the three Ollama lines. The first start downloads about 17 GB; JoyCaption is ready when `docker compose --profile joycaption logs -f joycaption` shows `Application startup complete`, and the VLM status in the top-right corner turns available.
   The JoyCaption image is built from `docker/joycaption.Dockerfile`: `vllm/vllm-openai:v0.30.0` with transformers pinned to 5.16.1, because the bundled 5.17 breaks loading Llava models (vllm-project/vllm#58755).
   Claude and most commercial models refuse to describe explicit content; a refused image is marked with an error and keeps its WD14 tags.
 - NSFW and explicit thumbnails are blurred by default ("Blur NSFW" in the toolbar).
@@ -120,6 +132,18 @@ If you covered other people with white rectangles so that only one person is lef
 - How it works: it looks for almost pure white (RGB ≥ 248) rectangles covering at least 4% of the image; textured white walls and blown-out windows are usually not detected.
 - API: `POST /api/projects/{id}/blocks/scan`; MCP: `detect_white_blocks`; settings `block_tag_auto` / `block_tag`.
 
+## Upscaling and denoising (waifu2x)
+
+Trainers enlarge images whose short side is below the training resolution (about 1024 px for SDXL / Illustrious) with a plain resize. That blurs them, and the LoRA learns the blur. JPEG compression noise is learned too. The "⤢ Upscale / denoise" button in the gallery toolbar fixes both with waifu2x; pick "Upscale low-resolution images" or "Denoise only (keep the size)" at the top of the dialog. The number on the button is how many images are below the upscale threshold; processed images show ⤢2x / ⤢4x or ✧ denoised on their card.
+
+- **Which images**: upscaling picks every image not processed yet whose short side is below 1024 px (you can change the threshold). Denoising picks every JPEG / lossy WebP not processed yet, whatever its size, or with "All images not processed yet (including PNG)" the PNGs too: saving as PNG adds no noise, but a PNG can still carry noise from video compression or an earlier JPEG. To pick images yourself, select them and use the button in the bulk bar, or "Upscale…" in the editor. Images with a short side below 384 px are marked "too small": upscaling cannot bring their detail back, so removing them is usually better.
+- **Options**: model `art` (illustrations / anime, recommended), `art_scan` (scans with halftone or paper texture) or `photo`. When upscaling, noise reduction "Auto" uses level 1 for JPEG and lossy WebP and none otherwise, and scale "Auto" uses 2x, or 4x when 2x still stays below the threshold. When only denoising, level 1 suits ordinary JPEGs; levels 2–3 are for clearly blocky images and also smooth away fine lines and textures.
+- **Originals are kept**: the result is saved as PNG and the original goes to `data/projects/<id>/originals/`. "Restore original" (editor or bulk bar) or "Restore all originals" (in the dialog) puts it back. Upscaling again always starts from the original, and importing the original again is recognized as a duplicate.
+- Tags do not need to be redone (WD14 looks at a 448 px copy anyway). White blocks are re-detected; manual marks are kept. The upscaled file has a new content hash, so the next Civitai training uploads the new version.
+- **Models**: the waifu2x `swin_unet` ONNX models from [nunif](https://github.com/nagadomi/nunif) (by nagadomi, MIT). On first use, only the models a job needs are read straight out of the release zip (about 17–19 MB each) into the `models` volume. They run on the same onnxruntime as WD14, so no PyTorch or Vulkan is needed.
+- **Speed and VRAM**: measured on an RTX 5090, 960×540 → 1920×1080 takes about 0.3 s per image; on CPU it takes about 6–9 s. Each loaded model uses about 0.6–0.8 GB of VRAM, plus about 0.5 GB for CUDA itself, and everything is freed when the job ends. Upscaling and tagging jobs run one after the other, never at the same time.
+- API: `POST /api/projects/{id}/upscale` (`"scale": 1` = denoise only), `POST /api/projects/{id}/upscale/restore`; MCP: `upscale_images`, `restore_upscaled_images`.
+
 ## Danbooru tags from a VLM (JoyCaption)
 
 JoyCaption Beta One has a built-in "Danbooru tag list" mode. Settings → "Danbooru tags (WD14 / VLM)" → "Danbooru tags from the VLM":
@@ -136,6 +160,19 @@ JoyCaption Beta One has a built-in "Danbooru tag list" mode. Settings → "Danbo
 - Artist tags from the VLM are off by default ("Use artist tags guessed by the VLM"); for Anima the `@` prefix is added automatically.
 - VLM tags have no confidence scores, so thresholds only apply to WD14. For anime images WD14 is usually the better source; VLM tags help with new characters or niche concepts WD14 does not know.
 - REST `POST /api/quick-tag(/json)` and MCP `quick_tag_image` accept `vlm_tags`; project settings can be changed with `update_project_settings`.
+
+## Freeing VRAM
+
+The "VRAM ▾" button in the top-right corner frees the VRAM held by the local models and loads them back, which helps when the GPU is shared with ComfyUI or other tools.
+
+- **WD14**: "Free WD14's VRAM" unloads the model. The next tagging loads it again automatically (a few seconds), or use "Load WD14" to load it in advance. About 0.5 GB used by CUDA itself stays until the app restarts.
+- **JoyCaption**: "Put the VLM to sleep" uses vLLM's sleep mode. The model weights move to system RAM (about 17 GB) and the VRAM is freed without stopping the container. The next VLM call wakes it automatically (a few seconds), or use "Wake the VLM". Waking fails if other programs have taken the VRAM in the meantime.
+- **waifu2x**: loaded only while upscaling and freed automatically when the job ends. "Free waifu2x's VRAM" is there in case a job was interrupted.
+- Freeing is refused while a tagging or upscaling job is queued or running.
+- The bundled `joycaption` service starts vLLM with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1`. If your container was created before this, recreate it with `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption`. The development endpoints this turns on are only reachable from the app, because the service publishes no port.
+- Ollama unloads its model by itself after `OLLAMA_KEEP_ALIVE` (default 10 minutes) and cannot be put to sleep from here.
+- The menu also shows the GPU's total VRAM use (all programs) when `nvidia-smi` is available.
+- API: `GET /api/gpu`, `POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x}`.
 
 ## Civitai cloud training
 
@@ -177,7 +214,7 @@ Train on Civitai's GPUs through the [Orchestration API](https://developer.civita
 - Defaults: cosine LR scheduler; noise offset 0.1 for SDXL, 0 otherwise; Min SNR γ 5; text encoder LR 5e-5; sample LoRA strength 1.0; sample CFG uses Civitai's generation default for the base model (SDXL 7, Flux.1 3.5, Klein 5, Qwen 2.5, Anima 4…). Flux.1 schnell and MiniMax H3 have no published value and are left to Civitai.
 - The base checkpoint and the LoRA to continue from accept an AIR, a model version ID, or a civitai.com URL containing `modelVersionId` (resolved with the Site API). The checkpoint's type is checked; a LoRA is checked to really be a LoRA, and for SD / Flux / Klein / Chroma / ERNIE / Qwen / Z-Image / Anima, to belong to the same base model (Wan and LTX use different names on the site and are validated by Civitai's estimate).
 - Resolution, repeats, clip skip and other settings of the civitai.com trainer are not part of the API and cannot be set; Civitai picks the training resolution for the base model. Flux.2 Klein edit training (`isEditTraining`) needs paired reference images and is not supported.
-- Only the images an export would include are uploaded (minor-coded + sexual images are excluded per Civitai's policy). Captions are identical to the exported `.txt` files; shuffle / keep tokens default to the tagging settings.
+- Only the images an export would include are uploaded (minor-coded + sexual images are excluded per Civitai's policy). Captions are identical to the exported `.txt` files; shuffle / keep tokens default to the tagging settings. Civitai accepts at most 1024 characters per caption: longer captions leave out their lowest-scoring WD14 tags until they fit (tags you added yourself go last), and the trigger, description, appended tags and white-block keyword are always kept.
 
 **Uploads and retraining**
 
@@ -215,13 +252,14 @@ claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
 { "mcpServers": { "lora-tag-studio": { "type": "http", "url": "http://localhost:7870/mcp" } } }
 ```
 
-25 tools:
+27 tools:
 
 | Area | Tools |
 |---|---|
 | Base models and quick tagging | `list_profiles`, `get_tagging_guide`, `quick_tag_image` |
 | Projects and import | `list_projects`, `create_project`, `get_project`, `update_project_settings`, `add_images_from_urls`, `list_server_import_folders`, `import_server_folder` |
 | Tagging and editing | `start_tagging`, `get_job_status`, `list_captions`, `get_image`, `update_image_caption`, `bulk_edit_tags`, `get_tag_stats`, `detect_white_blocks` |
+| Upscaling | `upscale_images`, `restore_upscaled_images` |
 | Export | `export_dataset` |
 | Civitai training | `get_civitai_training_types`, `prepare_civitai_training`, `get_civitai_preparation`, `submit_civitai_training`, `get_civitai_training`, `list_active_civitai_trainings` |
 
@@ -259,7 +297,9 @@ When `API_KEY` is set, every `/api` and `/mcp` request needs `Authorization: Bea
 | `PUBLIC_BASE_URL` | empty | Prefix for download links returned to LLMs, e.g. `http://192.168.1.10:7870` |
 | `DEFAULT_LANG` | `en` | Language for API / MCP requests that do not specify one: `zh-TW` / `en` / `ja` / `ko` / `zh-CN` (the web UI follows the browser) |
 | `WD14_MODEL` | `SmilingWolf/wd-eva02-large-tagger-v3` | Default WD14 model (can be changed per project) |
-| `ORT_DEVICE` | `auto` | `auto` / `cpu` / `cuda` |
+| `ORT_DEVICE` | `auto` | `auto` / `cpu` / `cuda` (also used by waifu2x) |
+| `WAIFU2X_DIR` | `/models/waifu2x` | Where the waifu2x models are stored |
+| `WAIFU2X_MODELS_URL` | nunif release `waifu2x_onnx_models_20250502.zip` | Zip the waifu2x models are read from (needs HTTP range support) |
 | `TAG_CONCURRENCY` | `2` | Images processed at the same time (raise it for a remote VLM) |
 | `HF_TOKEN` | empty | Optional Hugging Face token for faster downloads |
 | `VLM_BACKEND` | `openai` | `openai` (OpenAI-compatible) / `anthropic` / `none` |
@@ -288,10 +328,11 @@ app/
   mcp_server.py      MCP tools
   profiles.py        Base model defaults, rating mappings, tagging guides  ← add or adjust base models here
   pipeline.py        Tagging pipeline for one image
-  jobs.py            Background tagging queue
+  jobs.py            Background job queue (tagging, upscaling)
   services.py        Logic shared by the API and MCP
   exporter.py        Civitai / kohya / jsonl export
   civitai.py         Civitai cloud training (Orchestration API)
+  upscale.py         waifu2x upscaling: model download, tiled inference, backup / restore
   storage.py         Uploads, folder / zip import, thumbnails
   db.py              SQLite
   tagging/
@@ -325,16 +366,19 @@ DATA_DIR=./data IMPORT_DIR=./import VLM_BACKEND=none uvicorn app.main:app --relo
 - **VLM shows as unreachable**: make sure you started with `--profile vlm` and that `docker compose logs ollama-pull` shows the model has finished downloading.
 - **VLM returns 404**: the model name does not match `ollama list`.
 - **The GPU is not used**: if the top-right corner shows "WD14 · CPU", check that you used `docker-compose.gpu.yml` and rebuilt with `--build`, and that `docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi` works.
-- **JoyCaption runs out of memory**: lower `JOYCAPTION_GPU_UTIL` or use a smaller VLM; the GPU build of WD14 uses about 1–2 GB.
+- **JoyCaption runs out of memory**: lower `JOYCAPTION_GPU_UTIL` or use a smaller VLM; the GPU build of WD14 uses about 1–2 GB. To share the GPU with other tools, put JoyCaption to sleep from the "VRAM ▾" menu when you are not tagging.
+- **The VRAM menu says the VLM cannot sleep**: the joycaption container was created without sleep mode; recreate it with `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption`.
+- **`docker compose down` shows `Network lora-tag-studio_default  Resource is still in use`**: a container from a profile (JoyCaption or Ollama) is still running. Run `docker compose --profile vlm --profile joycaption down` (see [Stopping](#stopping)).
 - **JoyCaption fails with `cannot import name 'PixtralRotaryEmbedding'`**: an unpatched `vllm/vllm-openai` image is in use. Check that the joycaption service in `docker-compose.yml` uses `build:` and run `docker compose ... --profile joycaption up -d --build`.
 - **The web UI shows key names such as `common.server_unreachable`**: the image has no locale files (`app/locales/*.json`); rebuild with `--build`. `docker compose logs app` lists the loaded languages at startup.
+- **Upscaling fails at "Preparing the waifu2x models"**: the app has to reach github.com once to download the models; `docker compose logs app` shows the error.
 - **Captions longer than 75 tokens**: CLIP in SD 1.5 / SDXL reads 75 tokens at a time; lower "Max tags" or raise the threshold. kohya can use `--max_token_length=225`.
 
 ## Notes
 
 - This project is not affiliated with Civitai. Cloud training spends Buzz from your own Civitai account; check the estimate before you confirm.
 - You are responsible for having the rights to the images you train on and for following the content rules of the services you use.
-- Models (WD14, JoyCaption, Ollama models) are downloaded from their publishers at runtime and are subject to their own licenses.
+- Models (WD14, waifu2x, JoyCaption, Ollama models) are downloaded from their publishers at runtime and are subject to their own licenses.
 
 ## License
 

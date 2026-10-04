@@ -82,8 +82,12 @@ services:
       - --max-model-len=4096
       - --gpu-memory-utilization=${JOYCAPTION_GPU_UTIL:-0.7}
       - --enable-prefix-caching
+      # 休眠模式：WebUI 右上角「VRAM」可讓 JoyCaption 休眠（模型移到系統記憶體、釋放 VRAM），標註時自動喚醒
+      - --enable-sleep-mode
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
+      # 開啟 /sleep、/wake_up、/is_sleeping 端點。這些開發用端點不該對外：這個服務沒有開放埠，只有 app 連得到
+      VLLM_SERVER_DEV_MODE: "1"
     volumes:
       - hf-cache:/root/.cache/huggingface
     deploy:

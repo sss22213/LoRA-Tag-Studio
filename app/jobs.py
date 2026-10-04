@@ -1,4 +1,4 @@
-"""背景標註工作佇列（單一 worker 依序處理工作，每個工作內可平行處理多張圖）。"""
+"""背景工作佇列：標註與 waifu2x 放大（單一 worker 依序處理，標註工作內可平行處理多張圖）。"""
 from __future__ import annotations
 
 import logging
@@ -24,6 +24,8 @@ class Job:
     id: str
     project_id: str
     image_ids: list[str]
+    kind: str = "tag"  # tag：標註 | upscale：waifu2x 放大
+    params: dict[str, Any] = field(default_factory=dict)
     status: str = "queued"  # queued | running | done | cancelled | error
     done: int = 0
     failed: int = 0
@@ -48,6 +50,7 @@ class Job:
         return {
             "id": self.id,
             "project_id": self.project_id,
+            "kind": self.kind,
             "status": self.status,
             "total": len(self.image_ids),
             "done": self.done,
@@ -73,10 +76,11 @@ def start_worker() -> None:
         _worker.start()
 
 
-def submit(project_id: str, image_ids: list[str]) -> Job:
+def submit(project_id: str, image_ids: list[str], kind: str = "tag", params: dict[str, Any] | None = None) -> Job:
     # 已在佇列中的圖片不重複排入
     imgs = [i for i in db.list_images(project_id, ids=image_ids) if i["status"] not in ("queued", "processing")]
-    job = Job(id=uuid.uuid4().hex[:12], project_id=project_id, image_ids=[i["id"] for i in imgs], lang=get_lang())
+    job = Job(id=uuid.uuid4().hex[:12], project_id=project_id, image_ids=[i["id"] for i in imgs], kind=kind,
+              params=params or {}, lang=get_lang())
     if not job.image_ids:
         job.status, job.finished_at = "done", time.time()
         job.say("msg.job_nothing")
@@ -103,6 +107,11 @@ def active_for_project(project_id: str) -> Job | None:
         if j.status in ("queued", "running"):
             return j
     return None
+
+
+def any_active() -> bool:
+    """有沒有排隊中或進行中的工作（標註或放大，任何專案）。"""
+    return any(j.status in ("queued", "running") for j in list(_jobs.values()))
 
 
 def cancel(job_id: str) -> Job | None:
@@ -161,32 +170,49 @@ def _run(job: Job) -> None:
     s = normalize_settings(project["settings"])
     job.status, job.started_at = "running", time.time()
     job.say("msg.job_processing")
+    done_key = {"tag": "msg.job_done", "upscale": "msg.upscale_done"}[job.kind]
+    if job.kind == "upscale" and job.params.get("scale") == "1":
+        done_key = "msg.denoise_done"
     try:
-        # 第一次使用時會下載模型，先在主執行緒載入以取得清楚的錯誤訊息
-        if s.get("use_wd14", True):
-            job.say("msg.job_loading_model")
-            from .tagging.wd14 import get_tagger
+        if job.kind == "upscale":
+            from . import upscale
 
-            get_tagger(s.get("wd14_model") or None)
-            job.say("msg.job_processing")
-        with ThreadPoolExecutor(max_workers=settings.tag_concurrency) as pool:
-            list(pool.map(lambda iid: _process_one(job, s, iid), job.image_ids))
+            with use_lang(job.lang):
+                upscale.run_job(job)
+        else:
+            _run_tagging(job, s)
         if job.cancel_event.is_set():
             job.status = "cancelled"
             job.say("msg.job_cancelled")
         else:
             job.status = "done"
             if job.failed:
-                job.say("msg.job_done_failed", ok=job.done - job.failed, failed=job.failed)
+                job.say(f"{done_key}_failed", ok=job.done - job.failed, failed=job.failed)
             else:
-                job.say("msg.job_done", ok=job.done)
+                job.say(done_key, ok=job.done)
     except Exception as e:  # noqa: BLE001
         log.exception("工作失敗")
         job.status, job.message_key, job.message_raw = "error", "", str(e)
     finally:
+        if job.kind == "upscale":
+            from . import upscale
+
+            upscale.unload_all()  # 偶爾才用，用完就釋放 VRAM
         db.restore_status(job.image_ids)
         job.finished_at = time.time()
         db.touch_project(job.project_id)
+
+
+def _run_tagging(job: Job, s: dict[str, Any]) -> None:
+    # 第一次使用時會下載模型，先在主執行緒載入以取得清楚的錯誤訊息
+    if s.get("use_wd14", True):
+        job.say("msg.job_loading_model")
+        from .tagging.wd14 import get_tagger
+
+        get_tagger(s.get("wd14_model") or None)
+        job.say("msg.job_processing")
+    with ThreadPoolExecutor(max_workers=settings.tag_concurrency) as pool:
+        list(pool.map(lambda iid: _process_one(job, s, iid), job.image_ids))
 
 
 def _loop() -> None:

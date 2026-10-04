@@ -33,6 +33,12 @@ class Settings:
         self.wd14_default_model = _env("WD14_MODEL", "SmilingWolf/wd-eva02-large-tagger-v3")
         self.ort_device = _env("ORT_DEVICE", "auto").lower()  # auto | cpu | cuda
 
+        # waifu2x（nunif 的 ONNX 模型）放大低解析圖片。第一次使用時只從 zip 裡下載需要的模型檔
+        self.waifu2x_dir = Path(_env("WAIFU2X_DIR", "/models/waifu2x"))
+        self.waifu2x_models_url = _env(
+            "WAIFU2X_MODELS_URL",
+            "https://github.com/nagadomi/nunif/releases/download/0.0.0/waifu2x_onnx_models_20250502.zip")
+
         # 自然語言 caption 用的視覺語言模型 (VLM)
         # openai    : 任何 OpenAI 相容端點（Ollama / vLLM / LM Studio / OpenRouter / OpenAI）
         # anthropic : Claude API（需要 ANTHROPIC_API_KEY）

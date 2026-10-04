@@ -102,6 +102,7 @@ def llms_txt() -> str:
 ## Workflow (REST)
 1. `POST /api/projects` {{"name", "profile", "lora_type": "character|style|concept", "trigger"}}
 2. `POST /api/projects/{{id}}/upload` (multipart files, zip allowed) or `POST /api/projects/{{id}}/import-urls` {{"urls": [...]}}
+   Optional: `POST /api/projects/{{id}}/upscale` {{}} upscales images with a short side below 1024 px (waifu2x job)
 3. `POST /api/projects/{{id}}/tag` {{"only_untagged": true}} → `GET /api/jobs/{{job_id}}` until status=done
 4. Review: `GET /api/projects/{{id}}/captions`, `GET /api/projects/{{id}}/stats`
 5. Fix: `POST /api/projects/{{id}}/bulk` {{"action": "remove", "tags": ["watermark"]}} or

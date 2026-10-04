@@ -11,6 +11,7 @@ import io
 import logging
 import re
 import threading
+import time
 from typing import Any
 
 import httpx
@@ -134,6 +135,7 @@ def _encode(image: Image.Image) -> str:
 # ---------------------------------------------------------------- OpenAI 相容
 def _caption_openai(image: Image.Image, system: str, prompt: str, temperature: float = 0.2,
                     max_tokens: int = 600, top_p: float | None = None) -> str:
+    ensure_awake()
     payload = {
         "model": settings.vlm_model,
         "messages": [
@@ -167,6 +169,82 @@ def _caption_openai(image: Image.Image, system: str, prompt: str, temperature: f
         return data["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError) as e:
         raise VLMError(t("msg.vlm_bad_response", body=str(data)[:300])) from e
+
+
+# ---------------------------------------------------------------- vLLM 休眠（JoyCaption）
+# vLLM 以 --enable-sleep-mode 啟動、並設定 VLLM_SERVER_DEV_MODE=1 時有 /sleep、/wake_up、/is_sleeping。
+# level 1：模型權重移到系統記憶體、丟掉 KV cache，釋放大部分 VRAM；喚醒只要把權重搬回 GPU。
+SLEEP_CHECK_TTL = 60  # 不支援休眠的端點（Ollama、未開休眠模式的 vLLM）多久再檢查一次
+_sleep_lock = threading.Lock()
+_sleep_unsupported_until = 0.0
+
+
+def _server_root() -> str:
+    """OpenAI 相容端點的伺服器根網址（vLLM 的休眠端點不在 /v1 底下）。"""
+    url = settings.vlm_base_url
+    return url[:-3] if url.endswith("/v1") else url
+
+
+def _headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {settings.vlm_api_key}"} if settings.vlm_api_key else {}
+
+
+def sleep_status() -> dict[str, Any]:
+    """{"supported": 能不能休眠, "sleeping": 是否休眠中, "online": 連得到嗎}。
+    不是 vLLM、或 vLLM 沒有以休眠模式啟動時 supported=False；雲端 / 停用的後端 online=None。"""
+    if settings.vlm_backend != "openai":
+        return {"supported": False, "sleeping": False, "online": None}
+    try:
+        r = httpx.get(f"{_server_root()}/is_sleeping", headers=_headers(), timeout=3)
+    except httpx.HTTPError:
+        return {"supported": False, "sleeping": False, "online": False}
+    try:
+        sleeping = r.json().get("is_sleeping") if r.status_code == 200 else None
+    except (ValueError, AttributeError):
+        sleeping = None
+    if not isinstance(sleeping, bool):
+        return {"supported": False, "sleeping": False, "online": True}
+    return {"supported": True, "sleeping": sleeping, "online": True}
+
+
+def sleep() -> None:
+    """讓 vLLM 休眠（level 1）：等進行中的請求完成，模型移到系統記憶體，釋放 VRAM。"""
+    try:
+        r = httpx.post(f"{_server_root()}/sleep", params={"level": 1, "mode": "wait"}, headers=_headers(), timeout=300)
+    except httpx.HTTPError as e:
+        raise VLMError(t("msg.vlm_connect_failed", url=settings.vlm_base_url, error=e)) from e
+    if r.status_code == 404:
+        raise VLMError(t("msg.vlm_sleep_unsupported"))
+    if r.status_code >= 400:
+        raise VLMError(t("msg.vlm_sleep_failed", error=f"HTTP {r.status_code} {r.text[:200]}"))
+    log.info("VLM 已休眠")
+
+
+def wake_up() -> None:
+    """喚醒 vLLM：把模型搬回 GPU。VRAM 不夠時會失敗。"""
+    try:
+        r = httpx.post(f"{_server_root()}/wake_up", headers=_headers(), timeout=600)
+    except httpx.HTTPError as e:
+        raise VLMError(t("msg.vlm_wake_failed", error=e)) from e
+    if r.status_code == 404:
+        raise VLMError(t("msg.vlm_sleep_unsupported"))
+    if r.status_code >= 400:
+        raise VLMError(t("msg.vlm_wake_failed", error=f"HTTP {r.status_code} {r.text[:200]}"))
+    log.info("VLM 已喚醒")
+
+
+def ensure_awake() -> None:
+    """呼叫 VLM 前：vLLM 在休眠就先喚醒（使用者手動休眠後，標註時自動喚醒）。"""
+    global _sleep_unsupported_until
+    if time.time() < _sleep_unsupported_until:
+        return
+    with _sleep_lock:  # 同時處理多張圖時只喚醒一次
+        st = sleep_status()
+        if not st["supported"]:
+            _sleep_unsupported_until = time.time() + SLEEP_CHECK_TTL
+        elif st["sleeping"]:
+            log.info("VLM 休眠中，自動喚醒")
+            wake_up()
 
 
 # ---------------------------------------------------------------- Claude
@@ -323,6 +401,9 @@ def status() -> dict[str, Any]:
         want = settings.vlm_model
         info["available"] = not models or any(m in (want, f"{want}:latest") for m in models)
         info["message"] = t("msg.vlm_status_ok") if info["available"] else t("msg.vlm_status_model_missing", model=want)
+        info["sleep"] = sleep_status()
+        if info["sleep"]["sleeping"]:
+            info["message"] = t("msg.vlm_status_sleeping")
     except (httpx.ConnectError, httpx.ConnectTimeout):
         # 連線被拒或主機名稱查不到：服務沒在跑，或 vLLM 還在載入模型（HTTP 埠載入完才會開）
         info["message"] = t("msg.vlm_status_starting", url=settings.vlm_base_url)

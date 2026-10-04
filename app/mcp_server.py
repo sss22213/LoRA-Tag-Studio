@@ -24,7 +24,8 @@ Typical workflow:
 1. list_profiles → pick the base model the LoRA targets (pony_v6, illustrious, noobai_xl, anima, flux1_dev, ...).
 2. get_tagging_guide(profile) to learn the caption conventions for that model.
 3. create_project(name, profile, lora_type, trigger).
-4. add_images_from_urls or import_server_folder to add images.
+4. add_images_from_urls or import_server_folder to add images. Optionally upscale_images for low-resolution
+   images (short side below ~1024 px) → poll get_job_status.
 5. start_tagging → poll get_job_status until status is done.
 6. list_captions / get_tag_stats to review; fix with bulk_edit_tags or update_image_caption.
 7. export_dataset → returns a zip download URL ready for the Civitai trainer.
@@ -170,7 +171,8 @@ def start_tagging(project_id: str, only_untagged: bool = True, image_ids: list[s
 
 @_tool
 def get_job_status(job_id: str) -> dict[str, Any]:
-    """Progress of a tagging job (status: queued | running | done | cancelled | error)."""
+    """Progress of a tagging or upscaling job (kind: tag | upscale; status: queued | running | done | cancelled |
+    error)."""
     job = jobs.get(job_id)
     if job is None:
         raise ValueError("job not found")
@@ -207,6 +209,24 @@ def detect_white_blocks(project_id: str, force: bool = False) -> dict[str, Any]:
     (keyword: settings.block_tag, default "white rectangle") and put that keyword in the negative prompt when
     generating, or remove those images (REST API: POST /api/projects/{project_id}/images/delete)."""
     return services.scan_blocks(project_id, force)
+
+
+@_tool
+def upscale_images(project_id: str, image_ids: list[str] | None = None, min_side: int = 1024, style: str = "art",
+                   noise: str = "auto", scale: str = "auto") -> dict[str, Any]:
+    """Upscale low-resolution images with waifu2x so the trainer does not blur them, or with scale="1" only remove
+    JPEG compression noise (size unchanged). Background job; poll get_job_status. Without image_ids it picks images
+    not processed yet: short side below min_side, or for scale="1" every JPEG / lossy WebP image. style: art
+    (illustrations / anime) | art_scan (scans) | photo. noise: auto (level 1 for JPEG / lossy WebP, none otherwise) |
+    none | 0-3. scale: auto (2x, or 4x when 2x stays below min_side) | 1 (noise reduction only) | 2 | 4. The original is backed up (restore_upscaled_images); tags need not be redone. Images with a short side
+    below ~384 px gain little; consider removing them instead."""
+    return services.start_upscale(project_id, image_ids, min_side, style, noise, scale)
+
+
+@_tool
+def restore_upscaled_images(project_id: str, image_ids: list[str] | None = None) -> dict[str, Any]:
+    """Put the original images back for upscaled images (default: all of them in the project)."""
+    return services.restore_upscaled(project_id, image_ids)
 
 
 @_tool

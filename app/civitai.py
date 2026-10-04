@@ -28,9 +28,9 @@ from . import db
 from .config import settings
 from .exporter import convert_image, dataset_images
 from .i18n import get_lang, t, use_lang
-from .pipeline import caption_for
+from .pipeline import block_tags, caption_for
 from .profiles import PROFILES
-from .tagging.postprocess import training_hints
+from .tagging.postprocess import canon, split_tags, training_hints
 
 log = logging.getLogger(__name__)
 
@@ -331,12 +331,37 @@ def resolve_lora(ref: str, ecosystem: str) -> str | None:
 
 
 # ------------------------------------------------------------------ 訓練內容
-def _caption(img: dict[str, Any], s: dict[str, Any]) -> str:
+def _fit_caption(img: dict[str, Any], s: dict[str, Any]) -> tuple[str, int]:
+    """Civitai 的 caption 上限 1024 字：超過時拿掉標籤直到放得下，回傳 (caption, 拿掉幾個標籤)。
+    先拿 WD14 分數最低的；沒有分數的（手動加的、VLM 的、角色）最後才拿，由後往前。
+    trigger、分級、自然語言描述、附加標籤與白色色塊關鍵字（含手動加在標籤裡的）都保留（舊做法從結尾截斷，會切掉色塊關鍵字）。"""
     text = caption_for(img, s)
     if len(text) <= MAX_CAPTION:
-        return text
-    cut = text[:MAX_CAPTION]
-    return cut[:cut.rfind(",")] if "," in cut else cut
+        return text, 0
+    tags = list(img.get("tags") or [])
+    scores = {canon(n).lower(): sc for n, sc in (img.get("raw") or {}).get("general") or []}
+    score = lambda i: scores.get(canon(tags[i]).lower())  # noqa: E731
+    # 色塊關鍵字就算是手動加在標籤裡（沒偵測到色塊時），也絕不拿掉
+    keep = {canon(k).lower() for k in split_tags(s.get("block_tag"))}
+    order = sorted((i for i in range(len(tags)) if canon(tags[i]).lower() not in keep),
+                   key=lambda i: (score(i) is None, score(i) or 0, -i))
+    removed: set[int] = set()
+    for i in order:
+        removed.add(i)
+        text = caption_for({**img, "tags": [tg for j, tg in enumerate(tags) if j not in removed]}, s)
+        if len(text) <= MAX_CAPTION:
+            return text, len(removed)
+    # 只剩描述還是太長：截斷描述，色塊關鍵字放回最後
+    suffix = ", ".join(block_tags(img, s))
+    if suffix and text.endswith(suffix):
+        text = text[:-len(suffix)].rstrip(", ")
+    cut = text[:MAX_CAPTION - (len(suffix) + 2 if suffix else 0)]
+    cut = cut[:cut.rfind(",")] if "," in cut else cut
+    return (f"{cut}, {suffix}" if suffix else cut), len(removed)
+
+
+def _caption(img: dict[str, Any], s: dict[str, Any]) -> str:
+    return _fit_caption(img, s)[0]
 
 
 def default_samples(images: list[dict[str, Any]], s: dict[str, Any], n: int = 3) -> list[str]:
@@ -732,6 +757,7 @@ class Prep:
     duplicates: list[dict[str, str]] = field(default_factory=list)
     excluded: int = 0
     truncated: int = 0
+    truncated_tags: int = 0  # 為了放進 1024 字拿掉的標籤總數
     ecosystem: str = ""
     model: str | None = None
     continue_from: str | None = None
@@ -820,7 +846,7 @@ def _run_prepare(prep: Prep, project: dict[str, Any], s: dict[str, Any], images:
                     raise
                 log.info("Civitai 不認得快取的 blob，重新上傳：%s", e)
                 prep.done = prep.reused = 0
-                prep.blocked, prep.duplicates, prep.truncated = [], [], 0
+                prep.blocked, prep.duplicates, prep.truncated, prep.truncated_tags = [], [], 0, 0
                 _prepare_body(prep, project, s, images, params, use_cache=False)
             prep.status = "ready"
         except (CivitaiError, ValueError, KeyError, OSError) as e:
@@ -855,8 +881,10 @@ def _prepare_body(prep: Prep, project: dict[str, Any], s: dict[str, Any], images
             prep.duplicates.append({"file": img["original_name"], "same_as": seen[blob_id]})
             continue
         seen[blob_id] = img["original_name"]
-        caption = _caption(img, s)
-        prep.truncated += 1 if len(caption_for(img, s)) > MAX_CAPTION else 0
+        caption, cut = _fit_caption(img, s)
+        if len(caption_for(img, s)) > MAX_CAPTION:
+            prep.truncated += 1
+            prep.truncated_tags += cut
         items.append({"air": blob_id, "caption": caption})
         kept.append(img)
     if not items:

@@ -77,6 +77,9 @@ small, .muted { color: var(--muted); }
 .lang-sel { width: auto; height: 30px; padding: 2px 8px; font-size: 13px; background: var(--panel-2); }
 .sys { margin-left: auto; display: flex; gap: 8px; font-size: 12px; }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 99px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.pill-btn { font: inherit; cursor: pointer; }
+.pill-btn:hover { color: var(--text); border-color: var(--accent); }
+.sys .menu { min-width: 340px; font-size: 13px; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
 .dot.ok { background: var(--ok); }
 .dot.warn { background: var(--warn); }
@@ -349,3 +352,17 @@ th { color: var(--muted); font-weight: 600; }
 a.cv-active-item { display: block; color: inherit; text-decoration: none; }
 a.cv-active-item:hover { border-color: var(--accent); }
 .cv-blocked { margin: 6px 0 0 18px; font-size: 12.5px; }
+
+/* waifu2x 放大 */
+.badge.up { background: rgba(78, 168, 247, .15); color: var(--info); }
+.badge.warn { background: rgba(245, 165, 36, .16); color: var(--warn); }
+.card .tl .up { background: var(--panel); border: 1px solid var(--border); }
+.upscale .up-list { margin: 8px 0 12px; }
+.upscale .up-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 8px; max-height: 260px; overflow: auto; margin-top: 6px; }
+.upscale .up-item { position: relative; font-size: 11.5px; color: var(--muted); text-align: center; }
+.upscale .up-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; background: var(--panel-3); display: block; margin-bottom: 3px; }
+.upscale .up-item .badge { position: absolute; top: 4px; right: 4px; background: var(--panel); border: 1px solid var(--border); }
+.upscale .up-opts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.upscale .up-opts select { width: 100%; }
+@media (max-width: 640px) { .upscale .up-opts { grid-template-columns: 1fr; } }
+.upscale .up-mode { display: flex; gap: 18px; flex-wrap: wrap; padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid var(--border); font-weight: 600; }

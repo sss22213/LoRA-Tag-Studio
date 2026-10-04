@@ -61,10 +61,12 @@ CREATE TABLE IF NOT EXISTS civitai_runs (
 CREATE INDEX IF NOT EXISTS idx_civitai_runs_project ON civitai_runs(project_id, created_at);
 """
 
-_IMAGE_FIELDS = {"tags", "nl_caption", "rating", "raw", "status", "error", "width", "height", "filename", "size", "blocks"}
-_JSON_FIELDS = ("raw", "blocks")
+_IMAGE_FIELDS = {"tags", "nl_caption", "rating", "raw", "status", "error", "width", "height", "filename", "size", "blocks",
+                 "sha1", "upscale"}
+_JSON_FIELDS = ("raw", "blocks", "upscale")
 # 新增欄位（舊資料庫自動補上）
-_ADDED_COLUMNS = {"images": [("blocks", "TEXT")]}  # blocks：白色色塊偵測結果，NULL = 尚未偵測
+# blocks：白色色塊偵測結果，NULL = 尚未偵測；upscale：waifu2x 放大紀錄（含原圖資訊），NULL = 沒放大過
+_ADDED_COLUMNS = {"images": [("blocks", "TEXT"), ("upscale", "TEXT")]}
 
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -181,7 +183,9 @@ def add_image(project_id: str, **fields: Any) -> dict[str, Any]:
 
 
 def find_by_sha(project_id: str, sha1: str) -> dict[str, Any] | None:
-    rows = _q("SELECT * FROM images WHERE project_id=? AND sha1=?", (project_id, sha1))
+    """同一張圖（放大過的圖也比對放大前的原圖）。"""
+    rows = _q("SELECT * FROM images WHERE project_id=? AND (sha1=? OR json_extract(upscale, '$.original.sha1')=?)",
+              (project_id, sha1, sha1))
     return _image(rows[0]) if rows else None
 
 

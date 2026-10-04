@@ -40,6 +40,11 @@ def thumbs_dir(pid: str) -> Path:
     return project_dir(pid) / "thumbs"
 
 
+def originals_dir(pid: str) -> Path:
+    """放大（waifu2x）前的原圖備份。"""
+    return project_dir(pid) / "originals"
+
+
 def image_path(img: dict[str, Any]) -> Path:
     return images_dir(img["project_id"]) / img["filename"]
 
@@ -70,7 +75,7 @@ def parse_caption_file(text: str, trigger: str = "") -> tuple[list[str], str]:
     return tags, ", ".join(sentences)
 
 
-def _make_thumb(im: Image.Image, dest: Path) -> None:
+def make_thumb(im: Image.Image, dest: Path) -> None:
     t = im.copy()
     if t.mode not in ("RGB", "RGBA"):
         t = t.convert("RGBA")
@@ -113,7 +118,7 @@ def save_image_bytes(
         ext = ".png"
         final.save(idir / f"{iid}{ext}", format="PNG")
 
-    _make_thumb(final, thumbs_dir(pid) / f"{iid}.webp")
+    make_thumb(final, thumbs_dir(pid) / f"{iid}.webp")
     try:
         blocks = detect_white_blocks(final)
     except Exception:  # noqa: BLE001 — 偵測失敗不影響匯入，之後可再手動偵測
@@ -129,7 +134,10 @@ def save_image_bytes(
 
 
 def delete_image_files(img: dict[str, Any]) -> None:
-    for p in (image_path(img), thumb_path(img)):
+    paths = [image_path(img), thumb_path(img)]
+    if img.get("upscale"):
+        paths.append(originals_dir(img["project_id"]) / img["upscale"]["original"]["filename"])
+    for p in paths:
         try:
             p.unlink()
         except FileNotFoundError:

@@ -8,6 +8,7 @@
 - **兩種標註器**：WD14（SmilingWolf v3，ONNX，CPU / GPU）產生 Danbooru 標籤；VLM（Ollama / JoyCaption / Claude / 任何 OpenAI 相容端點）產生自然語言描述，也可以用 JoyCaption 的 Danbooru 模式補充或取代標籤。
 - **支援 NSFW**：WD14 完整輸出 NSFW 標籤、各底模分級標籤自動換算、VLM 露骨描述模式、可選的無審查 JoyCaption 服務。
 - **WebUI**：拖放上傳資料夾 / zip、圖庫篩選、標籤編輯（拖曳排序、自動完成）、標籤統計、批次加入 / 移除 / 取代、角色特徵修剪、黑名單。
+- **waifu2x 放大與降噪**：短邊太小的圖先放大再訓練，LoRA 才不會學到模糊；也可以只去掉 JPEG 雜訊、不改尺寸。原圖會保留，可以還原。
 - **直接送到 Civitai 雲端訓練**：上傳圖片與 caption、試算 Buzz、確認後開始訓練、查看進度，並下載每個 epoch 的 LoRA（Civitai Orchestration API）。
 - **給其他 LLM 使用**：REST API（OpenAPI 規格可直接當 tool server）＋ MCP 伺服器（Claude Desktop / Claude Code / Cursor / Open WebUI）。
 - **多國語言**：WebUI、錯誤訊息、標註指南與匯出的 README 支援繁體中文、English、日本語、한국어、简体中文，依瀏覽器語言自動切換，右上角可手動選擇。
@@ -46,6 +47,17 @@ docker compose up -d --build  # CPU 版
 ```bash
 docker compose exec ollama ollama pull qwen2.5vl:32b   # 並把 .env 的 VLM_MODEL 改成同名
 ```
+
+### 停止
+
+```bash
+docker compose --profile vlm --profile joycaption down
+```
+
+- 就算只啟動了其中一個，也把兩個 profile 都帶上；帶到沒在跑的 profile 不會有影響。不帶的話，`down` 會漏掉 Ollama / JoyCaption 的容器，最後出現 `Network lora-tag-studio_default  Resource is still in use`。
+- 只停一個服務、其他繼續跑：`docker compose --profile joycaption stop joycaption`。要再啟動用 `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption`。只想釋放 JoyCaption 的 VRAM、不停容器，見[釋放 VRAM](#釋放-vram)。
+- **不要加 `-v`**：那會刪掉 `models`、`ollama`、`hf-cache` 這些 volume，WD14、Ollama 模型和 JoyCaption（約 17 GB）都得重新下載。`./data` 裡的專案不受 `down` 影響。
+- `.env` 有設定 `COMPOSE_PROFILES` 的話，直接 `docker compose down` 就會包含那些 profile。
 
 ---
 
@@ -102,7 +114,7 @@ docker compose exec ollama ollama pull qwen2.5vl:32b   # 並把 .env 的 VLM_MOD
   VLM_MODEL=joycaption                     # 對應 --served-model-name
   VLM_API_KEY=EMPTY                        # vLLM 預設不驗證，填任意值
   ```
-  並把 Ollama 那三行註解掉。第一次啟動會下載約 17GB 模型，`docker compose logs -f joycaption` 出現 `Application startup complete` 才可使用；右上角 VLM 狀態會轉為可用。
+  並把 Ollama 那三行註解掉。第一次啟動會下載約 17GB 模型，`docker compose --profile joycaption logs -f joycaption` 出現 `Application startup complete` 才可使用；右上角 VLM 狀態會轉為可用。
   JoyCaption 服務由 `docker/joycaption.Dockerfile` 建置：以 `vllm/vllm-openai:v0.30.0` 為基底並固定 transformers 5.16.1（0.30.0 內附的 5.17 會讓 Llava 模型無法載入，見 vllm-project/vllm#58755）。
   Claude 與多數商用模型會拒絕描述露骨內容；被拒答時該圖會標記錯誤並保留 WD14 標籤。
 - WebUI 預設模糊 NSFW / 露骨縮圖（工具列的「模糊 NSFW」可關閉）。
@@ -120,6 +132,18 @@ docker compose exec ollama ollama pull qwen2.5vl:32b   # 並把 .env 的 VLM_MOD
 - 偵測方式：找出幾乎純白（RGB ≥ 248）、面積至少 4% 的矩形；有紋理的白牆、過曝窗戶通常不會被當成色塊。
 - API：`POST /api/projects/{id}/blocks/scan`；MCP：`detect_white_blocks`；設定 `block_tag_auto` / `block_tag`。
 
+## 放大與降噪（waifu2x）
+
+短邊低於訓練解析度（SDXL / Illustrious 約 1024 px）的圖，訓練時會被一般演算法放大而變糊，LoRA 會把模糊學進去；JPEG 的壓縮雜訊也一樣會被學進去。圖庫工具列的「⤢ 放大 / 降噪」用 waifu2x 處理這兩種情況，對話框最上面選「放大低解析圖」或「只降噪（不改尺寸）」。按鈕上的數字是低於放大門檻的張數；處理過的圖，卡片右上角會顯示 ⤢2x / ⤢4x 或 ✧ 降噪。
+
+- **處理哪些圖**：放大是短邊低於 1024 px（可調整）、還沒處理過的圖；只降噪是還沒處理過的 JPEG / 有損 WebP，不論大小；選「所有還沒處理過的圖（含 PNG）」會連 PNG 一起處理。PNG 存檔本身不產生雜訊，但內容可能帶著影片壓縮或之前 JPEG 留下的雜訊。要自己挑，就選取圖片後按批次列的按鈕，或在編輯器按「放大…」。短邊不到 384 px 的圖會標示「太小」，放大也救不回細節，通常直接刪除比較好。
+- **選項**：模型 `art`（插畫 / 動漫，建議）、`art_scan`（有網點、紙紋的掃描圖）、`photo`（照片）。放大時，降噪「自動」只對 JPEG 和有損 WebP 用 1 級，其他不降噪；倍率「自動」用 2x，2x 還不到門檻才用 4x。只降噪時，一般 JPEG 用 1 級就夠；2–3 級只用在方塊雜訊明顯的圖，太強會連細線和紋理一起抹平。
+- **原圖會保留**：結果存成 PNG，原圖移到 `data/projects/<id>/originals/`。編輯器或批次列的「還原原圖」、對話框裡的「全部還原原圖」可以換回去。重新放大一律從原圖開始；再次匯入原圖會被當成重複的圖片。
+- 標籤不必重跑（WD14 本來就把圖縮到 448 px 判讀）。白色色塊會重新偵測，手動標記會保留。放大後的檔案內容雜湊不同，下次送 Civitai 訓練會上傳新的版本。
+- **模型**：[nunif](https://github.com/nagadomi/nunif) 的 waifu2x `swin_unet` ONNX 模型（作者 nagadomi，MIT 授權）。第一次使用時，只從 release 的 zip 裡讀出這次需要的模型（每個約 17–19 MB），存到 `models` volume。和 WD14 共用 onnxruntime，不需要 PyTorch 或 Vulkan。
+- **速度與 VRAM**：在 RTX 5090 上實測，960×540 → 1920×1080 每張約 0.3 秒；CPU 約 6–9 秒。每個載入的模型約占 0.6–0.8 GB VRAM，另加 CUDA 本身約 0.5 GB，工作結束時全部自動釋放。放大和標註工作會輪流執行，不會同時跑。
+- API：`POST /api/projects/{id}/upscale`（`"scale": 1` = 只降噪）、`POST /api/projects/{id}/upscale/restore`；MCP：`upscale_images`、`restore_upscaled_images`。
+
 ## 用 VLM 產生 Danbooru 標籤（JoyCaption）
 
 JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danbooru 標籤（WD14 / VLM）」→「用 VLM 產生 Danbooru 標籤」：
@@ -136,6 +160,19 @@ JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danboor
 - 畫師標籤預設不採用（「採用 VLM 判斷的畫師標籤」）；Anima 會自動加上 `@`。
 - VLM 標籤沒有信心分數，門檻只套用在 WD14。動漫圖通常仍以 WD14 為主；VLM 標籤適合 WD14 不認得的新角色或冷門概念。
 - REST `POST /api/quick-tag(/json)` 與 MCP `quick_tag_image` 可帶 `vlm_tags`；專案設定可用 `update_project_settings` 修改。
+
+## 釋放 VRAM
+
+右上角的「VRAM ▾」可以釋放本機模型占用的 VRAM，需要時再載回。和 ComfyUI 等工具共用顯示卡時很有用。
+
+- **WD14**：「釋放 WD14 的 VRAM」會卸載模型，下次標註時自動載回（約數秒），也可以按「載入 WD14」先載入。CUDA 本身約 0.5 GB 的占用要重啟 app 才會歸零。
+- **JoyCaption**：「讓 VLM 休眠」使用 vLLM 的休眠模式，模型權重移到系統記憶體（約 17 GB），不必停容器就能釋放 VRAM。下次呼叫 VLM 時自動喚醒（約數秒），也可以按「喚醒 VLM」。如果這段期間 VRAM 被其他程式占走，喚醒會失敗。
+- **waifu2x**：只在放大時載入，工作結束時自動釋放。「釋放 waifu2x 的 VRAM」是給工作中斷時用的。
+- 標註或放大工作排隊中或進行中時不能釋放。
+- 內建的 `joycaption` 服務以 `--enable-sleep-mode` 和 `VLLM_SERVER_DEV_MODE=1` 啟動 vLLM。容器是在加入這個設定之前建立的話，用 `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption` 重新建立。這會開啟 vLLM 的開發用端點，但這個服務沒有開放埠，只有 app 連得到。
+- Ollama 閒置 `OLLAMA_KEEP_ALIVE`（預設 10 分鐘）後會自己卸載模型，這裡不能讓它休眠。
+- 有 `nvidia-smi` 時，選單也會顯示整張 GPU 的 VRAM 用量（含其他程式）。
+- API：`GET /api/gpu`、`POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x}`。
 
 ## 送到 Civitai 雲端訓練
 
@@ -177,7 +214,7 @@ JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danboor
 - 預設值：學習率排程 cosine；noise offset SDXL 0.1、其他 0；Min SNR γ 5；文字編碼器學習率 5e-5；範例 LoRA 強度 1.0；範例 CFG 用 Civitai 生成 API 對該底模的預設（SDXL 7、Flux.1 3.5、Klein 5、Qwen 2.5、Anima 4…），Flux.1 schnell 與 MiniMax H3 沒有公開數值，留空由 Civitai 決定。
 - 訓練底模與接續訓練的 LoRA 可填 AIR、模型版本 ID 或含 `modelVersionId` 的 civitai.com 網址（用 Site API 解析）。會檢查底模的類型是否相符；LoRA 會檢查是不是 LoRA，以及 SD / Flux / Klein / Chroma / ERNIE / Qwen / Z-Image / Anima 是否同一種底模（Wan / LTX 在網站上的名稱不同，交給 Civitai 試算時驗證）。
 - Civitai 網站訓練器的 resolution、repeats、clip skip 等設定不在 API 裡，無法指定；訓練解析度由 Civitai 依底模決定。Flux.2 Klein 的編輯訓練（`isEditTraining`）需要成對的參考圖，不支援。
-- 只上傳匯出時也會包含的圖片（依 Civitai 政策排除「未成年特徵 + 性內容」）；caption 與匯出的 `.txt` 相同，shuffle / keep tokens 預設依標註設定帶入。
+- 只上傳匯出時也會包含的圖片（依 Civitai 政策排除「未成年特徵 + 性內容」）；caption 與匯出的 `.txt` 相同，shuffle / keep tokens 預設依標註設定帶入。Civitai 每張 caption 最多 1024 字：超過時從 WD14 分數最低的標籤開始拿掉，直到放得下（自己加的標籤最後才拿），trigger、描述、附加標籤和色塊關鍵字一律保留。
 
 **上傳與重新訓練**
 
@@ -215,13 +252,14 @@ claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
 { "mcpServers": { "lora-tag-studio": { "type": "http", "url": "http://localhost:7870/mcp" } } }
 ```
 
-共 25 個工具：
+共 27 個工具：
 
 | 類別 | 工具 |
 |---|---|
 | 底模與快速標註 | `list_profiles`、`get_tagging_guide`、`quick_tag_image` |
 | 專案與匯入 | `list_projects`、`create_project`、`get_project`、`update_project_settings`、`add_images_from_urls`、`list_server_import_folders`、`import_server_folder` |
 | 標註與編輯 | `start_tagging`、`get_job_status`、`list_captions`、`get_image`、`update_image_caption`、`bulk_edit_tags`、`get_tag_stats`、`detect_white_blocks` |
+| 放大 | `upscale_images`、`restore_upscaled_images` |
 | 匯出 | `export_dataset` |
 | Civitai 訓練 | `get_civitai_training_types`、`prepare_civitai_training`、`get_civitai_preparation`、`submit_civitai_training`、`get_civitai_training`、`list_active_civitai_trainings` |
 
@@ -259,7 +297,9 @@ curl -OJ "http://localhost:7870/api/projects/<id>/export?format=civitai"
 | `PUBLIC_BASE_URL` | 空 | 回傳給 LLM 的下載連結前綴，例如 `http://192.168.1.10:7870` |
 | `DEFAULT_LANG` | `en` | API / MCP 未指定語言時的語言：`zh-TW` / `en` / `ja` / `ko` / `zh-CN`（WebUI 依瀏覽器自動選擇） |
 | `WD14_MODEL` | `SmilingWolf/wd-eva02-large-tagger-v3` | 預設 WD14 模型（專案可個別覆寫） |
-| `ORT_DEVICE` | `auto` | `auto` / `cpu` / `cuda` |
+| `ORT_DEVICE` | `auto` | `auto` / `cpu` / `cuda`（waifu2x 也用這個設定） |
+| `WAIFU2X_DIR` | `/models/waifu2x` | waifu2x 模型的存放位置 |
+| `WAIFU2X_MODELS_URL` | nunif release 的 `waifu2x_onnx_models_20250502.zip` | 讀取 waifu2x 模型的 zip（伺服器需支援分段下載） |
 | `TAG_CONCURRENCY` | `2` | 同時處理的圖片數（使用遠端 VLM 時可調高） |
 | `HF_TOKEN` | 空 | 選填的 Hugging Face token（提高下載速率） |
 | `VLM_BACKEND` | `openai` | `openai`（OpenAI 相容）/ `anthropic` / `none` |
@@ -286,10 +326,11 @@ app/
   mcp_server.py      MCP 工具
   profiles.py        各底模的預設值、分級對應、標註指南   ← 要新增 / 調整底模改這裡
   pipeline.py        單張圖片標註流程
-  jobs.py            背景標註佇列
+  jobs.py            背景工作佇列（標註、放大）
   services.py        API / MCP 共用邏輯
   exporter.py        Civitai / kohya / jsonl 匯出
   civitai.py         送到 Civitai 雲端訓練（Orchestration API）
+  upscale.py         waifu2x 放大：模型下載、切塊推論、原圖備份 / 還原
   storage.py         上傳、資料夾 / zip 匯入、縮圖
   db.py              SQLite
   tagging/
@@ -323,16 +364,19 @@ DATA_DIR=./data IMPORT_DIR=./import VLM_BACKEND=none uvicorn app.main:app --relo
 - **VLM 顯示無法連線**：確認有加 `--profile vlm`，且 `docker compose logs ollama-pull` 顯示模型已下載完成。
 - **VLM 回 404**：模型名稱與 `ollama list` 不一致。
 - **GPU 沒有被使用**：右上角顯示「WD14 · CPU」時，確認使用了 `docker-compose.gpu.yml` 並重新 `--build`，以及 `docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi` 能正常執行。
-- **JoyCaption 記憶體不足**：調低 `JOYCAPTION_GPU_UTIL` 或改用較小的 VLM；WD14 GPU 版約佔 1–2GB。
+- **JoyCaption 記憶體不足**：調低 `JOYCAPTION_GPU_UTIL` 或改用較小的 VLM；WD14 GPU 版約佔 1–2GB。和其他工具共用顯示卡時，不標註的時候可以從「VRAM ▾」讓 JoyCaption 休眠。
+- **VRAM 選單說 VLM 不能休眠**：joycaption 容器建立時還沒有休眠模式，用 `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption` 重新建立。
+- **`docker compose down` 出現 `Network lora-tag-studio_default  Resource is still in use`**：還有 profile 裡的容器（JoyCaption 或 Ollama）在跑。改用 `docker compose --profile vlm --profile joycaption down`（見[停止](#停止)）。
 - **JoyCaption 啟動失敗 `cannot import name 'PixtralRotaryEmbedding'`**：使用了未修正的 `vllm/vllm-openai` 映像檔。確認 `docker-compose.yml` 的 joycaption 使用 `build:`，並執行 `docker compose ... --profile joycaption up -d --build`。
 - **WebUI 顯示 `common.server_unreachable` 之類的鍵名**：映像檔內沒有語系檔（`app/locales/*.json`），重新 `--build`；`docker compose logs app` 啟動時會列出已載入的語言。
+- **放大卡在「準備 waifu2x 模型」就失敗**：app 第一次要連到 github.com 下載模型，錯誤原因可以看 `docker compose logs app`。
 - **caption 超過 75 tokens**：SD1.5 / SDXL 的 CLIP 一次讀 75 tokens，降低「最多標籤數」或提高門檻；kohya 可用 `--max_token_length=225`。
 
 ## 注意事項
 
 - 本專案與 Civitai 沒有關係。雲端訓練會扣你自己 Civitai 帳號的 Buzz，確認前請先看試算。
 - 請確認你有權使用拿來訓練的圖片，並遵守所用服務的內容規範。
-- 模型（WD14、JoyCaption、Ollama 的模型）在執行時從原作者處下載，適用各自的授權。
+- 模型（WD14、waifu2x、JoyCaption、Ollama 的模型）在執行時從原作者處下載，適用各自的授權。
 
 ## 授權
 

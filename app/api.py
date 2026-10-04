@@ -68,6 +68,25 @@ class IdList(BaseModel):
     ids: list[str]
 
 
+class UpscaleRequest(BaseModel):
+    ids: list[str] | None = Field(None, description="Images to upscale (default: every image whose short side is "
+                                                     "below min_side and that was not upscaled yet)")
+    min_side: int = Field(1024, ge=64, le=8192, description="Target short side in px: picks images when ids is "
+                                                            "omitted (except scale=1), and scale=auto uses 4x only if "
+                                                            "2x stays below it")
+    style: Literal["art", "art_scan", "photo"] = Field("art", description="art = illustrations / anime, art_scan = "
+                                                                          "scans (halftone, paper), photo = photos")
+    noise: str | int = Field("auto", description="JPEG noise reduction: auto (level 1 for JPEG / lossy WebP, none "
+                                                 "otherwise) | none | 0 | 1 | 2 | 3")
+    scale: str | int = Field("auto", description="auto (2x, 4x when 2x stays below min_side) | 2 | 4 | 1 = noise "
+                                                 "reduction only, size unchanged (without ids: JPEG / lossy WebP "
+                                                 "images of any size that were not processed yet)")
+
+
+class UpscaleRestoreRequest(BaseModel):
+    ids: list[str] | None = Field(None, description="Images to restore (default: all upscaled images)")
+
+
 class UrlImport(BaseModel):
     urls: list[str] = Field(..., description="http(s) image URLs to download into the project")
 
@@ -199,11 +218,35 @@ def system_info() -> dict[str, Any]:
         "prune_groups": {k: tr(f"prune_groups.{k}", default=k) for k in PRUNE_GROUPS},
         "export_formats": exporter.export_formats_view(),
         "bulk_actions": services.bulk_actions_view(),
+        "upscale": services.upscale_options(),
         "settings_schema": BASE_SETTINGS,
         "nsfw_common": tr("nsfw_common", default=""),
         "lang": i18n.get_lang(),
         "auth": bool(settings.api_key),
     }
+
+
+class GpuActionRequest(BaseModel):
+    model: str | None = Field(None, description="load_wd14 only: WD14 model repo (default: the server default)")
+
+
+@router.get("/gpu", operation_id="get_gpu_status",
+            summary="VRAM: loaded WD14 / waifu2x models, whether the VLM (vLLM) is sleeping, GPU memory use")
+def gpu_status() -> dict[str, Any]:
+    return services.gpu_status()
+
+
+@router.post("/gpu/{action}", operation_id="manage_vram",
+             summary="Free or load VRAM: release_wd14 | load_wd14 | sleep_vlm | wake_vlm | release_waifu2x",
+             description="release_wd14 unloads the WD14 models (reloaded automatically on the next tagging). "
+                         "release_waifu2x unloads the upscaling models (also done automatically after each "
+                         "upscaling job). "
+                         "sleep_vlm puts vLLM (JoyCaption) to sleep: weights move to system RAM and the VRAM is "
+                         "freed; it wakes automatically before the next VLM call. Releasing is refused while a "
+                         "tagging or upscaling job is queued or running. vLLM must run with --enable-sleep-mode and "
+                         "VLLM_SERVER_DEV_MODE=1 (the bundled joycaption service does).")
+def gpu_action(action: str, body: GpuActionRequest | None = None) -> dict[str, Any]:
+    return services.gpu_action(action, body.model if body else None)
 
 
 @router.get("/profiles", operation_id="list_profiles", summary="List base-model tagging profiles")
@@ -355,6 +398,24 @@ def delete_images(pid: str, body: IdList) -> dict[str, Any]:
 def tag(pid: str, body: TagRequest | None = None) -> dict[str, Any]:
     body = body or TagRequest()
     return services.start_tagging(pid, body.ids, body.only_untagged)
+
+
+@router.post("/projects/{pid}/upscale", operation_id="upscale_images",
+             summary="Upscale low-resolution images, or only remove JPEG noise (scale=1), with waifu2x "
+                     "(background job, poll GET /api/jobs/{id})",
+             description="Uses nunif's swin_unet waifu2x ONNX models (downloaded on first use, ~17–19 MB each) on "
+                         "the same GPU / CPU as WD14. Results are saved as PNG; the original is backed up and can be "
+                         "restored with POST /upscale/restore. Re-upscaling always starts from the original. Tags "
+                         "do not need to be redone; white blocks are re-detected (manual marks are kept).")
+def upscale(pid: str, body: UpscaleRequest | None = None) -> dict[str, Any]:
+    b = body or UpscaleRequest()
+    return services.start_upscale(pid, ids=b.ids, min_side=b.min_side, style=b.style, noise=b.noise, scale=b.scale)
+
+
+@router.post("/projects/{pid}/upscale/restore", operation_id="restore_upscaled_images",
+             summary="Put the original (pre-upscale) images back")
+def upscale_restore(pid: str, body: UpscaleRestoreRequest | None = None) -> dict[str, Any]:
+    return services.restore_upscaled(pid, ids=body.ids if body else None)
 
 
 @router.get("/jobs/{jid}", operation_id="get_job")

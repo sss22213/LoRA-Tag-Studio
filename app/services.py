@@ -4,7 +4,9 @@ from __future__ import annotations
 import fnmatch
 import io
 import ipaddress
+import shutil
 import socket
+import subprocess
 from collections import Counter
 from pathlib import PurePosixPath
 from typing import Any, Iterable
@@ -60,10 +62,21 @@ def image_out(img: dict[str, Any], s: dict[str, Any]) -> dict[str, Any]:
         "blocks": img.get("blocks"),  # 白色色塊偵測結果（null = 尚未偵測）
         "has_blocks": has_blocks(img.get("blocks")),
         "block_tag_applied": bool(block_tags(img, s)),  # caption 已加上白色色塊關鍵字
+        "upscale": img.get("upscale"),  # waifu2x 放大 / 降噪紀錄（含原圖尺寸），null = 沒處理過
+        "lossy": _is_lossy(img),  # 目前的檔案有壓縮雜訊（JPEG / 有損 WebP），可以只降噪
         "flag": policy_flag(img["tags"], img.get("rating"), img.get("nl_caption") or ""),
-        "image_url": f"/api/images/{img['id']}/file",
+        "image_url": f"/api/images/{img['id']}/file?v={int(img['updated_at'])}",
         "thumb_url": f"/api/images/{img['id']}/thumb?v={int(img['updated_at'])}",
     }
+
+
+def _is_lossy(img: dict[str, Any]) -> bool:
+    ext = img["filename"].rsplit(".", 1)[-1].lower()
+    if ext == "webp":  # 有損或無損要看檔頭
+        from .upscale import is_lossy
+
+        return is_lossy(storage.image_path(img))
+    return ext in ("jpg", "jpeg")
 
 
 def project_out(p: dict[str, Any]) -> dict[str, Any]:
@@ -193,6 +206,61 @@ def scan_blocks(pid: str, force: bool = False) -> dict[str, Any]:
     with_blocks = [i["id"] for i in imgs if has_blocks(i.get("blocks"))]
     return {"scanned": len(todo), "total": len(imgs), "with_blocks": len(with_blocks), "ids": with_blocks,
             "unscanned": sum(1 for i in imgs if i.get("blocks") is None)}
+
+
+def upscale_options() -> dict[str, Any]:
+    from . import upscale
+
+    return {"styles": list(upscale.STYLES), "noises": list(upscale.NOISES), "scales": list(upscale.SCALES),
+            "default_min_side": upscale.DEFAULT_MIN_SIDE, "too_small": upscale.TOO_SMALL,
+            "downloaded_models": upscale.downloaded_models()}
+
+
+def start_upscale(pid: str, ids: list[str] | None = None, min_side: int = 1024, style: str = "art",
+                  noise: str | int = "auto", scale: str | int = "auto") -> dict[str, Any]:
+    """用 waifu2x 放大或只降噪（scale=1）圖片（背景工作）。
+    沒指定 ids 時：放大 → 短邊低於 min_side、還沒處理過的圖；只降噪 → 還沒處理過的 JPEG / 有損 WebP（不論大小）。"""
+    from . import upscale
+
+    require_project(pid)
+    noise, scale = str(noise).lower(), str(scale).lower()
+    if style not in upscale.STYLES or noise not in upscale.NOISES or scale not in upscale.SCALES:
+        raise BadRequest(t("msg.upscale_bad_option", styles=", ".join(upscale.STYLES),
+                           noises=", ".join(upscale.NOISES), scales=", ".join(upscale.SCALES)))
+    if scale == "1" and noise == "none":
+        raise BadRequest(t("msg.upscale_nothing_to_do"))
+    imgs = db.list_images(pid, ids=ids)
+    denoise_only = scale == "1"
+    if ids is None:
+        imgs = [i for i in imgs if not i.get("upscale")]
+        imgs = [i for i in imgs if upscale.is_lossy(upscale.source_path(i))] if denoise_only \
+            else [i for i in imgs if min(upscale.original_size(i)) < min_side]
+    elif denoise_only and noise == "auto":  # 自動只對有壓縮雜訊的圖降噪，其他的不排進工作
+        imgs = [i for i in imgs if upscale.is_lossy(upscale.source_path(i))]
+    params = {"style": style, "noise": noise, "scale": scale, "min_side": min_side}
+    return jobs.submit(pid, [i["id"] for i in imgs], kind="upscale", params=params).to_dict()
+
+
+def restore_upscaled(pid: str, ids: list[str] | None = None) -> dict[str, Any]:
+    """把放大過的圖換回原圖（沒指定 ids = 全部）。"""
+    from . import upscale
+
+    require_project(pid)
+    restored, skipped = 0, []
+    for img in db.list_images(pid, ids=ids):
+        if not img.get("upscale"):
+            continue
+        if img["status"] in ("queued", "processing"):
+            skipped.append({"file": img["original_name"], "reason": t("msg.upscale_busy")})
+            continue
+        try:
+            upscale.restore_image(img)
+            restored += 1
+        except (OSError, ValueError) as e:
+            skipped.append({"file": img["original_name"], "reason": str(e)})
+    if restored:
+        db.touch_project(pid)
+    return {"restored": restored, "skipped": skipped}
 
 
 def delete_images(pid: str, ids: list[str]) -> int:
@@ -353,3 +421,66 @@ def captions(pid: str, limit: int = 1000, offset: int = 0) -> dict[str, Any]:
         for i in imgs[offset: offset + limit]
     ]
     return {"total": len(imgs), "offset": offset, "items": items}
+
+
+# ---------------------------------------------------------------- VRAM
+GPU_ACTIONS = ("release_wd14", "load_wd14", "sleep_vlm", "wake_vlm", "release_waifu2x")
+
+
+def _gpu_memory() -> dict[str, int] | None:
+    """整張 GPU 的 VRAM 用量（含其他程式）；容器裡沒有 nvidia-smi 時不顯示。"""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=5).stdout
+        used, total = (int(float(x)) for x in out.splitlines()[0].split(","))
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+    return {"used_mb": used, "total_mb": total}
+
+
+def gpu_status() -> dict[str, Any]:
+    """WD14 / waifu2x 是否載入、VLM（vLLM）是否休眠、是否有工作進行中，以及 GPU 的 VRAM 用量。"""
+    from . import upscale
+    from .tagging import vlm
+    from .tagging.wd14 import loaded_models
+
+    return {
+        "wd14": {"loaded": loaded_models(), "default_model": settings.wd14_default_model},
+        "waifu2x": {"loaded": upscale.loaded_models()},
+        "vlm": {"backend": settings.vlm_backend, "model": settings.vlm_model, **vlm.sleep_status()},
+        "busy": jobs.any_active(),
+        "memory": _gpu_memory(),
+    }
+
+
+def gpu_action(action: str, model: str | None = None) -> dict[str, Any]:
+    """手動釋放 / 載入 VRAM。工作進行中不能釋放（會被下一張圖自動載回，或打斷 VLM）。"""
+    from . import upscale
+    from .tagging import vlm
+    from .tagging.wd14 import get_tagger, unload_all
+
+    if action not in GPU_ACTIONS:
+        raise BadRequest(t("msg.gpu_bad_action", action=action, available=", ".join(GPU_ACTIONS)))
+    if action in ("release_wd14", "sleep_vlm", "release_waifu2x") and jobs.any_active():
+        raise BadRequest(t("msg.gpu_busy"))
+    try:
+        if action == "release_wd14":
+            unload_all()
+        elif action == "release_waifu2x":
+            upscale.unload_all()
+        elif action == "load_wd14":
+            get_tagger(model or None)
+        elif action == "sleep_vlm":
+            vlm.sleep()
+        else:
+            vlm.wake_up()
+    except vlm.VLMError as e:
+        raise BadRequest(str(e)) from e
+    except Exception as e:  # noqa: BLE001  WD14 下載 / 載入失敗
+        if action != "load_wd14":
+            raise
+        raise BadRequest(t("msg.wd14_load_failed", error=e)) from e
+    return gpu_status()

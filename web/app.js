@@ -241,10 +241,67 @@ function renderSysStatus() {
   if (!s) return;
   const gpu = s.wd14.available_providers.includes('CUDAExecutionProvider');
   const v = s.vlm;
+  const sleeping = !!v.sleep?.sleeping;
   $('#sysStatus').innerHTML = `
     <span class="pill" title="${esc(t('sys.wd14_title'))}"><span class="dot ${gpu ? 'ok' : 'warn'}"></span>${esc(t(gpu ? 'sys.wd14_gpu' : 'sys.wd14_cpu'))}</span>
-    <span class="pill" title="${esc(v.message || '')}"><span class="dot ${v.available ? 'ok' : v.backend === 'none' ? '' : 'err'}"></span>
-      VLM · ${esc(v.backend === 'none' ? t('sys.vlm_off') : (v.model || v.backend))}</span>`;
+    <span class="pill" title="${esc(v.message || '')}"><span class="dot ${sleeping ? '' : v.available ? 'ok' : v.backend === 'none' ? '' : 'err'}"></span>
+      VLM · ${esc(v.backend === 'none' ? t('sys.vlm_off') : (v.model || v.backend))}${sleeping ? ` · ${esc(t('vram.sleeping_short'))}` : ''}</span>
+    <span class="dropdown"><button class="pill pill-btn" id="vramBtn" title="${esc(t('vram.button_help'))}">${esc(t('vram.button'))} ▾</button></span>`;
+  $('#vramBtn').onclick = (e) => { e.stopPropagation(); vramMenu(e.currentTarget); };
+}
+
+/* ---------------------------------------------------------------- VRAM：WD14 釋放 / 載入、JoyCaption 休眠 / 喚醒 */
+const gb = (mb) => (mb / 1024).toFixed(1);
+
+async function vramMenu(anchor) {
+  let g;
+  try { g = await api('/gpu'); } catch (e) { toast(e.message, 'err'); return; }
+  const items = [];
+  if (g.memory) items.push({ info: t('vram.memory', { used: gb(g.memory.used_mb), total: gb(g.memory.total_mb) }) });
+  const wd = g.wd14.loaded;
+  const device = wd.some((m) => m.providers.includes('CUDAExecutionProvider')) ? 'GPU' : 'CPU';
+  items.push(wd.length
+    ? { info: t('vram.wd14_loaded', { models: wd.map((m) => m.repo_id.split('/').pop()).join(', '), device }), cls: 'ok' }
+    : { info: t('vram.wd14_unloaded') });
+  items.push(wd.length
+    ? { label: t('vram.wd14_release'), help: t(g.busy ? 'vram.busy' : 'vram.wd14_release_help'), disabled: g.busy,
+      onClick: () => vramAction('release_wd14') }
+    : { label: t('vram.wd14_load'), help: t('vram.wd14_load_help'),
+      onClick: () => vramAction('load_wd14', { model: state.project?.settings?.wd14_model || null }) });
+  const w2x = g.waifu2x.loaded;
+  const w2xDevice = w2x.some((m) => m.providers.includes('CUDAExecutionProvider')) ? 'GPU' : 'CPU';
+  items.push(w2x.length ? { info: t('vram.w2x_loaded', { n: w2x.length, device: w2xDevice }), cls: 'ok' } : { info: t('vram.w2x_unloaded') });
+  if (w2x.length) items.push({ label: t('vram.w2x_release'), help: t(g.busy ? 'vram.busy' : 'vram.w2x_release_help'), disabled: g.busy,
+    onClick: () => vramAction('release_waifu2x') });
+  items.push('-');
+  const v = g.vlm;
+  if (v.backend !== 'openai') items.push({ info: t('vram.vlm_not_local') });
+  else if (v.online === false) items.push({ info: t('vram.vlm_offline'), cls: 'warn' });
+  else if (!v.supported) items.push({ info: t('vram.vlm_unsupported'), cls: 'warn' });
+  else if (v.sleeping) {
+    items.push({ info: t('vram.vlm_sleeping', { model: v.model }) });
+    items.push({ label: t('vram.vlm_wake'), help: t('vram.vlm_wake_help'), onClick: () => vramAction('wake_vlm') });
+  } else {
+    items.push({ info: t('vram.vlm_awake', { model: v.model }), cls: 'ok' });
+    items.push({ label: t('vram.vlm_sleep'), help: t(g.busy ? 'vram.busy' : 'vram.vlm_sleep_help'), disabled: g.busy,
+      onClick: () => vramAction('sleep_vlm') });
+  }
+  items.push('-');
+  items.push({ info: t('vram.auto_note') });
+  dropdown(anchor, items);
+}
+
+async function vramAction(action, body = {}) {
+  const busy = toast(t(`vram.doing_${action}`), 'info', 600000);
+  try {
+    const g = await api(`/gpu/${action}`, { method: 'POST', body });
+    busy.remove();
+    toast(`${t(`vram.done_${action}`)}${g.memory ? ` ${t('vram.memory_now', { used: gb(g.memory.used_mb), total: gb(g.memory.total_mb) })}` : ''}`, 'ok', 6000);
+  } catch (e) {
+    busy.remove();
+    toast(e.message, 'err', 10000);
+  }
+  api('/system').then((s) => { state.system = s; renderSysStatus(); }).catch(() => {});
 }
 
 /* ---------------------------------------------------------------- Router */
@@ -436,6 +493,7 @@ async function renderProject(pid) {
           <select id="fStatus"><option value="">${esc(t('ws.all_status'))}</option>${STATUSES.map((k) => `<option value="${k}">${esc(statusName(k))}</option>`).join('')}</select>
           <select id="fRating"><option value="">${esc(t('ws.all_ratings'))}</option>${RATINGS.map((k) => `<option value="${k}">${esc(ratingName(k))}</option>`).join('')}<option value="none">${esc(t('rating.none'))}</option></select>
           <div class="dropdown"><button class="btn sm" id="btnBlocks" title="${esc(t('blocks.button_help'))}"></button></div>
+          <button class="btn sm" id="btnUpscale" title="${esc(t('upscale.button_help'))}"></button>
           <label class="check" title="${esc(t('ws.blur_help'))}"><input type="checkbox" id="fBlur"> ${esc(t('ws.blur'))}</label>
           <input type="range" id="fSize" min="130" max="340" step="10" style="width:100px" title="${esc(t('ws.thumb_size'))}">
           <span class="count" id="galCount"></span>
@@ -452,6 +510,7 @@ async function renderProject(pid) {
   $('#fStatus').onchange = (e) => { f.status = e.target.value; renderGallery(); };
   $('#fRating').onchange = (e) => { f.rating = e.target.value; renderGallery(); };
   $('#btnBlocks').onclick = (e) => blocksMenu(e.currentTarget);
+  $('#btnUpscale').onclick = () => upscaleDialog();
   $('#fBlur').checked = store.get('blur', true);
   $('#fBlur').onchange = (e) => { store.set('blur', e.target.checked); $('#gallery').classList.toggle('blur-nsfw', e.target.checked); };
   $('#gallery').classList.toggle('blur-nsfw', $('#fBlur').checked);
@@ -556,14 +615,15 @@ function filteredImages() {
 const cardCache = new Map();
 function cardFor(img) {
   const sig = [img.thumb_url, img.status, img.caption, img.rating, img.flag, img.error, img.has_blocks, img.block_tag_applied,
-    state.selected.has(img.id)].join('|');
+    img.upscale?.at, state.selected.has(img.id)].join('|');
   const cached = cardCache.get(img.id);
   if (cached && cached.sig === sig) return cached.el;
   const el = h(`<div class="card ${state.selected.has(img.id) ? 'selected' : ''}" data-id="${img.id}" data-rating="${esc(img.rating || '')}">
       <div class="thumb"><img loading="lazy" src="${img.thumb_url}" alt=""></div>
       <div class="sel"><input type="checkbox" ${state.selected.has(img.id) ? 'checked' : ''}></div>
       <div class="tl">${img.has_blocks ? `<span class="badge blk ${img.block_tag_applied ? 'ok' : ''}" title="${esc(img.block_tag_applied
-    ? t('blocks.card_applied', { tag: state.project.settings.block_tag }) : t('blocks.card_title'))}">▭${img.block_tag_applied ? '✓' : ''}</span>` : ''}${img.rating && img.rating !== 'general' ? ratingBadge(img.rating) : ''}<span class="st ${img.status}" title="${esc(statusName(img.status))}${img.error ? ': ' + esc(img.error) : ''}"></span></div>
+    ? t('blocks.card_applied', { tag: state.project.settings.block_tag }) : t('blocks.card_title'))}">▭${img.block_tag_applied ? '✓' : ''}</span>` : ''}${img.upscale
+    ? `<span class="badge up" title="${esc(upscaledNote(img))}">${upscaledBadge(img)}</span>` : ''}${img.rating && img.rating !== 'general' ? ratingBadge(img.rating) : ''}<span class="st ${img.status}" title="${esc(statusName(img.status))}${img.error ? ': ' + esc(img.error) : ''}"></span></div>
       ${img.flag ? `<div class="flag" title="${esc(img.flag)}">⚠ ${esc(t('gallery.will_exclude'))}</div>` : ''}
       <div class="cap" title="${esc(img.caption)}">${img.caption ? esc(img.caption) : `<i>${esc(img.original_name)}</i>`}</div>
     </div>`);
@@ -605,6 +665,7 @@ function renderGallery() {
   $('#selAll').checked = list.length > 0 && list.every((i) => state.selected.has(i.id));
   renderBulkBar();
   renderBlocksButton();
+  renderUpscaleButton();
 }
 
 function renderBulkBar() {
@@ -617,6 +678,8 @@ function renderBulkBar() {
     <button class="btn sm" data-a="remove">－ ${esc(t('bulk.remove'))}</button>
     <button class="btn sm" data-a="replace">⇄ ${esc(t('bulk.replace'))}</button>
     <button class="btn sm" data-a="tag">▶ ${esc(t('bulk.retag'))}</button>
+    <button class="btn sm" data-a="upscale">⤢ ${esc(t('upscale.bulk'))}</button>
+    ${[...state.selected].some((id) => state.images.find((i) => i.id === id)?.upscale) ? `<button class="btn sm" data-a="restore">↺ ${esc(t('upscale.restore'))}</button>` : ''}
     <button class="btn sm danger" data-a="delete">${esc(t('common.delete'))}</button>
     <span class="grow"></span><button class="btn sm ghost" data-a="clear">${esc(t('bulk.clear'))}</button>`;
   const ids = () => [...state.selected];
@@ -636,6 +699,8 @@ function renderBulkBar() {
       }
       if (a === 'replace') replaceDialog('', ids());
       if (a === 'tag') tagSelected();
+      if (a === 'upscale') upscaleDialog(ids());
+      if (a === 'restore') restoreUpscaled(ids().filter((id) => state.images.find((i) => i.id === id)?.upscale));
       if (a === 'delete') {
         if (await confirmBox(t('bulk.delete_confirm', { n }), { ok: t('common.delete'), danger: true })) {
           await api(`/projects/${pid}/images/delete`, { method: 'POST', body: { ids: ids() } });
@@ -644,6 +709,135 @@ function renderBulkBar() {
       }
     } catch (err) { toast(err.message, 'err'); }
   };
+}
+
+/* ---------------------------------------------------------------- waifu2x 放大 / 降噪 */
+// 短邊太小的圖在訓練時會被一般演算法放大而變糊，JPEG 的壓縮雜訊也會被學進去；先用 waifu2x 放大或只降噪（原圖備份，可還原）
+const upMinSide = () => store.get('upscaleMinSide', state.system.upscale?.default_min_side || 1024);
+const shortSide = (img) => { const o = img.upscale?.original || img; return Math.min(o.width || 0, o.height || 0); };
+const upscaleCandidates = (min) => state.images.filter((i) => !i.upscale && shortSide(i) < min);
+const denoiseCandidates = () => state.images.filter((i) => !i.upscale && i.lossy);  // JPEG / 有損 WebP
+const upscaledNote = (img) => (img.upscale.scale === 1
+  ? t('upscale.card_title_denoise', { noise: img.upscale.noise })
+  : t('upscale.card_title', { scale: img.upscale.scale, w: img.upscale.original.width, h: img.upscale.original.height }));
+const upscaledBadge = (img) => (img.upscale.scale === 1 ? `✧ ${esc(t('upscale.badge_denoise'))}` : `⤢${img.upscale.scale}x`);
+
+function renderUpscaleButton() {
+  const btn = $('#btnUpscale');
+  if (!btn) return;
+  const n = upscaleCandidates(upMinSide()).length;
+  const done = state.images.filter((i) => i.upscale).length;
+  btn.innerHTML = `⤢ ${esc(t('upscale.button'))}${n ? ` <span class="badge" title="${esc(t('upscale.button_badge', { n, min: upMinSide() }))}">${n}</span>` : ''}${done
+    ? ` <span class="badge ok" title="${esc(t('upscale.upscaled_n', { n: done }))}">✓ ${done}</span>` : ''}`;
+}
+
+function upscaleDialog(ids = null) {
+  const up = state.system.upscale;
+  const picked = ids ? state.images.filter((i) => ids.includes(i.id)) : [];
+  const opt = (v, label) => `<option value="${v}">${esc(label)}</option>`;
+  const minInput = `<input type="number" id="upMin" min="64" max="8192" step="64" value="${upMinSide()}" style="width:90px">`;
+  const startMode = store.get('upscaleMode', 'upscale');
+  const body = h(`<div class="upscale">
+      <div class="up-mode">${['upscale', 'denoise'].map((m) => `<label class="check"><input type="radio" name="upMode" value="${m}" ${m === startMode ? 'checked' : ''}> ${esc(t(`upscale.mode_${m}`))}</label>`).join('')}</div>
+      <p class="muted" id="upIntro"></p>
+      ${picked.length ? `<label class="check"><input type="radio" name="upSrc" value="sel" checked> ${esc(t('upscale.src_selected', { n: picked.length }))}</label>` : ''}
+      <label class="check"><input type="radio" name="upSrc" value="auto" ${picked.length ? '' : 'checked'}>
+        <span id="upSrcLow">${esc(t('upscale.src_low', { input: '%INPUT%' })).replace('%INPUT%', minInput)}</span><span id="upSrcLossy">${esc(t('upscale.src_lossy'))}</span></label>
+      <label class="check" id="upSrcAllWrap"><input type="radio" name="upSrc" value="all"> ${esc(t('upscale.src_all'))}</label>
+      <div class="up-list" id="upList"></div>
+      <div class="up-opts">
+        <div class="field"><div class="lbl">${esc(t('upscale.style'))}</div><select id="upStyle">${up.styles.map((v) => opt(v, t(`upscale.style_${v}`))).join('')}</select></div>
+        <div class="field"><div class="lbl">${esc(t('upscale.noise'))}</div><select id="upNoise"></select><div class="help" id="upNoiseHelp"></div></div>
+        <div class="field" id="upScaleField"><div class="lbl">${esc(t('upscale.scale'))}</div><select id="upScale">${up.scales.filter((v) => v !== '1').map((v) => opt(v, t(`upscale.scale_${v}`))).join('')}</select>
+          <div class="help" id="upScaleHelp"></div></div>
+      </div>
+      <div class="help">${esc(t('upscale.note'))}</div>
+      <div id="upDone"></div>
+    </div>`);
+  let targets = [];
+  const denoise = () => $('input[name=upMode]:checked', body).value === 'denoise';
+  const plan = (img) => {
+    const o = img.upscale?.original || img;
+    if (denoise()) return `${o.width}×${o.height}`;
+    const sc = $('#upScale', body).value;
+    const f = sc === 'auto' ? (shortSide(img) * 2 >= +$('#upMin', body).value ? 2 : 4) : +sc;
+    return `${o.width}×${o.height} → ${o.width * f}×${o.height * f}`;
+  };
+  // 只降噪沒有「不降噪」；自動只處理 JPEG / 有損 WebP，所以選取的圖預設用 1 級
+  const setNoiseOptions = () => {
+    const den = denoise();
+    const values = den ? up.noises.filter((v) => !['auto', 'none'].includes(v)) : up.noises;
+    $('#upNoise', body).innerHTML = values.map((v) => opt(v, t(`upscale.noise_${v}`))).join('');
+    $('#upNoise', body).value = den ? '1' : 'auto';
+    $('#upNoiseHelp', body).textContent = t(den ? 'upscale.noise_help_denoise' : 'upscale.noise_help');
+  };
+  const draw = () => {
+    const den = denoise();
+    const min = parseInt($('#upMin', body).value, 10) || 1024;
+    // 「全部（含 PNG）」只用在降噪：PNG 存檔不會產生壓縮雜訊，但內容可能帶著影片 / JPEG 轉存的雜訊
+    $('#upSrcAllWrap', body).hidden = !den;
+    if (!den && $('input[name=upSrc][value=all]', body).checked) $('input[name=upSrc][value=auto]', body).checked = true;
+    const src = $('input[name=upSrc]:checked', body).value;
+    targets = src === 'sel' ? picked : src === 'all' ? state.images.filter((i) => !i.upscale)
+      : den ? denoiseCandidates() : upscaleCandidates(min);
+    $('#upIntro', body).textContent = t(den ? 'upscale.intro_denoise' : 'upscale.intro');
+    $('#upSrcLow', body).hidden = den;
+    $('#upSrcLossy', body).hidden = !den;
+    $('#upScaleField', body).hidden = den;
+    const small = up.too_small;
+    $('#upList', body).innerHTML = targets.length ? `<div class="muted">${esc(t('upscale.count', { n: targets.length }))}</div><div class="up-grid">${targets.slice(0, 300).map((i) => `
+      <div class="up-item" title="${esc(i.original_name)}"><img loading="lazy" src="${i.thumb_url}" alt="">
+        <div>${esc(plan(i))}</div>${!den && shortSide(i) < small ? `<span class="badge warn" title="${esc(t('upscale.too_small_help', { n: small }))}">${esc(t('upscale.too_small'))}</span>`
+          : i.upscale ? `<span class="badge up">${esc(t('upscale.again'))}</span>` : ''}</div>`).join('')}</div>`
+      : `<div class="muted">${esc(t(den ? 'upscale.none_match_denoise' : 'upscale.none_match'))}</div>`;
+    startBtn.textContent = t(den ? 'upscale.start_denoise' : 'upscale.start', { n: targets.length });
+    startBtn.disabled = !targets.length;
+    $('#upScaleHelp', body).textContent = t('upscale.scale_help', { min });
+  };
+  const done = state.images.filter((i) => i.upscale);
+  if (done.length && !ids) {
+    $('#upDone', body).innerHTML = `<div class="row" style="margin-top:12px"><span>${esc(t('upscale.upscaled_n', { n: done.length }))}</span>
+      <button class="btn sm" id="upRestoreAll">↺ ${esc(t('upscale.restore_all'))}</button></div>`;
+  }
+  const m = modal({
+    title: t('upscale.title'), body, size: 'mid',
+    actions: [
+      { label: t('common.cancel'), onClick: (close) => close() },
+      { label: t('upscale.start', { n: 0 }), primary: true, onClick: async (close) => {
+        const den = denoise();
+        const noise = $('#upNoise', body).value, scale = den ? '1' : $('#upScale', body).value;
+        const min = parseInt($('#upMin', body).value, 10) || 1024;
+        store.set('upscaleMode', den ? 'denoise' : 'upscale');
+        if (!den) store.set('upscaleMinSide', min);
+        const job = await api(`/projects/${state.project.id}/upscale`, { method: 'POST', body: {
+          ids: targets.map((i) => i.id), min_side: min, style: $('#upStyle', body).value, noise, scale } });
+        close();
+        if (!job.total) { toast(job.message || t('job.nothing'), 'warn'); return; }
+        toast(t(den ? 'upscale.started_denoise' : 'upscale.started', { n: job.total }), 'ok');
+        watchJob(job.id);
+      } },
+    ],
+  });
+  const startBtn = $('.modal-foot .primary', m.el);
+  $('#upMin', body).oninput = debounce(draw, 250);
+  $('#upMin', body).onfocus = () => { $('input[name=upSrc][value=auto]', body).checked = true; draw(); };
+  $$('input[name=upSrc]', body).forEach((r) => { r.onchange = draw; });
+  $$('input[name=upMode]', body).forEach((r) => { r.onchange = () => { setNoiseOptions(); draw(); }; });
+  $('#upScale', body).onchange = draw;
+  const restoreAll = $('#upRestoreAll', body);
+  if (restoreAll) restoreAll.onclick = async () => { if (await restoreUpscaled(done.map((i) => i.id))) m.close(); };
+  setNoiseOptions();
+  draw();
+}
+
+async function restoreUpscaled(ids) {
+  if (!ids.length || !await confirmBox(t('upscale.restore_confirm', { n: ids.length }))) return false;
+  try {
+    const r = await api(`/projects/${state.project.id}/upscale/restore`, { method: 'POST', body: { ids } });
+    toast(t('upscale.restored', { n: r.restored }) + (r.skipped.length ? ` · ${r.skipped[0].file}: ${r.skipped[0].reason}` : ''), r.skipped.length ? 'warn' : 'ok', 6000);
+    await reloadImages(); refreshEditor();
+    return true;
+  } catch (e) { toast(e.message, 'err'); return false; }
 }
 
 /* ---------------------------------------------------------------- 白色色塊 */
@@ -1143,6 +1337,8 @@ function openEditor(id) {
         <div class="row" style="flex-wrap:wrap">
           <button class="btn" id="edRetag">▶ ${esc(t('editor.retag'))}</button>
           <button class="btn" id="edCopy">${esc(t('editor.copy'))}</button>
+          <button class="btn" id="edUpscale">⤢ ${esc(t('upscale.upscale_one'))}</button>
+          <button class="btn" id="edRestore" hidden>↺ ${esc(t('upscale.restore'))}</button>
           <button class="btn danger" id="edDelete">${esc(t('editor.delete'))}</button>
           <span class="grow"></span>
           <button class="btn" id="edPrev" title="←">‹ ${esc(t('editor.prev'))}</button><button class="btn" id="edNext" title="→">${esc(t('editor.next'))} ›</button>
@@ -1180,11 +1376,15 @@ function openEditor(id) {
     if (cur.error) alerts.push(`<div class="alert warn">${esc(cur.error)}</div>`);
     $('#edAlerts', body).innerHTML = alerts.join('');
     const manual = cur.blocks?.override != null;
-    $('#edMeta', body).innerHTML = `<b style="color:var(--text)">${esc(cur.original_name)}</b> · ${cur.width}×${cur.height} ${ratingBadge(cur.rating)}
+    $('#edMeta', body).innerHTML = `<b style="color:var(--text)">${esc(cur.original_name)}</b> · ${cur.width}×${cur.height}${cur.upscale
+      ? ` <span class="badge up" title="${esc(upscaledNote(cur))}">${cur.upscale.scale === 1
+        ? `✧ ${esc(t('upscale.editor_info_denoise', { noise: cur.upscale.noise }))}`
+        : `⤢ ${esc(t('upscale.editor_info', { scale: cur.upscale.scale, w: cur.upscale.original.width, h: cur.upscale.original.height }))}`}</span>` : ''} ${ratingBadge(cur.rating)}
       <span class="badge"><span class="st ${cur.status}" style="width:8px;height:8px;border:0;border-radius:50%;display:inline-block"></span>${esc(statusName(cur.status))}</span>
       <button class="btn sm ${cur.has_blocks ? 'active' : ''}" id="edBlocks" title="${esc(t('blocks.ed_help'))}">▭ ${esc(t(cur.has_blocks ? 'blocks.ed_has' : 'blocks.ed_none'))}${manual ? ` · ${esc(t('blocks.ed_manual'))}` : ''}</button>
       ${manual ? `<button class="btn sm ghost" id="edBlocksReset" title="${esc(t('blocks.ed_reset'))}">↺</button>` : ''}`;
     $('#edBlocks', body).onclick = () => persist({ has_blocks: !cur.has_blocks });
+    $('#edRestore', body).hidden = !cur.upscale;
     if (manual) $('#edBlocksReset', body).onclick = () => persist({ clear_blocks_override: true });
   }
 
@@ -1231,7 +1431,7 @@ function openEditor(id) {
     cur = list[idx] && state.images.find((x) => x.id === list[idx].id);
     if (!cur) { m.close(); return; }
     tags = [...cur.tags];
-    $('#edImg', body).src = cur.image_url;
+    if ($('#edImg', body).getAttribute('src') !== cur.image_url) $('#edImg', body).src = cur.image_url;
     $('#edNl', body).value = cur.nl_caption || '';
     title.textContent = t('editor.title', { i: idx + 1, n: list.length });
     drawChips(); showPreview();
@@ -1243,6 +1443,8 @@ function openEditor(id) {
   $('#edPrev', body).onclick = () => idx > 0 && load(idx - 1);
   $('#edNext', body).onclick = () => idx < list.length - 1 && load(idx + 1);
   $('#edCopy', body).onclick = () => copyText(cur.caption);
+  $('#edUpscale', body).onclick = () => upscaleDialog([cur.id]);
+  $('#edRestore', body).onclick = () => restoreUpscaled([cur.id]);
   $('#edDelete', body).onclick = async () => {
     if (!await confirmBox(t('editor.delete_confirm'), { ok: t('common.delete'), danger: true })) return;
     await api(`/projects/${state.project.id}/images/delete`, { method: 'POST', body: { ids: [cur.id] } });
@@ -1265,8 +1467,10 @@ function openEditor(id) {
   editor = {
     refresh: () => {
       const fresh = state.images.find((x) => x.id === cur?.id);
-      if (fresh && (fresh.caption !== cur.caption || fresh.status !== cur.status || fresh.error !== cur.error)) {
+      if (fresh && (fresh.caption !== cur.caption || fresh.status !== cur.status || fresh.error !== cur.error
+        || fresh.image_url !== cur.image_url)) {
         cur = fresh; tags = [...cur.tags]; $('#edNl', body).value = cur.nl_caption || ''; drawChips(); showPreview();
+        if ($('#edImg', body).getAttribute('src') !== cur.image_url) $('#edImg', body).src = cur.image_url;
       }
     },
   };
@@ -1571,7 +1775,10 @@ async function civitaiDialog({ focusRuns = false } = {}) {
         ${p.insufficient_buzz ? `<div>${esc(t('civitai.insufficient'))}</div>` : ''}</div>`);
     }
     if (p.excluded) lines.push(`<div class="alert warn">${esc(t('civitai.excluded', { n: p.excluded }))}</div>`);
-    if (p.truncated) lines.push(`<div class="alert warn">${esc(t('civitai.truncated', { n: p.truncated }))}</div>`);
+    if (p.truncated) {
+      lines.push(`<div class="alert warn">${esc(t('civitai.truncated', { n: p.truncated,
+        avg: Math.max(1, Math.round((p.truncated_tags || 0) / p.truncated)) }))}</div>`);
+    }
     if (p.duplicates?.length) {
       lines.push(`<div class="alert warn">${esc(t('civitai.duplicates', { n: p.duplicates.length }))}<ul class="cv-blocked">${
         p.duplicates.slice(0, 20).map((d) => `<li><b>${esc(d.file)}</b> = ${esc(d.same_as)}</li>`).join('')}</ul></div>`);

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import logging
 import threading
 from typing import Any
@@ -36,7 +37,8 @@ _taggers: dict[str, "WD14Tagger"] = {}
 _dlls_preloaded = False
 
 
-def _providers() -> list[str]:
+def ort_providers() -> list[str]:
+    """onnxruntime 要用的 provider（WD14 與 waifu2x 共用）。"""
     import onnxruntime as ort
 
     global _dlls_preloaded
@@ -68,7 +70,7 @@ class WD14Tagger:
 
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.session = ort.InferenceSession(model_path, sess_options=opts, providers=_providers())
+        self.session = ort.InferenceSession(model_path, sess_options=opts, providers=ort_providers())
         self.providers = self.session.get_providers()
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
@@ -123,6 +125,18 @@ def get_tagger(repo_id: str | None = None) -> WD14Tagger:
             tagger = WD14Tagger(repo_id)
             _taggers[repo_id] = tagger
         return tagger
+
+
+def unload_all() -> list[str]:
+    """釋放所有已載入的 WD14 模型（GPU 版會釋放 VRAM）。下次標註時自動重新載入。
+    CUDA 本身的基本占用（數百 MB）在程式結束前不會歸零。"""
+    with _lock:
+        names = list(_taggers)
+        _taggers.clear()
+    gc.collect()
+    if names:
+        log.info("已釋放 WD14 模型：%s", ", ".join(names))
+    return names
 
 
 def loaded_models() -> list[dict[str, Any]]:
