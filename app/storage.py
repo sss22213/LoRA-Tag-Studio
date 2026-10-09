@@ -153,7 +153,7 @@ def delete_project_files(pid: str) -> None:
 Entry = tuple[str, Callable[[], bytes]]
 
 
-def _stem_key(path: str) -> str:
+def stem_key(path: str) -> str:
     p = PurePosixPath(path.replace("\\", "/"))
     return str(p.with_suffix("")).lower()
 
@@ -174,9 +174,9 @@ def pair_files(entries: Iterable[Entry]) -> Iterator[tuple[str, Callable[[], byt
         if ext in IMAGE_EXTS:
             images.append((path, read))
         elif ext in (".txt", ".caption"):
-            captions[_stem_key(path)] = read().decode("utf-8", errors="replace")
+            captions[stem_key(path)] = read().decode("utf-8", errors="replace")
     for path, read in images:
-        yield path, read, captions.get(_stem_key(path))
+        yield path, read, captions.get(stem_key(path))
 
 
 def import_entries(pid: str, entries: Iterable[Entry], trigger: str = "") -> dict[str, Any]:
@@ -209,7 +209,7 @@ def import_zip(pid: str, fileobj: Any, trigger: str = "") -> dict[str, Any]:
         return import_entries(pid, entries, trigger=trigger)
 
 
-def _safe_import_path(subpath: str) -> Path:
+def safe_import_path(subpath: str) -> Path:
     base = settings.import_dir.resolve()
     target = (base / subpath.lstrip("/")).resolve()
     if target != base and base not in target.parents:
@@ -220,7 +220,7 @@ def _safe_import_path(subpath: str) -> Path:
 
 
 def server_dir_entries(subpath: str, recursive: bool = True) -> list[Entry]:
-    root = _safe_import_path(subpath)
+    root = safe_import_path(subpath)
     files = root.rglob("*") if recursive else root.iterdir()
     return sorted(
         (str(p.relative_to(root)), p.read_bytes)

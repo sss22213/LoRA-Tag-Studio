@@ -17,7 +17,7 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -704,6 +704,7 @@ def list_runs(project_id: str, refresh: bool = True) -> list[dict[str, Any]]:
         if refresh and configured() and (run["status"] not in TERMINAL or run["status"] == "succeeded"
                                          or _watch_refund(run)):
             _refresh_into(run, max_age=5)
+        run["a1111"] = db.a1111_imports(run["workflow_id"])  # 已經匯入 A1111 / Forge 的 epoch
     return runs
 
 
@@ -864,11 +865,17 @@ def _prepare_body(prep: Prep, project: dict[str, Any], s: dict[str, Any], images
     max_side = int(params.get("max_side") or 2048)
     results: dict[str, tuple[str | None, str | None, bool]] = {}
     with ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
-        futures = {img["id"]: pool.submit(_upload_one, img, max_side, use_cache) for img in images}
-        for img in images:
-            results[img["id"]] = futures[img["id"]].result()
-            prep.done += 1
-            prep.reused += 1 if results[img["id"]][2] else 0
+        futures = {pool.submit(_upload_one, img, max_side, use_cache): img["id"] for img in images}
+        try:
+            # 傳完幾張就算幾張：一張特別慢時，進度不會停在它前面
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+                prep.done += 1
+                prep.reused += 1 if results[futures[fut]][2] else 0
+        except BaseException:
+            for fut in futures:  # 有一張失敗就不必等其他的傳完；已經傳好的會留在快取，下次沿用
+                fut.cancel()
+            raise
     items, kept, seen = [], [], {}
     for img in images:  # 依資料集順序（順序會影響 Civitai 的重複任務判斷）
         blob_id, blocked, _ = results[img["id"]]

@@ -424,7 +424,7 @@ def captions(pid: str, limit: int = 1000, offset: int = 0) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- VRAM
-GPU_ACTIONS = ("release_wd14", "load_wd14", "sleep_vlm", "wake_vlm", "release_waifu2x")
+GPU_ACTIONS = ("release_wd14", "load_wd14", "sleep_vlm", "wake_vlm", "release_waifu2x", "release_ccip")
 
 
 def _gpu_memory() -> dict[str, int] | None:
@@ -442,14 +442,15 @@ def _gpu_memory() -> dict[str, int] | None:
 
 
 def gpu_status() -> dict[str, Any]:
-    """WD14 / waifu2x 是否載入、VLM（vLLM）是否休眠、是否有工作進行中，以及 GPU 的 VRAM 用量。"""
-    from . import upscale
+    """WD14 / waifu2x / CCIP 是否載入、VLM（vLLM）是否休眠、是否有工作進行中，以及 GPU 的 VRAM 用量。"""
+    from . import finder, upscale
     from .tagging import vlm
     from .tagging.wd14 import loaded_models
 
     return {
         "wd14": {"loaded": loaded_models(), "default_model": settings.wd14_default_model},
         "waifu2x": {"loaded": upscale.loaded_models()},
+        "ccip": {"loaded": finder.loaded_models()},
         "vlm": {"backend": settings.vlm_backend, "model": settings.vlm_model, **vlm.sleep_status()},
         "busy": jobs.any_active(),
         "memory": _gpu_memory(),
@@ -458,19 +459,21 @@ def gpu_status() -> dict[str, Any]:
 
 def gpu_action(action: str, model: str | None = None) -> dict[str, Any]:
     """手動釋放 / 載入 VRAM。工作進行中不能釋放（會被下一張圖自動載回，或打斷 VLM）。"""
-    from . import upscale
+    from . import finder, upscale
     from .tagging import vlm
     from .tagging.wd14 import get_tagger, unload_all
 
     if action not in GPU_ACTIONS:
         raise BadRequest(t("msg.gpu_bad_action", action=action, available=", ".join(GPU_ACTIONS)))
-    if action in ("release_wd14", "sleep_vlm", "release_waifu2x") and jobs.any_active():
+    if action in ("release_wd14", "sleep_vlm", "release_waifu2x", "release_ccip") and jobs.any_active():
         raise BadRequest(t("msg.gpu_busy"))
     try:
         if action == "release_wd14":
             unload_all()
         elif action == "release_waifu2x":
             upscale.unload_all()
+        elif action == "release_ccip":
+            finder.unload_all()
         elif action == "load_wd14":
             get_tagger(model or None)
         elif action == "sleep_vlm":

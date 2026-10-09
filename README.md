@@ -9,6 +9,7 @@ A self-hosted tool that turns a folder of images into a LoRA training dataset. I
 - **NSFW support**: WD14 outputs NSFW tags unfiltered, rating tags are converted per base model, there is an explicit-description mode for VLMs, and an optional uncensored JoyCaption service.
 - **Web UI**: drag-and-drop folders or zips, gallery filters, a tag editor (drag to reorder, autocomplete), tag statistics, bulk add / remove / replace, trait pruning for character LoRAs, and a blacklist.
 - **waifu2x upscaling and denoising**: images whose short side is too small are upscaled before training, so the LoRA does not learn blur, and JPEG noise can be removed without changing the size. Originals are kept and can be restored.
+- **Character finder**: pick one character out of a pile of images by comparing them with a few reference images (CCIP), then download the picks or import them into a project.
 - **Civitai cloud training**: upload images and captions, get a Buzz estimate, start training after you confirm, follow the progress, and download the LoRA of every epoch (Civitai Orchestration API).
 - **Usable by other LLMs**: a REST API (its OpenAPI spec works as a tool server) and an MCP server (Claude Desktop, Claude Code, Cursor, Open WebUI).
 - **Five languages**: the web UI, error messages, tagging guides and exported READMEs are available in English, 繁體中文, 日本語, 한국어 and 简体中文. The UI follows the browser language and can be switched in the top-right corner.
@@ -144,6 +145,59 @@ Trainers enlarge images whose short side is below the training resolution (about
 - **Speed and VRAM**: measured on an RTX 5090, 960×540 → 1920×1080 takes about 0.3 s per image; on CPU it takes about 6–9 s. Each loaded model uses about 0.6–0.8 GB of VRAM, plus about 0.5 GB for CUDA itself, and everything is freed when the job ends. Upscaling and tagging jobs run one after the other, never at the same time.
 - API: `POST /api/projects/{id}/upscale` (`"scale": 1` = denoise only), `POST /api/projects/{id}/upscale/restore`; MCP: `upscale_images`, `restore_upscaled_images`.
 
+## SMB servers (NAS / shared folders)
+
+Images on a NAS or a Windows shared folder can be added without going through the browser: "More import → SMB server" in a project, or "Add → SMB server" in the character finder.
+
+- **Connection**: host (IP or name; pasting `\\nas\share` fills in the share too), share name, user name, password, optional domain and port (445). "Test connection" checks the host, the login and the share; a connection is only saved when it works. The password is stored on the server (`data/studio.db`, not encrypted, like the Civitai key in `.env`) and is never shown by the page or the API; leave it empty when editing to keep it.
+- **Pick like in a file browser**:
+  - Click a folder to open it; images show thumbnails. Thumbnails can be turned off for a plain list, which is faster on a slow network.
+  - Tick folders and images to import several at once. Ticks are kept when you change folders or connections, so one import can combine several NAS boxes.
+  - Shift selects a range, and "Select all here" ticks everything in the current folder.
+  - ⤢ opens a preview; ← → move between images and Space ticks one.
+  - With nothing ticked, the current folder is imported.
+  - Ticked folders can include their sub folders. Duplicates, such as a folder and an image inside it, are imported once.
+  - The import runs as a background job with progress, so large folders do not freeze the page. If one item cannot be read, the others are still imported and the error is listed in the job result.
+  - Thumbnails are cached in `data/cache/smb/` and removed when a connection is edited or deleted.
+- **Projects** download the images (training and export need local files); same-name `.txt` files become existing captions, also for individually ticked images. **Character searches** only store the SMB paths and read the files when needed (search, previews, downloads), so a large share takes no extra space. Deleting a connection makes those images unreadable; the confirmation shows how many there are.
+- The app container must reach the SMB server. Use an IP address if a name such as `nas.local` (mDNS) does not resolve inside Docker. Set `API_KEY` when the app is reachable from other machines.
+- Uses [smbprotocol](https://github.com/jborean93/smbprotocol) (MIT); SMB 2 / 3.
+- API: `GET/POST /api/smb`, `PATCH/DELETE /api/smb/{id}`, `POST /api/smb/test`, `GET /api/smb/{id}/browse?path=` (sub folders and images with name, size and mtime), `POST /api/smb/import` (`items`: `[{conn_id, path, dir}]`, may span connections; `target`: `project` / `finder`).
+
+## Character finder (CCIP)
+
+"Character finder" in the top bar picks the images of one character out of a pile of images. It is separate from projects and never changes project images.
+
+1. **New search**: choose the CCIP default model (150 MB, about 2 GB of VRAM) or the large model (384 MB, about 3 GB, slightly more accurate).
+2. **Reference images of the character**: one works; 3–10 solo images with a clear face, different angles and outfits are steadier. A reference that does not look like the others is marked with "?".
+3. **Exclude (optional)**: images of similar-looking characters, for example the same hair color. Images that look more like these do not match.
+4. **Images to search**: as many as you like.
+5. **Run**, then review the results, sorted by similarity. Matches are selected automatically. The threshold slider starts at the model's published value (0.178 / 0.213); lower is stricter.
+6. **Fix mistakes by hand**: ✕ on a card marks a wrong pick as "not the target"; ✓ under "Others" marks an image the model missed as the target (the tag filter below still applies to it). In the preview, ← → browse, X excludes and V marks the target. Manual decisions stay when the threshold changes or on re-runs; ↺ undoes them.
+7. **Tag filter (optional)**: "Also generate tags" is on by default and tags the images to search with WD14 during the run. Above the results you can type tags:
+   - A match must have a tag, or must not have it when it starts with `-`, e.g. `-multiple girls` drops group shots.
+   - "Common" lists the tags found in the results with their counts, character tags first; click a tag to require it, or the − next to it to exclude it.
+   - Only the targets are filtered: CCIP matches and images marked ✓. ✕ always excludes. Images removed by tags are listed under "Filtered by tags" with the reason; when WD14 got the tags wrong, ＋ ("Keep despite tags") keeps one anyway.
+   - While a filter is set, images without tags cannot be checked, so they do not match and are listed under "No tags yet"; they are checked once tagged. "Matches" therefore means targets that pass the tag filter (plus images kept despite tags).
+   - The filter is saved, and downloads and project imports use the filtered result. If tags were not generated, a "Generate tags" button above the results adds them without recomputing features.
+8. **Download** the selected images as a zip, or **import them into a new or existing project** (images only, duplicates skipped).
+
+- **Remove duplicates**: lists groups of nearly identical images and acts only after you confirm. Two places:
+  - **In the results** (the button in the results bar, or the ⋯ menu at the top right): only the current matches are compared, and duplicates are excluded (restore them with ↺ in the "Others" tab).
+  - **In all images to search** (the button in the "Images to search" header): duplicates are removed from the search. 50,000 images take a few seconds the first time; changing the tolerance afterwards is almost instant.
+  - **Tolerance** (1–16): the average difference of the two images shrunk to 32×32 (0–255). Up to 2 = practically identical (size, compression, subtitles); 3–6 = the same shot, even if the mouth or a blink differs; 7–11 = expressions and gestures may differ too; higher may also include camera moves. Across all images, 8 or more can also group different characters on the same background, so keep it lower there (default 4; 6 in the results). A perceptual hash picks the candidates first.
+  - **Which image is kept**: one that currently matches first, so a frame of another character never replaces one of yours. Then the highest resolution (PNG first on a tie). Click a thumbnail to keep another one; unticked groups are left alone.
+  - Images are only removed from the search; files on SMB, in the server folder or in projects are not deleted. Images that were already searched have fingerprints; the others are read once first (CPU only).
+
+- **Image sources** for references, exclusions and the images to search: images, folders or zip files from your computer (button or drag and drop), an SMB server (referenced, see [SMB servers](#smb-servers-nas--shared-folders)), the server import folder (`./import`, referenced instead of copied), or images of an existing project (hard-linked, so no extra space).
+- Features are stored, so changing the threshold is instant, and adding images only processes the new ones. Changing the references or exclusions keeps the features but needs a re-run; switching the model recomputes everything.
+- **Accuracy**: tested on the author's anime screenshot datasets, five similar characters from the same series plus one from another series. It identified 99.7% of solo images correctly with only 1–5 references each, and also found about two thirds of the images WD14 could not recognize.
+- **Limitations**: CCIP compares whole images. A small character in a crowded frame, several characters in one image, or images mostly covered by white blocks can be missed or confused. Original or very new characters were not tested.
+- **Speed and VRAM**: about 35 ms per image on an RTX 5090 (mostly image decoding), about 130 ms on CPU. The model is freed when the job ends; generating tags loads WD14 for the run and frees it again if it was not loaded before. The search shares the job queue with tagging and upscaling, so they never run at the same time. Next to "Run" there is the same VRAM menu as in the top bar, and "Free other models' VRAM first" unloads WD14 and waifu2x and puts JoyCaption to sleep before the search starts.
+- **Model**: [deepghs/ccip_onnx](https://huggingface.co/deepghs/ccip_onnx) (OpenRAIL license), downloaded from Hugging Face on first use.
+- Files: uploads live in `data/finder/<id>/`. Deleting a search deletes them; files in the server import folder are never touched.
+- API: `POST /api/finder`, `POST /api/finder/{id}/upload?role=ref|neg|pool`, `/import-server`, `/import-project`, `/run` (`tags: true` also tags the pool), `/manual`, `PATCH /api/finder/{id}` (`tag_filter`), `GET /duplicates?threshold=1–16&scope=all|matches`, `/hash`, `/download`, `/to-project` (see `/docs`).
+
 ## Danbooru tags from a VLM (JoyCaption)
 
 JoyCaption Beta One has a built-in "Danbooru tag list" mode. Settings → "Danbooru tags (WD14 / VLM)" → "Danbooru tags from the VLM":
@@ -172,7 +226,8 @@ The "VRAM ▾" button in the top-right corner frees the VRAM held by the local m
 - The bundled `joycaption` service starts vLLM with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1`. If your container was created before this, recreate it with `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption`. The development endpoints this turns on are only reachable from the app, because the service publishes no port.
 - Ollama unloads its model by itself after `OLLAMA_KEEP_ALIVE` (default 10 minutes) and cannot be put to sleep from here.
 - The menu also shows the GPU's total VRAM use (all programs) when `nvidia-smi` is available.
-- API: `GET /api/gpu`, `POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x}`.
+- **CCIP** (character finder): loaded only while a search runs and freed automatically.
+- API: `GET /api/gpu`, `POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip}`.
 
 ## Civitai cloud training
 
@@ -229,6 +284,14 @@ Train on Civitai's GPUs through the [Orchestration API](https://developer.civita
 - The estimate may include a Civitai discount; the form then also shows the undiscounted price, and the final charge may settle at that amount (charged when the run is submitted, the rest when it finishes). "Training runs" shows what was actually charged according to Civitai's transactions.
 - Cancelling sends `status: canceled`, the same request the civitai.com site uses; training stops and cannot be resumed. Cancelling is asynchronous: Civitai shows "Canceled" only after the training machine stops, which can take a few minutes, and the run shows "Cancelling" until then. Civitai only documents refunds for work that has not started; after cancelling, "Training runs" shows the Buzz actually refunded (it keeps checking for an hour after the run ends).
 - Prices follow Civitai's current rates (for example 0.2 Buzz per step + 10 Buzz per epoch for SDXL / SD1, and at least 80% of the default configuration's price). The estimate is the reference.
+
+**Import into A1111 / Forge**: each epoch in the training history has a "→ A1111" button; nothing is imported until you press it.
+- Needs the LoRA import API of [Forge Neo Chino](https://github.com/sss22213/sd-webui-forge-neo-chino) (`POST /sdapi/v1/lora/import`) and `A1111_URL` in `.env`. Use `http://host.docker.internal:7860` when Forge runs on the same host; without it the button is hidden.
+- Forge downloads the LoRA itself from Civitai's signed URL; it does not pass through this app. The file goes into `A1111_LORA_SUBFOLDER` (default `LoRA-Tag-Studio`) of the Lora folder, named like `kirima_syaro_20261004_3rmo_e10.safetensors` (trigger word, training date and id, epoch).
+- The card is filled in too: the trigger word (added after `<lora:…>` when you click the card), the base model type (used by Forge's preset filter), a description (project and epoch), and the first sample image as the preview.
+- No Forge restart is needed; press refresh in the Lora tab. When it is done, a ready-to-paste prompt is shown.
+- An identical file already in Forge is not downloaded again. A different file with the same name asks before overwriting. Imported epochs are marked "In A1111".
+- API: `POST /api/civitai/runs/{id}/a1111` (`epoch`, `overwrite`), and `GET /api/a1111` checks that Forge is reachable; MCP tool `import_lora_to_a1111`.
 
 **API / MCP**: `GET /api/civitai` lists every type's `fields`, `defaults` and `max_batch`; sending a parameter the type does not support returns an error. MCP flow: `get_civitai_training_types` → `prepare_civitai_training` (takes `training_type`, `priority`, `force_upload` and the parameters above) → `get_civitai_preparation` (the estimate) → `submit_civitai_training` only after the user confirms the cost → `get_civitai_training`.
 
@@ -308,6 +371,9 @@ When `API_KEY` is set, every `/api` and `/mcp` request needs `Authorization: Bea
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT` | –, `claude-opus-5-5`, `low` | Used with `VLM_BACKEND=anthropic` (server-side refusal fallback enabled) |
 | `ALLOW_PRIVATE_URLS` | `0` | Allow private network addresses in "Import from URL" (off to prevent SSRF) |
 | `CIVITAI_API_KEY` | empty | Key for Civitai cloud training (kept on the server) |
+| `A1111_URL` | empty | A1111 / Forge address (needs Forge Neo Chino's LoRA import API), e.g. `http://host.docker.internal:7860`; enables "→ A1111" in the training history |
+| `A1111_LORA_SUBFOLDER` | `LoRA-Tag-Studio` | Sub folder of the Lora folder to import into (empty = the Lora folder itself) |
+| `A1111_API_AUTH` | empty | `user:password` when Forge runs with `--api-auth` |
 | `JOYCAPTION_GPU_UTIL` | `0.7` | Share of VRAM vLLM reserves |
 | `JOYCAPTION_VLLM_IMAGE` / `JOYCAPTION_TRANSFORMERS` | `vllm/vllm-openai:v0.30.0` / `5.16.1` | vLLM image and transformers version for JoyCaption; rebuild with `--build` after changing them |
 
@@ -332,7 +398,10 @@ app/
   services.py        Logic shared by the API and MCP
   exporter.py        Civitai / kohya / jsonl export
   civitai.py         Civitai cloud training (Orchestration API)
+  a1111.py           Import trained LoRAs into A1111 / Forge
   upscale.py         waifu2x upscaling: model download, tiled inference, backup / restore
+  finder.py          Character finder: CCIP features, scoring, tag filter, duplicates, image sources, download / import
+  smb.py             SMB sources: saved connections, browsing and thumbnails, importing ticked folders / images
   storage.py         Uploads, folder / zip import, thumbnails
   db.py              SQLite
   tagging/
@@ -378,7 +447,7 @@ DATA_DIR=./data IMPORT_DIR=./import VLM_BACKEND=none uvicorn app.main:app --relo
 
 - This project is not affiliated with Civitai. Cloud training spends Buzz from your own Civitai account; check the estimate before you confirm.
 - You are responsible for having the rights to the images you train on and for following the content rules of the services you use.
-- Models (WD14, waifu2x, JoyCaption, Ollama models) are downloaded from their publishers at runtime and are subject to their own licenses.
+- Models (WD14, waifu2x, CCIP, JoyCaption, Ollama models) are downloaded from their publishers at runtime and are subject to their own licenses.
 
 ## License
 

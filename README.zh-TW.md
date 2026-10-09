@@ -9,6 +9,7 @@
 - **支援 NSFW**：WD14 完整輸出 NSFW 標籤、各底模分級標籤自動換算、VLM 露骨描述模式、可選的無審查 JoyCaption 服務。
 - **WebUI**：拖放上傳資料夾 / zip、圖庫篩選、標籤編輯（拖曳排序、自動完成）、標籤統計、批次加入 / 移除 / 取代、角色特徵修剪、黑名單。
 - **waifu2x 放大與降噪**：短邊太小的圖先放大再訓練，LoRA 才不會學到模糊；也可以只去掉 JPEG 雜訊、不改尺寸。原圖會保留，可以還原。
+- **角色篩選**：給幾張參考圖，用 CCIP 從一堆圖片挑出某個角色，挑好的圖可以下載或匯入專案。
 - **直接送到 Civitai 雲端訓練**：上傳圖片與 caption、試算 Buzz、確認後開始訓練、查看進度，並下載每個 epoch 的 LoRA（Civitai Orchestration API）。
 - **給其他 LLM 使用**：REST API（OpenAPI 規格可直接當 tool server）＋ MCP 伺服器（Claude Desktop / Claude Code / Cursor / Open WebUI）。
 - **多國語言**：WebUI、錯誤訊息、標註指南與匯出的 README 支援繁體中文、English、日本語、한국어、简体中文，依瀏覽器語言自動切換，右上角可手動選擇。
@@ -144,6 +145,67 @@ docker compose --profile vlm --profile joycaption down
 - **速度與 VRAM**：在 RTX 5090 上實測，960×540 → 1920×1080 每張約 0.3 秒；CPU 約 6–9 秒。每個載入的模型約占 0.6–0.8 GB VRAM，另加 CUDA 本身約 0.5 GB，工作結束時全部自動釋放。放大和標註工作會輪流執行，不會同時跑。
 - API：`POST /api/projects/{id}/upscale`（`"scale": 1` = 只降噪）、`POST /api/projects/{id}/upscale/restore`；MCP：`upscale_images`、`restore_upscaled_images`。
 
+## SMB 伺服器（NAS / 分享資料夾）
+
+NAS 或 Windows 分享資料夾裡的圖片，可以由伺服器直接讀取，不經過瀏覽器：專案用「更多匯入 → SMB 伺服器」，角色篩選用「加入 → SMB 伺服器」。
+
+- **連線設定**：
+  - 主機（IP 或名稱；貼上 `\\nas\share` 會自動填好分享名稱）、分享名稱、使用者、密碼，網域與連接埠（445）可不填。
+  - 「測試連線」會確認主機、帳密與分享都正確，連得上才會儲存。
+  - 密碼存在伺服器（`data/studio.db`），沒有加密，和 `.env` 裡的 Civitai 金鑰同一層級；網頁和 API 都不會顯示。編輯時密碼欄留空 = 不變。
+- **像檔案瀏覽器一樣挑選**：
+  - 點資料夾打開，圖片會顯示縮圖；縮圖可以關掉，改成清單，網路慢時比較快。
+  - 勾選資料夾或圖片可以一次匯入多個。換資料夾、換連線時勾選都會保留，所以一次匯入可以來自不同的 NAS。
+  - Shift 可以連續選取，「全選這一層」一次勾選目前資料夾的全部項目。
+  - ⤢ 放大預覽，← → 切換，空白鍵勾選。
+  - 沒有勾選時，匯入目前的資料夾。
+  - 勾選的資料夾可以選擇是否包含子資料夾；重複的圖片（例如勾了資料夾又勾了裡面的圖）只會匯入一次。
+  - 匯入在背景工作裡執行並顯示進度，大量圖片也不會讓網頁卡住。某個項目讀不到時，其他照常匯入，錯誤列在工作結果裡。
+  - 縮圖快取在 `data/cache/smb/`，刪除或修改連線時會清掉。
+- **專案**會把圖片下載下來（訓練、匯出都要本機檔案），同名的 `.txt` 會當成既有的 caption（單獨勾選的圖片也會帶上同一資料夾裡的同名 `.txt`）。
+- **角色篩選**只記 SMB 路徑，辨識、預覽、下載時才讀取，大量圖片也不多佔空間。刪除連線後這些圖片就讀不到了，刪除前的確認視窗會顯示有幾張。
+- app 的容器要連得到 SMB 伺服器。`nas.local` 這類名稱（mDNS）在 Docker 裡可能解析不到，請改用 IP。app 開放給其他電腦連線時，記得設定 `API_KEY`。
+- 使用 [smbprotocol](https://github.com/jborean93/smbprotocol)（MIT），支援 SMB 2 / 3。
+- API：`GET/POST /api/smb`、`PATCH/DELETE /api/smb/{id}`、`POST /api/smb/test`、`GET /api/smb/{id}/browse?path=`（子資料夾與圖片的名稱、大小、修改時間）、`POST /api/smb/import`（`items`：`[{conn_id, path, dir}]`，可跨連線；`target`：`project` / `finder`）。
+
+## 角色篩選（CCIP）
+
+上方的「角色篩選」可以從一堆圖片挑出某個角色。它和專案分開，不會動到專案裡的圖片。
+
+1. **新增篩選**：選 CCIP 預設模型（150 MB，約 2 GB VRAM）或大模型（384 MB，約 3 GB，稍微準一點）。
+2. **目標角色的參考圖**：1 張就能用；3–10 張單人、臉清楚、不同角度與服裝會更穩。和其他參考圖不像的會標「?」，可能是放錯圖。
+3. **排除（可不加）**：長得像的其他角色，例如髮色相近的。圖片比較像這些角色時就不算符合。
+4. **要篩選的圖片**：多少張都可以。
+5. **開始辨識**：結果依相似度排列，符合的會自動勾選。門檻滑桿預設是模型公布的值（0.178 / 0.213），調低比較嚴格。
+6. **手動修正**：模型挑錯的按卡片上的 ✕，標為「不是目標」；漏掉的在「不符合」裡按 ✓ 標成「是目標」（下面的 tag 篩選仍然會套用）。放大檢視時可以用 ← → 切換，按 X 排除、V 標成是目標。手動判定會保留，換門檻或重新辨識都不會蓋掉；按 ↺ 取消。
+7. **tag 篩選（可不用）**：「同時產生 tag」預設勾選，辨識時用 WD14 幫要篩選的圖片產生 tag。結果上方可以輸入 tag：
+   - 必須有某個 tag，或前面加 `-` 代表不能有，例如 `-multiple girls` 去掉多人圖。
+   - 「常見」列出這批結果裡出現的 tag 和張數，角色 tag 排在最前面；按 tag 是「必須有」，按旁邊的 − 是「不能有」。
+   - 只篩「是目標」的圖片：CCIP 挑出的和手動 ✓ 的。✕ 一定排除。被篩掉的圖片在「被 tag 篩掉」裡，卡片上會寫原因；WD14 標錯時按 ＋（忽略 tag 保留）可以留下來。
+   - 有設定篩選時，還沒產生 tag 的圖片無法確認，先不算符合，列在「還沒有 tag」裡；產生 tag 後會自動判斷。所以「符合」就是通過 tag 篩選的目標（加上忽略 tag 保留的）。
+   - 篩選條件會存起來，下載和匯入專案都照篩選後的結果。辨識時沒勾的話，結果上方也有「產生 tag」按鈕，只補 tag、不重算特徵。
+8. **下載**選取的圖片（zip），或**匯入新的 / 既有的專案**。只匯入圖片，重複的會略過。
+
+- **移除重複**：列出幾乎相同的圖片分組，確認後才處理。有兩個地方：
+  - **在篩選結果裡**（結果列的按鈕，或右上角 ⋯ 選單）：只比對目前符合的圖片，重複的改成手動排除（在「不符合」分頁按 ↺ 可以復原）。
+  - **在所有要篩選的圖片裡**（「要篩選的圖片」標題列右邊的按鈕）：重複的從這個篩選移除。5 萬張第一次約幾秒，之後調整差異容許幾乎立即更新。
+  - **差異容許**（1–16）：兩張圖縮成 32×32 後的平均差異（0–255）。2 以下 = 幾乎一模一樣（尺寸、壓縮、字幕不同）；3–6 = 同一個鏡頭，嘴型、眨眼不同也算；7–11 = 表情、手勢不同也算；更大時鏡頭移動也可能算進來。在所有圖片裡找時，8 以上同背景的不同角色也可能算進來，建議小一點（預設 4；篩選結果裡預設 6）。先用感知雜湊挑出候選。
+  - **保留哪張**：優先保留目前符合的，不會留下別的角色那張、丟掉目標角色那張；再來是解析度最高的（同解析度時優先 PNG）。點縮圖可以改留另一張，取消勾選的組不處理。
+  - 只從這個篩選移除，SMB、伺服器資料夾和專案裡的原檔不會被刪。辨識過的圖片已經有指紋，可以直接找；還沒辨識的會先讀一次圖片（只用 CPU）。
+
+- **圖片來源**：參考圖、排除參考圖、要篩選的圖片都可以從這些地方加入：
+  - 本機的圖片、資料夾、zip（按鈕或拖放）
+  - SMB 伺服器（只記路徑，見[SMB 伺服器](#smb-伺服器nas--分享資料夾)）
+  - 伺服器匯入資料夾 `./import`（只記路徑，不複製）
+  - 既有專案的圖片（用硬連結，不多佔空間）
+- 特徵會存起來，所以調門檻是即時的，加入新圖片也只算新的那幾張。參考圖或排除參考圖改變時，特徵可以沿用，但要重新辨識；換模型則全部重算。
+- **準確度**：在作者的動畫截圖資料集上測試，包含同系列 5 個長得像的角色和另一部作品的 1 個角色。每個角色只給 1–5 張參考圖，單人圖的辨識正確率是 99.7%；WD14 認不出的圖也能找回約三分之二。
+- **限制**：CCIP 是整張圖比對。人物很小、多人同框，或畫面大半被白色色塊蓋住的圖，可能漏掉或認錯。沒有測過原創角色和很新的角色。
+- **速度與 VRAM**：RTX 5090 每張約 35 ms（大多花在讀圖），CPU 約 130 ms。工作結束時自動釋放模型；產生 tag 時會暫時載入 WD14，原本沒載入的話結束時一起釋放。和標註、放大共用同一個工作佇列，不會同時跑。「開始辨識」旁邊有和右上角相同的 VRAM 選單；勾選「辨識前先釋放其他模型的 VRAM」，開始前會釋放 WD14、waifu2x，並讓 JoyCaption 休眠。
+- **模型**：[deepghs/ccip_onnx](https://huggingface.co/deepghs/ccip_onnx)（OpenRAIL 授權），第一次使用時從 Hugging Face 下載。
+- **檔案**：上傳的圖片存在 `data/finder/<id>/`，刪除篩選時一起刪除；伺服器匯入資料夾裡的原檔不會動。
+- **API**：`POST /api/finder`、`POST /api/finder/{id}/upload?role=ref|neg|pool`、`/import-server`、`/import-project`、`/run`（`tags: true` 同時產生 tag）、`/manual`、`PATCH /api/finder/{id}`（`tag_filter`）、`GET /duplicates?threshold=1–16&scope=all|matches`、`/hash`、`/download`、`/to-project`，詳見 `/docs`。
+
 ## 用 VLM 產生 Danbooru 標籤（JoyCaption）
 
 JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danbooru 標籤（WD14 / VLM）」→「用 VLM 產生 Danbooru 標籤」：
@@ -172,7 +234,8 @@ JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danboor
 - 內建的 `joycaption` 服務以 `--enable-sleep-mode` 和 `VLLM_SERVER_DEV_MODE=1` 啟動 vLLM。容器是在加入這個設定之前建立的話，用 `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption` 重新建立。這會開啟 vLLM 的開發用端點，但這個服務沒有開放埠，只有 app 連得到。
 - Ollama 閒置 `OLLAMA_KEEP_ALIVE`（預設 10 分鐘）後會自己卸載模型，這裡不能讓它休眠。
 - 有 `nvidia-smi` 時，選單也會顯示整張 GPU 的 VRAM 用量（含其他程式）。
-- API：`GET /api/gpu`、`POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x}`。
+- **CCIP**（角色篩選）：只在辨識時載入，結束時自動釋放。
+- API：`GET /api/gpu`、`POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip}`。
 
 ## 送到 Civitai 雲端訓練
 
@@ -229,6 +292,14 @@ JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danboor
 - 試算可能已套用 Civitai 的折扣，這時表單會同時顯示折扣前的原價：實際扣款可能以原價結算（送出時預扣、結束時追加）。訓練紀錄顯示的是 Civitai 交易紀錄的實際扣款。
 - 取消訓練送出的是 `status: canceled`（與 Civitai 網站相同），訓練會停止且無法接續。取消是非同步的：Civitai 要等訓練機器停下來才會改成「已取消」（可能要幾分鐘），這段時間會顯示「取消中」。Civitai 文件只說明還沒開始的任務可能退款；取消後訓練紀錄會顯示實際退回的 Buzz（結束後一小時內持續查詢）。
 - 訓練費用依 Civitai 當下的價格（例如 SDXL / SD1 每步 0.2 Buzz + 每個 epoch 10 Buzz，且不低於預設配置的 80%），以試算結果為準。
+
+**匯入 A1111 / Forge**：訓練紀錄的每個 epoch 旁邊有「→ A1111」按鈕，按了才匯入。
+- 需要 [Forge Neo Chino](https://github.com/sss22213/sd-webui-forge-neo-chino) 的 LoRA 匯入 API（`POST /sdapi/v1/lora/import`），並在 `.env` 設定 `A1111_URL`。Forge 跑在同一台主機時用 `http://host.docker.internal:7860`；沒設定就不顯示這個按鈕。
+- Forge 會自己從 Civitai 的簽名網址下載 LoRA，不經過這裡。檔案放在 Lora 資料夾的 `A1111_LORA_SUBFOLDER`（預設 `LoRA-Tag-Studio`），檔名像 `kirima_syaro_20261004_3rmo_e10.safetensors`（觸發詞、訓練日期與編號、epoch）。
+- 卡片資訊會一起寫好：觸發詞（點卡片時自動加在 `<lora:…>` 後面）、底模類型（Forge 依預設篩選 LoRA 用）、說明（專案與 epoch），第一張範例圖當預覽。
+- 不必重開 Forge，在 LoRA 分頁按重新整理就看得到。完成時會顯示可以直接貼上的提示詞。
+- Forge 已經有同一個檔案時不重複下載。同名但內容不同時會先問要不要覆蓋。已匯入的 epoch 會標示「已在 A1111」。
+- API：`POST /api/civitai/runs/{id}/a1111`（`epoch`、`overwrite`），`GET /api/a1111` 檢查 Forge 連不連得上；MCP 工具 `import_lora_to_a1111`。
 
 **API / MCP**：`GET /api/civitai` 列出每個類型的 `fields`、`defaults`、`max_batch`；送出該類型沒有的參數會回錯誤。MCP 流程：`get_civitai_training_types` → `prepare_civitai_training`（可帶 `training_type`、`priority`、`force_upload` 與上表的參數）→ `get_civitai_preparation`（取得試算費用）→ 使用者確認費用後才 `submit_civitai_training` → `get_civitai_training`。
 
@@ -308,6 +379,9 @@ curl -OJ "http://localhost:7870/api/projects/<id>/export?format=civitai"
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT` | 空 / `claude-opus-5-5` / `low` | `VLM_BACKEND=anthropic` 時使用（已啟用伺服器端 refusal fallback） |
 | `ALLOW_PRIVATE_URLS` | `0` | 「從網址匯入」是否允許內網位址（預設關閉以避免 SSRF） |
 | `CIVITAI_API_KEY` | 空 | Civitai 雲端訓練用的金鑰（只留在伺服器端） |
+| `A1111_URL` | 空 | A1111 / Forge 的網址（需要 Forge Neo Chino 的 LoRA 匯入 API），例如 `http://host.docker.internal:7860`；設定後訓練紀錄才有「→ A1111」 |
+| `A1111_LORA_SUBFOLDER` | `LoRA-Tag-Studio` | 匯入到 Lora 資料夾裡的哪個子資料夾（空白 = Lora 資料夾本身） |
+| `A1111_API_AUTH` | 空 | Forge 有開 `--api-auth` 時填 `帳號:密碼` |
 | `JOYCAPTION_GPU_UTIL` | `0.7` | vLLM 預先佔用的 VRAM 比例 |
 | `JOYCAPTION_VLLM_IMAGE` / `JOYCAPTION_TRANSFORMERS` | `vllm/vllm-openai:v0.30.0` / `5.16.1` | JoyCaption 的 vLLM 映像檔與 transformers 版本；修改後需 `--build` |
 
@@ -330,7 +404,10 @@ app/
   services.py        API / MCP 共用邏輯
   exporter.py        Civitai / kohya / jsonl 匯出
   civitai.py         送到 Civitai 雲端訓練（Orchestration API）
+  a1111.py           訓練好的 LoRA 匯入 A1111 / Forge
   upscale.py         waifu2x 放大：模型下載、切塊推論、原圖備份 / 還原
+  finder.py          角色篩選：CCIP 特徵、比對分數、tag 篩選、找重複、圖片來源、下載 / 匯入專案
+  smb.py             SMB 來源：連線設定、瀏覽與縮圖、匯入勾選的資料夾 / 圖片
   storage.py         上傳、資料夾 / zip 匯入、縮圖
   db.py              SQLite
   tagging/
@@ -376,7 +453,7 @@ DATA_DIR=./data IMPORT_DIR=./import VLM_BACKEND=none uvicorn app.main:app --relo
 
 - 本專案與 Civitai 沒有關係。雲端訓練會扣你自己 Civitai 帳號的 Buzz，確認前請先看試算。
 - 請確認你有權使用拿來訓練的圖片，並遵守所用服務的內容規範。
-- 模型（WD14、waifu2x、JoyCaption、Ollama 的模型）在執行時從原作者處下載，適用各自的授權。
+- 模型（WD14、waifu2x、CCIP、JoyCaption、Ollama 的模型）在執行時從原作者處下載，適用各自的授權。
 
 ## 授權
 

@@ -197,8 +197,17 @@ class _AuthMiddleware:
         await self.app(scope, receive, send)
 
 
+class _WebFiles(StaticFiles):
+    """網頁檔每次都向伺服器確認（沒變就回 304），重建映像檔後瀏覽器一定拿到新版。"""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 app.mount("/mcp", mcp_app)
-app.mount("/", StaticFiles(directory=settings.web_dir, html=True), name="web")
+app.mount("/", _WebFiles(directory=settings.web_dir, html=True), name="web")
 app.add_middleware(_AuthMiddleware)
 app.add_middleware(_LangMiddleware)
 app.add_middleware(_MCPPathFix)

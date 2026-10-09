@@ -37,6 +37,10 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       ALLOW_PRIVATE_URLS: ${ALLOW_PRIVATE_URLS:-0}
       CIVITAI_API_KEY: ${CIVITAI_API_KEY:-}
+      # A1111 / Forge：訓練好的 LoRA 一鍵匯入（需要 Forge Neo Chino 的 LoRA 匯入 API），例如 http://host.docker.internal:7860
+      A1111_URL: ${A1111_URL:-}
+      A1111_LORA_SUBFOLDER: ${A1111_LORA_SUBFOLDER:-LoRA-Tag-Studio}
+      A1111_API_AUTH: ${A1111_API_AUTH:-}
     volumes:
       - ./data:/data              # 專案、圖片、標註資料庫、匯出 zip
       - ./import:/import:ro       # 伺服器資料夾匯入（把圖片資料夾放這裡）

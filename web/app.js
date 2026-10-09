@@ -97,7 +97,7 @@ async function api(path, { method = 'GET', body, form } = {}) {
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try { const j = await res.json(); msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch { /* 非 JSON */ }
-    throw new Error(msg);
+    throw Object.assign(new Error(msg), { status: res.status });
   }
   const ct = res.headers.get('content-type') || '';
   return ct.includes('json') ? res.json() : res.text();
@@ -123,16 +123,16 @@ function askApiKey() {
   return keyPrompt;
 }
 
-function uploadXHR(pid, files, paths, onProgress) {
+function uploadXHR(url, files, paths, onProgress) {
   return new Promise((resolve, reject) => {
     const fd = new FormData();
     files.forEach((f, i) => { fd.append('files', f, f.name); fd.append('paths', paths[i] || f.name); });
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/projects/${pid}/upload`);
+    xhr.open('POST', url);
     xhr.setRequestHeader('X-Lang', i18n.lang);
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded, e.total);
     xhr.onload = async () => {
-      if (xhr.status === 401) { await askApiKey(); resolve(uploadXHR(pid, files, paths, onProgress)); return; }
+      if (xhr.status === 401) { await askApiKey(); resolve(uploadXHR(url, files, paths, onProgress)); return; }
       if (xhr.status >= 400) { let m = xhr.statusText; try { m = JSON.parse(xhr.responseText).detail; } catch { /* */ } reject(new Error(m)); return; }
       resolve(JSON.parse(xhr.responseText));
     };
@@ -273,6 +273,11 @@ async function vramMenu(anchor) {
   items.push(w2x.length ? { info: t('vram.w2x_loaded', { n: w2x.length, device: w2xDevice }), cls: 'ok' } : { info: t('vram.w2x_unloaded') });
   if (w2x.length) items.push({ label: t('vram.w2x_release'), help: t(g.busy ? 'vram.busy' : 'vram.w2x_release_help'), disabled: g.busy,
     onClick: () => vramAction('release_waifu2x') });
+  const ccip = g.ccip.loaded;
+  const ccipDevice = ccip.some((m) => m.providers.includes('CUDAExecutionProvider')) ? 'GPU' : 'CPU';
+  items.push(ccip.length ? { info: t('vram.ccip_loaded', { n: ccip.length, device: ccipDevice }), cls: 'ok' } : { info: t('vram.ccip_unloaded') });
+  if (ccip.length) items.push({ label: t('vram.ccip_release'), help: t(g.busy ? 'vram.busy' : 'vram.ccip_release_help'), disabled: g.busy,
+    onClick: () => vramAction('release_ccip') });
   items.push('-');
   const v = g.vlm;
   if (v.backend !== 'openai') items.push({ info: t('vram.vlm_not_local') });
@@ -311,6 +316,7 @@ async function route() {
   $('#modalRoot').innerHTML = '';
   const parts = (location.hash || '#/').slice(2).split('/');
   const nav = parts[0] === 'p' ? 'projects' : parts[0] || 'projects';
+  clearTimeout(fd.timer);
   $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.nav === nav));
   try {
     if (parts[0] === 'p' && parts[1]) {
@@ -321,6 +327,7 @@ async function route() {
       }
       return;
     }
+    if (parts[0] === 'finder') return parts[1] ? await renderFinder(parts[1]) : await renderFinderList();
     if (parts[0] === 'guide') return await renderGuide(parts[1]);
     if (parts[0] === 'api') return renderApi();
     return await renderProjects();
@@ -532,6 +539,7 @@ async function renderProject(pid) {
     { label: t('menu.import_zip'), help: t('menu.import_zip_help'), onClick: () => $('#fileInput').click() },
     { label: t('menu.import_server'), help: t('menu.import_server_help'), onClick: serverImportDialog },
     { label: t('menu.import_url'), help: t('menu.import_url_help'), onClick: urlImportDialog },
+    { label: t('smb.menu'), help: t('smb.menu_help_project'), onClick: () => smbDialog({ kind: 'project', projectId: state.project.id }) },
   ]);
   $('#btnTag').onclick = () => startTagging({ only_untagged: true });
   $('#btnTagMenu').onclick = (e) => dropdown(e.currentTarget, [
@@ -562,7 +570,7 @@ function renderProjectHead() {
   const s = p.settings;
   $('#projName').textContent = p.name;
   $('#projBadges').innerHTML = `
-    <span class="badge accent">${esc(p.profile_name)}</span>
+    <span class="badge accent" title="${esc(p.profile_name)}">${esc(p.profile_name)}</span>
     <span class="badge">${esc(state.system.lora_types[s.lora_type]?.name || s.lora_type)}</span>
     <span class="badge">${esc(state.system.caption_modes[s.caption_mode] || s.caption_mode)}</span>
     ${s.trigger ? `<span class="badge">${esc(t('ws.trigger_badge', { trigger: s.trigger }))}</span>` : `<span class="badge r-questionable">${esc(t('ws.no_trigger'))}</span>`}`;
@@ -915,7 +923,7 @@ function blockHint(ids) {
 }
 
 /* ---------------------------------------------------------------- 上傳 / 匯入 */
-function setupDrop(area) {
+function setupDrop(area, onFiles = uploadFiles) {
   let depth = 0, overlay = null;
   const show = (on) => {
     if (on && !overlay) { overlay = h(`<div class="dropzone">${esc(t('upload.drop'))}</div>`); area.append(overlay); }
@@ -942,7 +950,7 @@ function setupDrop(area) {
       }
     };
     if (entries.length) { for (const en of entries) await walk(en, ''); } else { [...e.dataTransfer.files].forEach((f) => files.push([f, f.name])); }
-    uploadFiles(files);
+    onFiles(files);
   });
 }
 
@@ -978,7 +986,7 @@ async function uploadFiles(pairs) {
   draw(0);
   try {
     for (const b of batches) {
-      const r = await uploadXHR(state.project.id, b.map((x) => x[0]), b.map((x) => x[1]), draw);
+      const r = await uploadXHR(`/api/projects/${state.project.id}/upload`, b.map((x) => x[0]), b.map((x) => x[1]), draw);
       sent += b.reduce((s, p) => s + p[0].size, 0);
       result.added += r.added; result.skipped.push(...r.skipped); result.added_ids.push(...(r.added_ids || []));
       draw(0);
@@ -994,7 +1002,8 @@ async function uploadFiles(pairs) {
   }
 }
 
-async function serverImportDialog() {
+async function serverImportDialog(target = null) {
+  // target：{ importFn(path, recursive), after(result) }；沒給就匯入目前的專案
   const dirs = await api('/import-dirs');
   const body = dirs.length
     ? `<p class="muted">${th('server_import.desc_html')}</p>
@@ -1007,7 +1016,9 @@ async function serverImportDialog() {
     b.onclick = async () => {
       b.disabled = true; b.textContent = t('server_import.importing');
       try {
-        const r = await api(`/projects/${state.project.id}/import-server`, { method: 'POST', body: { path: b.dataset.path, recursive: $('#impRec', m.el).checked } });
+        const recursive = $('#impRec', m.el).checked;
+        if (target) { const r = await target.importFn(b.dataset.path, recursive); m.close(); target.after(r); return; }
+        const r = await api(`/projects/${state.project.id}/import-server`, { method: 'POST', body: { path: b.dataset.path, recursive } });
         importToast(r); m.close(); reloadImages().then(() => blockHint(r.added_ids));
       } catch (e) { toast(e.message, 'err'); b.disabled = false; b.textContent = t('common.import'); }
     };
@@ -1025,6 +1036,262 @@ function urlImportDialog() {
       importToast(r); close(); reloadImages().then(() => blockHint(r.added_ids));
     } }],
   });
+}
+
+/* ---------------------------------------------------------------- SMB 伺服器（NAS / Windows 分享資料夾） */
+// target：{ kind: 'project', projectId } 下載到專案；{ kind: 'finder', sessionId, role } 角色篩選只記路徑
+// 像檔案瀏覽器：點資料夾打開，勾選資料夾或圖片（可以跨資料夾、跨連線），一次匯入；沒勾選就匯入目前的資料夾
+const fmtSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+
+async function smbDialog(target) {
+  let conns = await api('/smb');
+  let cur = conns[0]?.id || null, path = '', editing = null, listing = null, anchor = -1, recursive = true, showPicked = false;
+  const picked = new Map(); // `${連線}\n${路徑}` → { conn_id, path, dir }
+  const key = (cid, p) => `${cid}\n${p}`;
+  const body = h(`<div class="smb">
+      <div class="row smb-conn"><select id="smbSel"></select>
+        <button class="btn sm" id="smbEdit">${esc(t('smb.edit'))}</button>
+        <button class="btn sm ghost" id="smbDel">${esc(t('common.delete'))}</button></div>
+      <div id="smbForm" class="smb-form" hidden>
+        <div class="smb-grid">
+          <div class="field"><div class="lbl">${esc(t('smb.host'))}</div><input type="text" id="smbHost" placeholder="192.168.1.20 / nas.local / \\\\nas\\share"></div>
+          <div class="field"><div class="lbl">${esc(t('smb.share'))}</div><input type="text" id="smbShare" placeholder="photos"></div>
+          <div class="field"><div class="lbl">${esc(t('smb.username'))}</div><input type="text" id="smbUser" autocomplete="off"></div>
+          <div class="field"><div class="lbl">${esc(t('smb.password'))}</div><input type="password" id="smbPass" autocomplete="new-password"></div>
+          <div class="field"><div class="lbl">${esc(t('smb.domain'))}</div><input type="text" id="smbDomain" placeholder="${esc(t('smb.optional'))}"></div>
+          <div class="field"><div class="lbl">${esc(t('smb.port'))}</div><input type="number" id="smbPort" value="445" min="1" max="65535"></div>
+          <div class="field smb-wide"><div class="lbl">${esc(t('smb.name'))}</div><input type="text" id="smbName" placeholder="${esc(t('smb.name_ph'))}"></div>
+        </div>
+        <div class="help">${esc(t('smb.password_help'))}</div>
+        <div class="row" style="margin-top:8px"><button class="btn sm" id="smbTest">${esc(t('smb.test'))}</button>
+          <button class="btn sm primary" id="smbSave">${esc(t('smb.save'))}</button>
+          <button class="btn sm ghost" id="smbCancel">${esc(t('common.cancel'))}</button><span class="muted" id="smbMsg"></span></div>
+      </div>
+      <div id="smbBrowse" class="smb-browse"></div>
+      <div id="smbPicked" class="smb-picked"></div>
+      <div class="help">${esc(t('smb.browse_help'))} ${esc(t(target.kind === 'finder' ? 'smb.finder_help' : 'smb.project_help'))}</div>
+    </div>`);
+  const m = modal({
+    title: t('smb.title'), body, size: 'browser',
+    actions: [
+      { label: t('common.cancel'), onClick: (c) => c() },
+      { label: t('smb.import'), primary: true, onClick: async (close) => {
+        if (editing || (!picked.size && !listing)) return;
+        const items = picked.size ? [...picked.values()] : [{ conn_id: cur, path, dir: true }];
+        const job = await api('/smb/import', { method: 'POST', body: {
+          items, recursive, target: target.kind,
+          project_id: target.projectId, session_id: target.sessionId, role: target.role || 'pool' } });
+        close();
+        toast(t('smb.started'), 'ok');
+        if (target.kind === 'finder') finderWatch(job.id); else watchJob(job.id);
+      } },
+    ],
+  });
+  const importBtn = $('.modal-foot .primary', m.el);
+  const msg = (text, cls = '') => { $('#smbMsg', body).textContent = text; $('#smbMsg', body).className = cls; };
+  const connName = (cid) => conns.find((c) => c.id === cid)?.name || cid;
+  const items = () => (listing ? [...listing.dirs.map((name) => ({ dir: true, name })), ...listing.images.map((f) => ({ dir: false, ...f }))] : []);
+  const full = (name) => (path ? `${path}/${name}` : name);
+  const thumbsOn = () => store.get('smbThumbs', true);
+
+  const drawSel = () => {
+    $('#smbSel', body).innerHTML = conns.map((c) => `<option value="${c.id}">${esc(c.name)}（\\\\${esc(c.host)}\\${esc(c.share)}）</option>`).join('')
+      + `<option value="__new">＋ ${esc(t('smb.add'))}</option>`;
+    $('#smbSel', body).value = cur || '__new';
+    $('#smbEdit', body).hidden = !cur; $('#smbDel', body).hidden = !cur;
+  };
+  const showForm = (c) => {
+    editing = c ? c.id : 'new';
+    $('#smbForm', body).hidden = false; $('#smbBrowse', body).hidden = true; $('#smbPicked', body).hidden = true; importBtn.disabled = true;
+    $('#smbHost', body).value = c?.host || ''; $('#smbShare', body).value = c?.share || '';
+    $('#smbUser', body).value = c?.username || ''; $('#smbPass', body).value = '';
+    $('#smbPass', body).placeholder = c?.has_password ? t('smb.password_keep') : '';
+    $('#smbDomain', body).value = c?.domain || ''; $('#smbPort', body).value = c?.port || 445; $('#smbName', body).value = c?.name || '';
+    msg('');
+    setTimeout(() => $('#smbHost', body).focus(), 30);
+  };
+  const hideForm = () => { editing = null; $('#smbForm', body).hidden = true; $('#smbBrowse', body).hidden = false; $('#smbPicked', body).hidden = false; };
+  const formData = () => ({
+    host: $('#smbHost', body).value, share: $('#smbShare', body).value, username: $('#smbUser', body).value,
+    password: $('#smbPass', body).value, domain: $('#smbDomain', body).value, port: +$('#smbPort', body).value || 445, name: $('#smbName', body).value,
+  });
+  const dropPicked = (cid) => { for (const [k, v] of picked) if (v.conn_id === cid) picked.delete(k); };
+
+  // ---- 勾選
+  const setPick = (i, on) => {
+    const it = items()[i], p = full(it.name), k = key(cur, p);
+    if (on) picked.set(k, { conn_id: cur, path: p, dir: it.dir }); else picked.delete(k);
+  };
+  const refreshTiles = () => {
+    const list = items();
+    let n = 0;
+    $$('.smb-item', body).forEach((el) => {
+      const on = picked.has(key(cur, full(list[+el.dataset.i].name)));
+      n += on;
+      el.classList.toggle('on', on); $('input', el).checked = on;
+    });
+    const all = $('#smbAll', body);
+    if (all) { all.checked = list.length > 0 && n === list.length; all.indeterminate = n > 0 && n < list.length; }
+    updateFoot();
+  };
+  const updateFoot = () => {
+    const vals = [...picked.values()], dirs = vals.filter((v) => v.dir).length;
+    const box = $('#smbPicked', body);
+    const many = new Set(vals.map((v) => v.conn_id)).size > 1;
+    const shown = vals.slice(0, 300);
+    box.innerHTML = `<div class="row">
+        <span>${esc(vals.length ? t('smb.picked', { dirs, images: vals.length - dirs }) : t('smb.picked_none'))}</span>
+        ${vals.length ? `<button class="btn sm ghost" id="smbShow">${esc(t('smb.show_picked'))} ${showPicked ? '▴' : '▾'}</button>
+          <button class="btn sm ghost" id="smbClear">${esc(t('smb.clear'))}</button>` : ''}
+        <span class="spacer"></span>
+        <label class="check"><input type="checkbox" id="smbRec" ${recursive ? 'checked' : ''}> ${esc(t('smb.recursive'))}</label></div>
+      <div class="smb-chips" ${showPicked && vals.length ? '' : 'hidden'}>${shown.map((v) => `<span class="smb-chip" title="${esc(connName(v.conn_id))}: ${esc(v.path || '/')}">
+          ${v.dir ? '📁' : '🖼'} ${many ? `<b>${esc(connName(v.conn_id))}</b> ` : ''}${esc(v.path || '/')}<button data-unpick="${esc(key(v.conn_id, v.path))}" title="${esc(t('common.delete'))}">✕</button></span>`).join('')}
+        ${vals.length > shown.length ? `<span class="muted">${esc(t('smb.more_picked', { n: vals.length - shown.length }))}</span>` : ''}</div>`;
+    $('#smbRec', box).onchange = (e) => { recursive = e.target.checked; };
+    if ($('#smbShow', box)) $('#smbShow', box).onclick = () => { showPicked = !showPicked; updateFoot(); };
+    if ($('#smbClear', box)) $('#smbClear', box).onclick = () => { picked.clear(); refreshTiles(); };
+    $$('[data-unpick]', box).forEach((b) => { b.onclick = () => { picked.delete(b.dataset.unpick); refreshTiles(); }; });
+    if (editing) return;
+    if (picked.size) {
+      importBtn.textContent = t('smb.import_picked', { n: picked.size });
+      importBtn.disabled = false;
+    } else {
+      const parts = path ? path.split('/') : [];
+      importBtn.textContent = listing ? t('smb.import_here', { name: parts[parts.length - 1] || listing.share }) : t('smb.import');
+      importBtn.disabled = !listing || (!listing.images.length && !listing.dirs.length);
+    }
+  };
+
+  // ---- 瀏覽
+  const tile = (it, i) => {
+    const p = full(it.name), on = picked.has(key(cur, p));
+    const check = `<input type="checkbox" ${on ? 'checked' : ''} aria-label="${esc(t('smb.pick'))}">`;
+    if (it.dir) {
+      return `<div class="smb-item dir ${on ? 'on' : ''}" data-i="${i}" title="${esc(it.name)}">${check}
+        <div class="smb-ico">📁</div><div class="smb-name">${esc(it.name)}</div></div>`;
+    }
+    const src = `/api/smb/${encodeURIComponent(cur)}/thumb?path=${encodeURIComponent(p)}&v=${it.size}-${it.mtime}`;
+    return `<div class="smb-item img ${on ? 'on' : ''}" data-i="${i}" title="${esc(it.name)} · ${fmtSize(it.size)}">${check}
+        <button class="smb-zoom" data-zoom title="${esc(t('smb.preview'))}">⤢</button>
+        ${thumbsOn() ? `<img loading="lazy" src="${src}" alt="">` : '<div class="smb-ico">🖼</div>'}
+        <div class="smb-name">${esc(it.name)}</div></div>`;
+  };
+  const drawBrowse = () => {
+    const box = $('#smbBrowse', body), r = listing, conn = conns.find((c) => c.id === cur);
+    const parts = path ? path.split('/') : [], list = items(), root = `\\\\${conn.host}\\${r.share}`;
+    box.innerHTML = `<div class="smb-path">
+        <button class="btn sm ghost" data-go="" title="${esc(root)}">${esc(root)}</button>${parts.map((seg, i) => `<span class="muted">›</span><button class="btn sm ghost" data-go="${esc(parts.slice(0, i + 1).join('/'))}">${esc(seg)}</button>`).join('')}
+        <span class="spacer"></span>${parts.length ? `<button class="btn sm" data-go="${esc(parts.slice(0, -1).join('/'))}">↑ ${esc(t('smb.up'))}</button>` : ''}</div>
+      <div class="row smb-tools">
+        <label class="check"><input type="checkbox" id="smbAll" ${list.length ? '' : 'disabled'}> ${esc(t('smb.select_all'))}</label>
+        <span class="muted">${esc(t('smb.counts', { dirs: r.dirs.length, images: r.images.length }))}${r.others ? ` · ${esc(t('smb.others', { n: r.others }))}` : ''}</span>
+        <span class="spacer"></span>
+        <label class="check"><input type="checkbox" id="smbThumbs" ${thumbsOn() ? 'checked' : ''}> ${esc(t('smb.thumbs'))}</label></div>
+      <div class="smb-list ${thumbsOn() ? '' : 'no-thumbs'}">${list.map(tile).join('') || `<div class="muted smb-empty">${esc(t('smb.empty'))}</div>`}</div>`;
+    $$('[data-go]', box).forEach((b) => { b.onclick = () => browse(b.dataset.go); });
+    $('#smbAll', box).onchange = (e) => { list.forEach((_, i) => setPick(i, e.target.checked)); refreshTiles(); };
+    $('#smbThumbs', box).onchange = (e) => { store.set('smbThumbs', e.target.checked); drawBrowse(); };
+    $('.smb-list', box).onclick = (e) => {
+      const el = e.target.closest('.smb-item');
+      if (!el) return;
+      const i = +el.dataset.i, it = list[i];
+      if (e.target.closest('[data-zoom]')) { preview(i); return; }
+      const onBox = e.target.matches('input[type=checkbox]');
+      if (it.dir && !onBox) { browse(full(it.name)); return; } // 點資料夾 = 打開，勾選框 = 選取
+      const on = onBox ? e.target.checked : !picked.has(key(cur, full(it.name)));
+      if (e.shiftKey && anchor >= 0) { // Shift：連續選取
+        for (let j = Math.min(anchor, i); j <= Math.max(anchor, i); j++) setPick(j, on);
+      } else setPick(i, on);
+      anchor = i;
+      refreshTiles();
+    };
+    refreshTiles();
+  };
+  const browse = async (p) => {
+    const box = $('#smbBrowse', body), cid = cur;
+    listing = null; anchor = -1;
+    if (!cid) { box.innerHTML = ''; updateFoot(); return; }
+    box.innerHTML = `<div class="muted">${esc(t('common.loading'))}</div>`;
+    updateFoot();
+    try {
+      const r = await api(`/smb/${cid}/browse?path=${encodeURIComponent(p)}`);
+      if (cid !== cur) return; // 讀取中切換了連線
+      listing = r; path = r.path;
+      drawBrowse();
+    } catch (e) {
+      if (cid === cur) { box.innerHTML = `<div class="alert err">${esc(e.message)}</div>`; updateFoot(); }
+    }
+  };
+
+  // ---- 預覽：← → 切換，空白鍵勾選
+  const preview = (start) => {
+    const list = items(), imgs = list.map((it, j) => j).filter((j) => !list[j].dir);
+    let pos = imgs.indexOf(start);
+    const pb = h(`<div class="smb-preview"><div class="smb-pv-img"><img alt=""></div>
+        <div class="row"><button class="btn sm" data-prev>‹</button><span class="muted" data-name></span><span class="spacer"></span>
+          <label class="check"><input type="checkbox" data-pick> ${esc(t('smb.pick'))}</label><button class="btn sm" data-next>›</button></div></div>`);
+    const keys = (e) => {
+      if ($('#modalRoot').lastElementChild !== pm.el || e.target.matches('input, textarea')) return;
+      if (e.key === 'ArrowLeft') go(-1);
+      else if (e.key === 'ArrowRight') go(1);
+      else if (e.key === ' ') { e.preventDefault(); const cb = $('[data-pick]', pb); cb.checked = !cb.checked; pick(cb.checked); }
+    };
+    const pm = modal({ title: '', body: pb, size: 'wide', onClose: () => { document.removeEventListener('keydown', keys); refreshTiles(); } });
+    const show = () => {
+      const it = list[imgs[pos]], p = full(it.name);
+      $('img', pb).src = `/api/smb/${encodeURIComponent(cur)}/file?path=${encodeURIComponent(p)}`;
+      $('[data-name]', pb).textContent = `${pos + 1} / ${imgs.length} · ${fmtSize(it.size)}`;
+      $('[data-pick]', pb).checked = picked.has(key(cur, p));
+      $('.modal-head h3', pm.el).textContent = it.name;
+    };
+    const go = (d) => { pos = (pos + d + imgs.length) % imgs.length; show(); };
+    const pick = (on) => { setPick(imgs[pos], on); anchor = imgs[pos]; };
+    $('[data-prev]', pb).onclick = () => go(-1);
+    $('[data-next]', pb).onclick = () => go(1);
+    $('[data-pick]', pb).onchange = (e) => pick(e.target.checked);
+    document.addEventListener('keydown', keys);
+    show();
+  };
+
+  // ---- 連線
+  $('#smbSel', body).onchange = (e) => {
+    if (e.target.value === '__new') { showForm(null); return; }
+    cur = e.target.value; path = ''; hideForm(); drawSel(); browse('');
+  };
+  $('#smbEdit', body).onclick = () => showForm(conns.find((c) => c.id === cur));
+  $('#smbDel', body).onclick = async () => {
+    const c = conns.find((x) => x.id === cur);
+    if (!await confirmBox(t(c.finder_refs ? 'smb.delete_confirm_refs' : 'smb.delete_confirm', { name: c.name, n: c.finder_refs }), { ok: t('common.delete'), danger: true })) return;
+    await api(`/smb/${cur}`, { method: 'DELETE' });
+    dropPicked(cur);
+    conns = conns.filter((x) => x.id !== cur); cur = conns[0]?.id || null; drawSel();
+    if (cur) browse(''); else showForm(null);
+  };
+  $('#smbTest', body).onclick = async () => {
+    msg(t('smb.testing'));
+    try {
+      await api('/smb/test', { method: 'POST', body: { ...formData(), id: editing !== 'new' ? editing : null } });
+      msg(t('smb.test_ok'), 'ok-text');
+    } catch (e) { msg(e.message, 'err-text'); }
+  };
+  $('#smbSave', body).onclick = async () => {
+    msg(t('smb.testing'));
+    try {
+      const old = conns.find((x) => x.id === editing);
+      const c = editing === 'new'
+        ? await api('/smb', { method: 'POST', body: formData() })
+        : await api(`/smb/${editing}`, { method: 'PATCH', body: formData() });
+      if (old && (old.host !== c.host || old.share !== c.share)) dropPicked(c.id); // 換了主機或分享，舊的勾選就不對了
+      conns = await api('/smb'); cur = c.id; path = '';
+      hideForm(); drawSel(); browse('');
+    } catch (e) { msg(e.message, 'err-text'); }
+  };
+  $('#smbCancel', body).onclick = () => { if (cur) { hideForm(); drawSel(); browse(path); } };
+  // 讀不到的縮圖（壞檔、權限）換成圖示
+  $('#smbBrowse', body).addEventListener('error', (e) => { if (e.target.tagName === 'IMG') e.target.replaceWith(h('<div class="smb-ico">🖼</div>')); }, true);
+  drawSel();
+  if (cur) browse(''); else showForm(null);
 }
 
 /* ---------------------------------------------------------------- 標註工作 */
@@ -1621,8 +1888,12 @@ function civitaiRunHTML(run) {
     sm.priority ? t('civitai.run_priority', { p: t(`civitai.prio_${sm.priority}`) }) : '',
   ].filter(Boolean).join(' · ');
   // 已過期的任務在 Civitai 上已不存在，舊的下載連結也失效了
+  const imported = new Map((run.a1111 || []).map((x) => [x.epoch, x]));
+  const a1111On = state.system.a1111?.configured;
   const epochs = st === 'expired' ? '' : (sm.epochs || []).filter((e) => e.available && e.url).map((e) => `<div class="cv-epoch">
       <a class="btn sm" href="${esc(e.url)}" target="_blank" rel="noopener">⬇ ${esc(t('civitai.epoch', { n: e.epoch }))}</a>
+      ${a1111On ? `<button class="btn sm" data-a1111="${e.epoch}" title="${esc(t('civitai.a1111_help', { folder: state.system.a1111.subfolder }))}">${imported.has(e.epoch) ? '✓' : '→'} A1111</button>` : ''}
+      ${imported.has(e.epoch) ? `<span class="badge ok" title="${esc(imported.get(e.epoch).relative_path)}">${esc(t('civitai.a1111_in', { name: imported.get(e.epoch).name }))}</span>` : ''}
       ${e.samples.map((u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${isVideoUrl(u)
     ? `<video src="${esc(u)}" muted loop autoplay playsinline preload="metadata"></video>`
     : `<img src="${esc(u)}" alt="" loading="lazy">`}</a>`).join('')}
@@ -1641,6 +1912,30 @@ function civitaiRunHTML(run) {
     ${run.error ? `<div class="alert warn">${esc(run.error)}</div>` : ''}
     ${epochs ? `<div class="cv-epochs">${epochs}</div>` : ''}
   </div>`;
+}
+
+/** 把一個 epoch 匯入 A1111 / Forge（Forge 自己從 Civitai 下載）。同名但內容不同時問要不要覆蓋。 */
+async function civitaiToA1111(wid, epoch, btn) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = t('civitai.a1111_importing');
+  const send = (overwrite) => api(`/civitai/runs/${wid}/a1111`, { method: 'POST', body: { epoch, overwrite } });
+  try {
+    let r;
+    try {
+      r = await send(false);
+    } catch (e) {
+      if (e.status !== 409) throw e;
+      if (!await confirmBox(`${e.message} ${t('civitai.a1111_overwrite')}`, { ok: t('civitai.a1111_overwrite_ok'), danger: true })) return false;
+      r = await send(true);
+    }
+    toast(t(r.status === 'exists' ? 'civitai.a1111_exists' : 'civitai.a1111_done', { path: r.relative_path, prompt: r.prompt }), 'ok', 10000);
+    return true;
+  } catch (e) {
+    toast(e.message, 'err', 10000);
+    return false;
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
 }
 
 async function civitaiDialog({ focusRuns = false } = {}) {
@@ -1755,6 +2050,9 @@ async function civitaiDialog({ focusRuns = false } = {}) {
     $$('[data-retrain]', box).forEach((b) => {
       const run = runs.find((r) => r.workflow_id === b.closest('.cv-run').dataset.wid);
       b.onclick = () => fillFrom(run.summary.request, new Date(run.created_at * 1000).toLocaleString(i18n.lang));
+    });
+    $$('[data-a1111]', box).forEach((b) => {
+      b.onclick = async () => { if (await civitaiToA1111(b.closest('.cv-run').dataset.wid, +b.dataset.a1111, b)) loadRuns(); };
     });
     return runs;
   };
@@ -1974,6 +2272,709 @@ async function civitaiDialog({ focusRuns = false } = {}) {
     }],
   });
   pollRuns();
+}
+
+/* ================================================================ 角色篩選（CCIP） */
+// 和專案分開：參考圖（目標角色）、排除參考圖（長得像的其他角色，可不加）、要篩選的圖片 → 依相似度挑出目標角色
+const FD_ROLES = ['ref', 'neg', 'pool'];
+const fd = { s: null, sel: new Set(), auto: true, filter: 'match', shown: 300, timer: null, role: 'pool' };
+const fdThreshold = () => (fd.s.threshold ?? fd.s.default_threshold);
+const fdCcipMatch = (i) => i.scored && i.score <= fdThreshold() && (i.neg_score == null || i.score < i.neg_score);
+// tag 篩選只用在 CCIP 挑出的結果上；有設定篩選時，還沒產生 tag 的圖片無法確認，先不算符合
+const fdTagNorm = (s) => s.trim().toLowerCase().split(/\s+/).join('_');
+const fdTagShow = (s) => (s.length > 3 ? s.replace(/_/g, ' ') : s); // ^_^ 這類表情 tag 保留底線
+const fdTagActive = () => fd.s.tag_filter.include.length + fd.s.tag_filter.exclude.length > 0;
+const fdTagBlock = (i) => { // 被 tag 篩掉的原因（缺少的 / 不能有的 tag / 還沒有 tag），沒被篩掉回傳 null
+  if (!fdTagActive()) return null;
+  if (!i.tags) return { kind: 'untagged' };
+  const miss = fd.s.tag_filter.include.find((x) => !i.tags.includes(x));
+  if (miss) return { tag: miss, kind: 'missing' };
+  const bad = fd.s.tag_filter.exclude.find((x) => i.tags.includes(x));
+  return bad ? { tag: bad, kind: 'excluded' } : null;
+};
+// 手動判定（換門檻、改 tag 篩選或重新辨識都保留）：✕ 不是目標；✓ 是目標（只蓋過 CCIP 的判定，tag 篩選仍然套用）；
+// 2 = 忽略 tag 保留（WD14 標錯時用）
+const FD_KEEP = 2;
+const fdIsTarget = (i) => i.manual === 1 || (i.manual !== -1 && fdCcipMatch(i));
+const fdIsMatch = (i) => (i.manual === -1 ? false : i.manual === FD_KEEP ? true : fdIsTarget(i) && !fdTagBlock(i));
+const fdManualKey = (m) => ({ 1: 'finder.manual_included', [-1]: 'finder.manual_excluded', [FD_KEEP]: 'finder.manual_kept' })[m];
+const fdImages = (role) => fd.s.images.filter((i) => i.role === role);
+
+async function renderFinderList() {
+  const view = $('#view');
+  view.innerHTML = `<section class="page">
+    <div class="page-head"><h1>${esc(t('finder.title'))}</h1><span class="spacer"></span><button class="btn primary" id="fdNew">${esc(t('finder.new'))}</button></div>
+    <div class="hero"><h2>${esc(t('finder.hero_title'))}</h2><p class="muted">${esc(t('finder.hero_desc'))}</p></div>
+    <div id="fdList"><div class="empty">${esc(t('common.loading'))}</div></div></section>`;
+  $('#fdNew').onclick = newFinderDialog;
+  const list = await api('/finder');
+  const wrap = $('#fdList');
+  if (!list.length) { wrap.innerHTML = `<div class="empty">${esc(t('finder.empty'))}</div>`; return; }
+  wrap.innerHTML = '<div class="proj-grid"></div>';
+  for (const s of list) {
+    $('.proj-grid', wrap).append(h(`<a class="proj-card" href="#/finder/${s.id}">
+      <div class="cover" ${s.cover_id ? `style="background-image:url('/api/finder/images/${s.cover_id}/thumb')"` : ''}>${s.cover_id ? '' : '◎'}</div>
+      <div class="meta"><h3>${esc(s.name)}</h3>
+        <div class="sub">${esc(t(`finder.model_${s.model}`))}</div>
+        <div class="row" style="font-size:12.5px"><span class="muted">${esc(t('finder.card_counts', { refs: s.ref_count, pool: s.pool_count }))}</span>
+          ${s.active_job ? `<span class="badge accent">${esc(t('finder.running'))}</span>` : ''}</div></div></a>`));
+  }
+}
+
+function newFinderDialog() {
+  const body = h(`<div>
+    <div class="field"><div class="lbl">${esc(t('finder.name'))}</div><input type="text" id="fdNameIn" placeholder="${esc(t('finder.name_ph'))}" autofocus></div>
+    <div class="field"><div class="lbl">${esc(t('finder.model'))}</div><div class="fd-models">
+      ${['default', 'large'].map((m, i) => `<label class="choice"><input type="radio" name="fdModelIn" value="${m}" ${i === 0 ? 'checked' : ''}><span><b>${esc(t(`finder.model_${m}`))}</b><small class="muted">${esc(t(`finder.model_${m}_desc`))}</small></span></label>`).join('')}
+    </div><div class="help">${esc(t('finder.model_later'))}</div></div></div>`);
+  modal({
+    title: t('finder.new'), body, size: 'mid',
+    actions: [
+      { label: t('common.cancel'), onClick: (c) => c() },
+      { label: t('common.create'), primary: true, onClick: async (close) => {
+        const s = await api('/finder', { method: 'POST', body: { name: $('#fdNameIn', body).value, model: $('input[name=fdModelIn]:checked', body).value } });
+        close(); location.hash = `#/finder/${s.id}`;
+      } },
+    ],
+  });
+}
+
+async function renderFinder(sid) {
+  fd.s = await api(`/finder/${sid}`);
+  fd.sel.clear(); fd.auto = true; fd.filter = 'match'; fd.shown = 300;
+  const view = $('#view');
+  view.innerHTML = `<section class="page finder">
+    <div class="page-head"><a href="#/finder" class="btn ghost" title="${esc(t('ws.back'))}">←</a><h1 id="fdTitle" title="${esc(t('ws.rename_hint'))}"></h1>
+      <span class="spacer"></span>
+      <select id="fdModel">${['default', 'large'].map((m) => `<option value="${m}">${esc(t(`finder.model_${m}`))}</option>`).join('')}</select>
+      <div class="dropdown"><button class="icon-btn" id="fdMenu">⋯</button></div></div>
+    <p class="muted" style="margin-top:-8px">${esc(t('finder.page_desc'))}</p>
+    <div class="fd-sets">${FD_ROLES.map((r) => `<div class="fd-set" data-role="${r}">
+      <div class="fd-set-head"><b>${esc(t(`finder.role_${r}`))}</b><span class="badge" data-count></span><span class="spacer"></span>
+        <div class="dropdown"><button class="btn sm" data-add>＋ ${esc(t('finder.add'))} ▾</button></div>
+        ${r === 'pool' ? `<button class="btn sm" data-dups title="${esc(t('finder.dup_button_help'))}">${esc(t('finder.dup_button'))}</button>` : ''}
+        <button class="btn sm ghost" data-clear title="${esc(t('finder.clear'))}">${esc(t('finder.clear'))}</button></div>
+      <div class="help">${esc(t(`finder.role_${r}_help`))}</div>
+      <div class="fd-thumbs" data-thumbs></div></div>`).join('')}</div>
+    <div class="fd-run" id="fdRun"></div>
+    <div id="fdResults"></div></section>`;
+  $('#fdTitle').textContent = fd.s.name;
+  $('#fdTitle').onclick = async () => {
+    const v = await promptBox(t('menu.rename'), t('finder.name'), fd.s.name);
+    if (v && v.trim()) { await api(`/finder/${sid}`, { method: 'PATCH', body: { name: v } }); fd.s.name = v.trim(); $('#fdTitle').textContent = fd.s.name; }
+  };
+  $('#fdModel').value = fd.s.model;
+  $('#fdModel').onchange = async (e) => {
+    fd.s = { ...fd.s, ...await api(`/finder/${sid}`, { method: 'PATCH', body: { model: e.target.value } }) };
+    toast(t('finder.model_changed'), 'info', 6000); finderRefresh();
+  };
+  $('#fdMenu').onclick = (e) => dropdown(e.currentTarget, [
+    { label: t('menu.rename'), onClick: () => $('#fdTitle').click() },
+    { label: t('finder.dup_title'), help: t('finder.dup_button_help'), onClick: () => finderDupDialog('pool') },
+    '-',
+    { label: t('finder.delete'), help: t('finder.delete_help'), onClick: async () => {
+      if (!await confirmBox(t('finder.delete_confirm', { name: fd.s.name }), { ok: t('common.delete'), danger: true })) return;
+      await api(`/finder/${sid}`, { method: 'DELETE' }); location.hash = '#/finder';
+    } },
+  ]);
+  $$('.fd-set', view).forEach((box) => {
+    const role = box.dataset.role;
+    $('[data-add]', box).onclick = (e) => dropdown(e.currentTarget, [
+      { label: t('finder.src_files'), help: t('finder.src_files_help'), onClick: () => { fd.role = role; $('#fileInput').click(); } },
+      { label: t('finder.src_folder'), onClick: () => { fd.role = role; $('#folderInput').click(); } },
+      { label: t('finder.src_server'), help: t('finder.src_server_help'), onClick: () => serverImportDialog({
+        importFn: (path, recursive) => api(`/finder/${sid}/import-server`, { method: 'POST', body: { role, path, recursive } }),
+        after: finderImported }) },
+      { label: t('smb.menu'), help: t('smb.menu_help_finder'), onClick: () => smbDialog({ kind: 'finder', sessionId: sid, role }) },
+      { label: t('finder.src_project'), help: t('finder.src_project_help'), onClick: () => finderProjectPicker(role) },
+    ]);
+    setupDrop(box, (files) => finderUpload(role, files));
+    if ($('[data-dups]', box)) $('[data-dups]', box).onclick = () => finderDupDialog(role, 'all');
+    $('[data-clear]', box).onclick = async () => {
+      const n = fdImages(role).length;
+      if (!n || !await confirmBox(t('finder.clear_confirm', { n, role: t(`finder.role_${role}`) }), { ok: t('finder.clear'), danger: true })) return;
+      await api(`/finder/${sid}/clear?role=${role}`, { method: 'POST' }); await finderReload();
+    };
+  });
+  $('#fileInput').onchange = (e) => { finderUpload(fd.role, [...e.target.files].map((x) => [x, x.name])); e.target.value = ''; };
+  $('#folderInput').onchange = (e) => { finderUpload(fd.role, [...e.target.files].map((x) => [x, x.webkitRelativePath || x.name])); e.target.value = ''; };
+  finderRefresh();
+  if (fd.s.active_job) finderWatch(fd.s.active_job.id);
+}
+
+async function finderReload() {
+  fd.s = await api(`/finder/${fd.s.id}`);
+  finderRefresh();
+}
+
+function finderRefresh() {
+  finderRefreshSets();
+  finderRunBar();
+  finderResults();
+}
+
+function finderRefreshSets() {
+  for (const role of FD_ROLES) {
+    const box = $(`.fd-set[data-role="${role}"]`);
+    if (!box) return;
+    const imgs = fdImages(role);
+    $('[data-count]', box).textContent = imgs.length;
+    $('[data-clear]', box).hidden = !imgs.length;
+    if ($('[data-dups]', box)) $('[data-dups]', box).hidden = imgs.length < 2;
+    const shown = role === 'pool' ? imgs.slice(0, 16) : imgs;
+    const odd = (i) => role === 'ref' && i.scored && i.score > fdThreshold();  // 和其他參考圖不像：可能放錯圖
+    $('[data-thumbs]', box).innerHTML = shown.map((i) => `<div class="fd-thumb ${odd(i) ? 'odd' : ''}" title="${esc(i.rel_path || i.original_name)}${odd(i) ? ` — ${esc(t('finder.ref_odd'))}` : ''}${i.error ? ` — ${esc(i.error)}` : ''}">
+        <img loading="lazy" src="${i.thumb_url}" alt="">${role === 'pool' ? '' : `<button class="fd-x" data-del="${i.id}" title="${esc(t('common.delete'))}">✕</button>`}
+        ${odd(i) ? '<span class="badge warn">?</span>' : ''}${i.error ? '<span class="badge warn">!</span>' : ''}</div>`).join('')
+      + (role === 'pool' && imgs.length > shown.length ? `<div class="fd-more muted">${esc(t('finder.pool_more', { n: imgs.length - shown.length }))}</div>` : '')
+      || `<div class="muted fd-empty">${esc(t(`finder.role_${role}_empty`))}</div>`;
+    $$('[data-del]', box).forEach((b) => { b.onclick = async () => { await api(`/finder/${fd.s.id}/images/delete`, { method: 'POST', body: { ids: [b.dataset.del] } }); await finderReload(); }; });
+  }
+}
+
+function finderRunBar(job = null) {
+  const bar = $('#fdRun');
+  if (!bar) return;
+  const refs = fdImages('ref'), pool = fdImages('pool');
+  if (job) {
+    const pct = job.total ? (job.done / job.total) * 100 : 0;
+    bar.innerHTML = `<div class="row"><span>${esc(job.message || '')} ${job.total ? `${job.done}/${job.total}` : ''}</span><span class="spacer"></span>
+      <button class="btn sm" id="fdCancel">${esc(t('common.cancel'))}</button></div><div class="progress"><i style="width:${pct}%"></i></div>`;
+    $('#fdCancel').onclick = () => api(`/jobs/${job.id}/cancel`, { method: 'POST' });
+    return;
+  }
+  const wantTags = store.get('finderTags', true);
+  const untagged = wantTags ? pool.filter((i) => !i.tags && !i.error).length : 0;
+  const stale = pool.some((i) => !i.scored && !i.error) || refs.some((i) => !i.has_feature && !i.error) || untagged > 0;
+  const ready = refs.length && pool.length;
+  const scoredAny = pool.some((i) => i.scored);
+  bar.innerHTML = `<div class="row"><button class="btn primary" id="fdStart" ${ready && stale ? '' : 'disabled'}>▶ ${esc(t(scoredAny ? 'finder.rerun' : 'finder.run'))}</button>
+    <span class="muted">${esc(!refs.length ? t('finder.need_refs') : !pool.length ? t('finder.need_pool')
+      : stale ? (scoredAny && !pool.some((i) => !i.scored && !i.error) && untagged ? t('finder.need_tags', { n: untagged })
+        : t(scoredAny ? 'finder.stale' : 'finder.ready', { n: pool.length })) : t('finder.up_to_date'))}</span>
+    <span class="spacer"></span>
+    <label class="check" title="${esc(t('finder.gen_tags_help'))}"><input type="checkbox" id="fdTags" ${wantTags ? 'checked' : ''}> ${esc(t('finder.gen_tags'))}</label>
+    <label class="check" title="${esc(t('finder.free_vram_help'))}"><input type="checkbox" id="fdFreeVram" ${store.get('finderFreeVram', false) ? 'checked' : ''}> ${esc(t('finder.free_vram'))}</label>
+    <div class="dropdown"><button class="btn sm" id="fdVram" title="${esc(t('vram.button_help'))}">${esc(t('vram.button'))} ▾</button></div></div>`;
+  $('#fdFreeVram').onchange = (e) => store.set('finderFreeVram', e.target.checked);
+  $('#fdTags').onchange = (e) => { store.set('finderTags', e.target.checked); finderRunBar(); };
+  $('#fdVram').onclick = (e) => { e.stopPropagation(); vramMenu(e.currentTarget); };
+  $('#fdStart').onclick = () => finderStart(wantTags);
+}
+
+async function finderStart(tags) {
+  try {
+    const job = await api(`/finder/${fd.s.id}/run`, { method: 'POST', body: { free_vram: store.get('finderFreeVram', false), tags } });
+    finderWatch(job.id);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function finderWatch(jobId) {
+  clearTimeout(fd.timer);
+  const tick = async () => {
+    if (!$('#fdRun')) return;
+    let job;
+    try { job = await api(`/jobs/${jobId}`); } catch { fd.timer = setTimeout(tick, 2000); return; }
+    if (['done', 'cancelled', 'error'].includes(job.status)) {
+      await finderReload();
+      fd.auto = true;
+      toast(job.message + (job.errors?.length ? ` · ${t('finder.read_errors', { n: job.failed })}` : ''), job.status === 'done' ? 'ok' : job.status === 'error' ? 'err' : 'warn', 7000);
+      return;
+    }
+    finderRunBar(job);
+    fd.timer = setTimeout(tick, 1000);
+  };
+  tick();
+}
+
+function finderResults() {
+  const wrap = $('#fdResults');
+  if (!wrap) return;
+  if (!fdImages('pool').some((i) => i.scored)) { wrap.innerHTML = ''; return; }
+  const thr = fdThreshold(), def = fd.s.default_threshold;
+  // 門檻滑桿只畫一次：拖曳時只更新下面的結果，不然滑桿會被換掉、拖到一半中斷
+  wrap.innerHTML = `<div class="fd-res-head">
+      <h2>${esc(t('finder.results'))}</h2><span class="badge ok" id="fdMatchCount"></span>
+      <span class="spacer"></span>
+      <label class="fd-thr" title="${esc(t('finder.threshold_help'))}">${esc(t('finder.threshold'))}
+        <input type="range" id="fdThr" min="0.05" max="0.35" step="0.001" value="${thr}"><b id="fdThrVal">${thr.toFixed(3)}</b></label>
+      <button class="btn sm ghost" id="fdThrReset" ${fd.s.threshold == null ? 'disabled' : ''} title="${esc(t('finder.threshold_reset', { v: def.toFixed(3) }))}">↺ ${def.toFixed(3)}</button></div>
+    <div id="fdTagBar" class="fd-tagbar"></div>
+    <div id="fdResBody"></div>`;
+  const thrIn = $('#fdThr');
+  thrIn.oninput = () => { fd.s.threshold = +thrIn.value; $('#fdThrVal').textContent = (+thrIn.value).toFixed(3); $('#fdThrReset').disabled = false; finderResultsSoon(); };
+  thrIn.onchange = () => {
+    api(`/finder/${fd.s.id}`, { method: 'PATCH', body: { threshold: +thrIn.value } }).catch((e) => toast(e.message, 'err'));
+    finderRefreshSets();
+  };
+  $('#fdThrReset').onclick = async () => { fd.s = { ...fd.s, ...await api(`/finder/${fd.s.id}`, { method: 'PATCH', body: { reset_threshold: true } }) }; finderRefresh(); };
+  finderResultsBody();
+}
+
+function finderResultsBody() {
+  const body = $('#fdResBody');
+  if (!body) return;
+  const pool = fdImages('pool').filter((i) => i.scored || i.manual > 0).sort((a, b) => (a.score ?? 9) - (b.score ?? 9));
+  const matches = pool.filter(fdIsMatch);
+  const blocked = pool.filter((i) => i.manual !== FD_KEEP && fdIsTarget(i) && fdTagBlock(i));
+  const tagOut = blocked.filter((i) => fdTagBlock(i).kind !== 'untagged');
+  const untagged = blocked.filter((i) => fdTagBlock(i).kind === 'untagged');
+  if ((fd.filter === 'tagout' && !tagOut.length) || (fd.filter === 'untagged' && !untagged.length)) fd.filter = 'match';
+  if (fd.auto) fd.sel = new Set(matches.map((i) => i.id));
+  const list = fd.filter === 'match' ? matches : fd.filter === 'other' ? pool.filter((i) => !fdIsMatch(i))
+    : fd.filter === 'tagout' ? tagOut : fd.filter === 'untagged' ? untagged : pool;
+  $('#fdMatchCount').textContent = t('finder.match_count', { n: matches.length, total: pool.length });
+  finderTagBar();
+  const why = (i) => { const b = fd.filter === 'tagout' && fdTagBlock(i); return b && b.kind !== 'untagged' ? `<span class="badge warn" title="${esc(t(`finder.tag_why_${b.kind}`, { tag: fdTagShow(b.tag) }))}">${b.kind === 'missing' ? '∅' : '−'} ${esc(fdTagShow(b.tag))}</span>` : ''; };
+  body.innerHTML = `<div class="fd-res-bar">
+      <div class="seg">${[['match', matches.length], ...(tagOut.length ? [['tagout', tagOut.length]] : []), ...(untagged.length ? [['untagged', untagged.length]] : []),
+        ['other', pool.length - matches.length], ['all', pool.length]].map(([f, n]) => `<button class="btn sm ${fd.filter === f ? 'active' : ''}" data-f="${f}" ${['tagout', 'untagged'].includes(f) || (f === 'match' && fdTagActive()) ? `title="${esc(t(`finder.filter_${f}_help`))}"` : ''}>${esc(t(`finder.filter_${f}`))} <small>${n}</small></button>`).join('')}</div>
+      <span class="muted">${esc(t('finder.selected', { n: fd.sel.size }))}${fd.auto ? ` · ${esc(t('finder.auto_select'))}` : ''}</span>
+      <span class="spacer"></span>
+      <button class="btn sm" data-s="match">${esc(t('finder.sel_match'))}</button>
+      <button class="btn sm" data-s="shown">${esc(t('finder.sel_shown'))}</button>
+      <button class="btn sm" data-s="invert">${esc(t('finder.sel_invert'))}</button>
+      <button class="btn sm ghost" data-s="none">${esc(t('finder.sel_none'))}</button>
+      <button class="btn sm" id="fdDups" ${matches.length > 1 ? '' : 'disabled'} title="${esc(t('finder.dup_scope_matches_help'))}">${esc(t('finder.dup_button'))}</button>
+      <button class="btn sm" data-m="exclude" ${fd.sel.size ? '' : 'disabled'}>✕ ${esc(t('finder.bulk_exclude', { n: fd.sel.size }))}</button>
+      <button class="btn sm" data-m="include" ${fd.sel.size ? '' : 'disabled'}>✓ ${esc(t('finder.bulk_include', { n: fd.sel.size }))}</button>
+      <button class="btn sm primary" id="fdDownload" ${fd.sel.size ? '' : 'disabled'}>⬇ ${esc(t('finder.download', { n: fd.sel.size }))}</button>
+      <button class="btn sm primary" id="fdToProject" ${fd.sel.size ? '' : 'disabled'}>→ ${esc(t('finder.to_project', { n: fd.sel.size }))}</button></div>
+    <div class="fd-grid">${list.slice(0, fd.shown).map((i) => `<div class="fd-card ${fd.sel.has(i.id) ? 'selected' : ''} ${fdIsMatch(i) ? 'match' : ''}" data-id="${i.id}" title="${esc(i.rel_path || i.original_name)}">
+        <div class="thumb"><img loading="lazy" src="${i.thumb_url}" alt=""></div>
+        <div class="sel"><input type="checkbox" ${fd.sel.has(i.id) ? 'checked' : ''}></div>
+        <div class="fd-tools">${fdMarkButton(i)}<button class="fd-zoom" title="${esc(t('finder.preview'))}">⤢</button></div>
+        <div class="fd-score"><span>${i.score == null ? '' : esc(t('finder.diff', { v: i.score.toFixed(3) }))}</span>${why(i)}${i.manual ? `<span class="badge ${i.manual > 0 ? 'ok' : 'warn'}">${esc(t(fdManualKey(i.manual)))}</span>` : ''}${i.neg_score != null && i.neg_score <= i.score ? `<span class="badge warn" title="${esc(t('finder.neg_closer_help', { v: i.neg_score.toFixed(3) }))}">${esc(t('finder.neg_closer'))}</span>` : ''}</div></div>`).join('')}</div>
+    ${list.length > fd.shown ? `<div class="row" style="justify-content:center;margin-top:14px"><button class="btn" id="fdMore">${esc(t('finder.show_more', { n: list.length - fd.shown }))}</button></div>` : ''}
+    ${!list.length ? `<div class="empty">${esc(t('finder.no_results'))}</div>` : `<div class="help" style="margin-top:10px">${esc(t('finder.manual_help'))}</div>`}`;
+  $('#fdDups', body).onclick = () => finderDupDialog('pool', 'matches');
+  $$('[data-m]', body).forEach((b) => {
+    b.onclick = async () => {
+      const ids = [...fd.sel];
+      if (b.dataset.m === 'exclude' && ids.length > 10 && !await confirmBox(t('finder.bulk_exclude_confirm', { n: ids.length }))) return;
+      finderMark(ids, b.dataset.m);
+    };
+  });
+  $$('[data-f]', body).forEach((b) => { b.onclick = () => { fd.filter = b.dataset.f; fd.shown = 300; finderResultsBody(); }; });
+  $$('[data-s]', body).forEach((b) => {
+    b.onclick = () => {
+      const a = b.dataset.s;
+      fd.auto = a === 'match';
+      if (a === 'match') fd.sel = new Set(matches.map((i) => i.id));
+      if (a === 'shown') list.forEach((i) => fd.sel.add(i.id));
+      if (a === 'invert') fd.sel = new Set(pool.filter((i) => !fd.sel.has(i.id)).map((i) => i.id));
+      if (a === 'none') fd.sel.clear();
+      finderResultsBody();
+    };
+  });
+  $$('.fd-card', body).forEach((card) => {
+    card.onclick = (e) => {
+      if (e.target.closest('.fd-zoom')) { finderPreview(list, list.findIndex((i) => i.id === card.dataset.id)); return; }
+      const mark = e.target.closest('[data-mark]');
+      if (mark) { finderMark([card.dataset.id], mark.dataset.mark); return; }
+      const id = card.dataset.id;
+      fd.auto = false;
+      if (fd.sel.has(id)) fd.sel.delete(id); else fd.sel.add(id);
+      finderResultsBody();
+    };
+  });
+  if ($('#fdMore')) $('#fdMore').onclick = () => { fd.shown += 300; finderResultsBody(); };
+  $('#fdDownload').onclick = finderDownload;
+  $('#fdToProject').onclick = finderToProjectDialog;
+}
+const finderResultsSoon = debounce(() => finderResultsBody(), 120);
+
+// ---- tag 篩選列（在 CCIP 挑出的結果上再用 WD14 tag 篩）
+function finderTagBar() {
+  const bar = $('#fdTagBar');
+  if (!bar) return;
+  const f = fd.s.tag_filter;
+  const ccip = fdImages('pool').filter(fdIsTarget);
+  const tagged = ccip.filter((i) => i.tags);
+  const missing = ccip.length - tagged.length;
+  const focused = document.activeElement?.id === 'fdTagIn';
+  if (!tagged.length) {
+    bar.innerHTML = ccip.length ? `<div class="row"><b>${esc(t('finder.tag_filter'))}</b><span class="muted">${esc(t('finder.tags_none'))}</span>
+      <button class="btn sm" id="fdTagGen">${esc(t('finder.tags_generate'))}</button></div>` : '';
+    if ($('#fdTagGen', bar)) $('#fdTagGen', bar).onclick = () => finderStart(true);
+    return;
+  }
+  // 常見 tag：角色 tag 在前；每張都有的 tag 拿來篩沒有意義，不列
+  const count = new Map(), chars = new Set();
+  for (const i of tagged) i.tags.forEach((x, k) => { count.set(x, (count.get(x) || 0) + 1); if (k < (i.tags_char || 0)) chars.add(x); });
+  const used = new Set([...f.include, ...f.exclude]);
+  const ranked = [...count].filter(([x, n]) => !used.has(x) && (n < tagged.length || tagged.length === 1)).sort((a, b) => b[1] - a[1]);
+  const sug = [...ranked.filter(([x]) => chars.has(x)).slice(0, 6), ...ranked.filter(([x]) => !chars.has(x)).slice(0, 18)];
+  const chip = (x, kind) => `<span class="fd-tchip ${kind}" title="${esc(t(`finder.tag_${kind}_help`))}">${kind === 'inc' ? '✓' : '✕'} ${esc(fdTagShow(x))}<button data-rm="${esc(x)}" title="${esc(t('common.delete'))}">✕</button></span>`;
+  bar.innerHTML = `<div class="row fd-tagrow"><b>${esc(t('finder.tag_filter'))}</b>
+      <input type="text" id="fdTagIn" list="fdTagList" placeholder="${esc(t('finder.tag_ph'))}" autocomplete="off">
+      <datalist id="fdTagList">${[...count].sort((a, b) => b[1] - a[1]).slice(0, 800).map(([x, n]) => `<option value="${esc(fdTagShow(x))}">${n}</option>`).join('')}</datalist>
+      ${f.include.map((x) => chip(x, 'inc')).join('')}${f.exclude.map((x) => chip(x, 'exc')).join('')}
+      ${used.size ? `<button class="btn sm ghost" id="fdTagClear">${esc(t('finder.tag_clear'))}</button>` : ''}</div>
+    ${sug.length ? `<div class="fd-tagsug"><span class="muted">${esc(t('finder.tag_common'))}</span>${sug.map(([x, n]) => `<span class="fd-sug ${chars.has(x) ? 'char' : ''}">
+        <button data-inc="${esc(x)}" title="${esc(t('finder.tag_add_inc', { tag: fdTagShow(x) }))}">${esc(fdTagShow(x))} <small>${n}</small></button><button data-exc="${esc(x)}" title="${esc(t('finder.tag_add_exc', { tag: fdTagShow(x) }))}">−</button></span>`).join('')}</div>` : ''}
+    <div class="help">${esc(t('finder.tag_help'))}${missing ? ` ${esc(t(used.size ? 'finder.tags_missing_filtered' : 'finder.tags_missing', { n: missing }))}` : ''}
+      ${missing ? `<button class="btn sm ghost" id="fdTagGen">${esc(t('finder.tags_generate'))}</button>` : ''}</div>`;
+  const setFilter = (include, exclude) => {
+    fd.s.tag_filter = { include, exclude };
+    api(`/finder/${fd.s.id}`, { method: 'PATCH', body: { tag_filter: fd.s.tag_filter } }).catch((e) => toast(e.message, 'err'));
+    finderResultsBody();
+  };
+  const add = (x, kind) => {
+    x = fdTagNorm(x);
+    if (!x) return;
+    const inc = f.include.filter((y) => y !== x), exc = f.exclude.filter((y) => y !== x);
+    (kind === 'exc' ? exc : inc).push(x);
+    setFilter(inc, exc);
+  };
+  const input = $('#fdTagIn', bar);
+  // Enter 加入；前面加 - 代表不能有；逗號可以一次輸入多個
+  input.onkeydown = (e) => {
+    if (e.key !== 'Enter' || !input.value.trim()) return;
+    e.preventDefault();
+    const parts = input.value.split(',').map((x) => x.trim()).filter(Boolean);
+    let inc = [...f.include], exc = [...f.exclude];
+    for (const p of parts) {
+      const neg = p.startsWith('-'), x = fdTagNorm(neg ? p.slice(1) : p);
+      if (!x) continue;
+      inc = inc.filter((y) => y !== x); exc = exc.filter((y) => y !== x);
+      (neg ? exc : inc).push(x);
+    }
+    setFilter(inc, exc);
+    setTimeout(() => $('#fdTagIn')?.focus(), 0);
+  };
+  $$('[data-inc]', bar).forEach((b) => { b.onclick = () => add(b.dataset.inc, 'inc'); });
+  $$('[data-exc]', bar).forEach((b) => { b.onclick = () => add(b.dataset.exc, 'exc'); });
+  $$('[data-rm]', bar).forEach((b) => { b.onclick = () => setFilter(f.include.filter((y) => y !== b.dataset.rm), f.exclude.filter((y) => y !== b.dataset.rm)); });
+  if ($('#fdTagClear', bar)) $('#fdTagClear', bar).onclick = () => setFilter([], []);
+  if ($('#fdTagGen', bar)) $('#fdTagGen', bar).onclick = () => finderStart(true);
+  if (focused) input.focus();
+}
+
+// ---- 移除重複：列出幾乎相同的圖片分組，確認後移除（每組預設保留畫質最好的一張）
+// 差異門檻（小圖每個值的平均差，0–255）對應的說明
+const fdDupBand = (v) => (v <= 2 ? 'same' : v <= 6 ? 'mouth' : v <= 11 ? 'pose' : 'loose');
+
+async function finderDupDialog(role = 'pool', scope = null) {
+  const sid = fd.s.id;
+  // 在目前的結果裡找：重複的標成不符合（可以復原）；在整組裡找：從這個篩選移除
+  const canMatch = role === 'pool' && fdImages('pool').some((i) => i.scored);
+  scope = canMatch ? scope || 'matches' : 'all';
+  const thrOf = (sc) => +store.get(`finderDupThr_${sc}`, sc === 'matches' ? 6 : 4);
+  let thr = thrOf(scope), data = null, seq = 0, shown = 0, timer = null;
+  const PAGE = 120; // 5 萬張可能有上千組：分批顯示，移除時仍然處理全部的組
+  const keep = new Map(), skip = new Set(); // 組 → 改留的圖片；不處理的組
+  const body = h(`<div class="fd-dups">
+      <div class="row fd-dup-opts">${canMatch ? `<div class="seg">${['matches', 'all'].map((sc) => `<button class="btn sm" data-sc="${sc}" title="${esc(t(`finder.dup_scope_${sc}_help`))}">${esc(t(`finder.dup_scope_${sc}`))}</button>`).join('')}</div>` : ''}
+        <label class="fd-thr" title="${esc(t('finder.dup_threshold_help'))}">${esc(t('finder.dup_threshold'))}
+          <input type="range" id="fdDupThr" min="1" max="16" step="0.5"><b id="fdDupThrVal"></b></label>
+        <span class="muted" id="fdDupBand"></span><span class="fd-dup-warn" id="fdDupWarn"></span></div>
+      <div id="fdDupBody"></div>
+      <div class="help" id="fdDupHelp"></div></div>`);
+  const m = modal({
+    title: t('finder.dup_title'), body, size: 'browser',
+    actions: [
+      { label: t('common.cancel'), onClick: (c) => c() },
+      { label: t('finder.dup_remove', { n: 0 }), danger: true, onClick: async (close) => {
+        const ids = data.groups.flatMap((g, gi) => (skip.has(gi) ? [] : g.ids.filter((id) => id !== (keep.get(gi) || g.keep))));
+        if (!ids.length) return;
+        if (data.scope === 'matches') await api(`/finder/${sid}/manual`, { method: 'POST', body: { ids, action: 'exclude' } });
+        else await api(`/finder/${sid}/images/delete`, { method: 'POST', body: { ids } });
+        close();
+        toast(t(data.scope === 'matches' ? 'finder.dup_excluded' : 'finder.dup_removed', { n: ids.length }), 'ok');
+        await finderReload();
+      } },
+    ],
+  });
+  const btn = $('.modal-foot .danger', m.el), box = $('#fdDupBody', body), thrIn = $('#fdDupThr', body);
+  const open = () => document.body.contains(m.el);
+  const count = () => {
+    const n = data ? data.groups.reduce((s, g, gi) => s + (skip.has(gi) ? 0 : g.ids.length - 1), 0) : 0;
+    btn.textContent = t(scope === 'matches' ? 'finder.dup_exclude' : 'finder.dup_remove', { n }); btn.disabled = !n;
+  };
+  const showThr = () => {
+    thrIn.value = thr; $('#fdDupThrVal', body).textContent = thr.toFixed(1);
+    $('#fdDupBand', body).textContent = t(`finder.dup_band_${fdDupBand(thr)}`);
+    // 同背景、不同角色的圖平均差異約 8：在所有圖片裡找時提醒一下
+    $('#fdDupWarn', body).textContent = scope === 'all' && thr >= 7 ? t('finder.dup_band_all_warn') : '';
+  };
+  const drawGroup = (gi, el = $(`.fd-dup-group[data-g="${gi}"]`, box)) => {
+    const g = data.groups[gi], k = keep.get(gi) || g.keep;
+    el.classList.toggle('skip', skip.has(gi));
+    $$('.fd-dup-img', el).forEach((x) => {
+      const on = x.dataset.id === k;
+      x.classList.toggle('keep', on); x.classList.toggle('drop', !on);
+      $('.badge', x).className = `badge ${on ? 'ok' : 'warn'}`; $('.badge', x).textContent = t(on ? 'finder.dup_keep' : data.scope === 'matches' ? 'finder.dup_drop_matches' : 'finder.dup_drop');
+    });
+  };
+  let imgs = {};
+  const groupHTML = (g, gi) => `<div class="fd-dup-group" data-g="${gi}">
+        <label class="check"><input type="checkbox" data-skip ${skip.has(gi) ? '' : 'checked'}> ${esc(t('finder.dup_group', { i: gi + 1, n: g.ids.length }))}</label>
+        <div class="fd-dup-imgs">${g.ids.map((id) => { const i = imgs[id] || {}; return `<div class="fd-dup-img" data-id="${id}" title="${esc(i.rel_path || i.name || '')}${i.width ? ` · ${i.width}×${i.height}` : ''}">
+          <img loading="lazy" src="/api/finder/images/${id}/thumb" alt=""><span class="badge"></span><button class="fd-zoom" data-zoom title="${esc(t('finder.preview'))}">⤢</button>
+          <div class="fd-dup-meta">${i.width ? `${i.width}×${i.height}` : ''} · ${esc((i.name || '').split('.').pop().toUpperCase())}${scope === 'all' && i.match ? ` · <b>${esc(t('finder.is_match'))}</b>` : ''}</div></div>`; }).join('')}</div></div>`;
+  const more = () => { // 再多顯示一批
+    const list = $('.fd-dup-list', box), end = Math.min(data.groups.length, shown + PAGE);
+    list.insertAdjacentHTML('beforeend', data.groups.slice(shown, end).map((g, k) => groupHTML(g, shown + k)).join(''));
+    [...list.children].slice(shown, end).forEach((el, k) => drawGroup(shown + k, el));
+    shown = end;
+    const btnMore = $('#fdDupMore', box);
+    btnMore.hidden = shown >= data.groups.length;
+    btnMore.textContent = t('finder.dup_more', { n: data.groups.length - shown });
+  };
+  const draw = () => {
+    imgs = data.items;
+    shown = 0;
+    const partial = data.missing ? `<div class="alert info">${esc(t('finder.dup_partial', { n: data.missing }))}</div>` : '';
+    const sfx = data.scope === 'matches' ? '_matches' : '';
+    box.innerHTML = data.groups.length ? `${partial}<p>${esc(t(`finder.dup_found${sfx}`, { groups: data.groups.length, n: data.removable, total: data.total - data.missing }))}</p>
+      <div class="fd-dup-list"></div><div class="row" style="justify-content:center;margin-top:10px"><button class="btn" id="fdDupMore"></button></div>`
+      : `${partial}<div class="empty">${esc(t(`finder.dup_none${sfx}`, { total: data.total - data.missing }))}</div>`;
+    if (data.groups.length) { $('#fdDupMore', box).onclick = more; more(); }
+    count();
+  };
+  const progress = (text, pct) => { box.innerHTML = `<div class="fd-dup-wait"><span>${esc(text)}</span>${pct == null ? '' : `<div class="progress"><i style="width:${pct}%"></i></div>`}</div>`; };
+  const load = async () => {
+    const my = ++seq;
+    keep.clear(); skip.clear(); data = null; count();
+    $$('[data-sc]', body).forEach((b) => b.classList.toggle('active', b.dataset.sc === scope));
+    $('#fdDupHelp', body).textContent = t(scope === 'matches' ? 'finder.dup_help_matches' : 'finder.dup_help');
+    showThr();
+    if (!box.querySelector('.fd-dup-list')) progress(t('common.loading'));
+    else box.classList.add('loading'); // 拖門檻時先留著舊的結果
+    const url = () => `/finder/${sid}/duplicates?role=${role}&threshold=${thr}&scope=${scope}`;
+    try {
+      let r = await api(url());
+      // 還沒有指紋的圖片先讀一次（辨識過的圖片已經有）。這個篩選已經有工作在跑時（它也會順便算指紋），
+      // 不再排一個工作在後面等，先比對已經有指紋的圖片
+      if (r.missing && !r.busy) {
+        const { job } = await api(`/finder/${sid}/hash`, { method: 'POST', body: { role } });
+        if (job) {
+          finderWatch(job.id);
+          for (;;) {
+            if (!open() || my !== seq) return;
+            const j = await api(`/jobs/${job.id}`);
+            if (['done', 'cancelled', 'error'].includes(j.status)) { if (j.status !== 'done') throw new Error(j.message); break; }
+            progress(`${j.status === 'queued' ? t('finder.dup_queued') : t('finder.dup_hashing')} ${j.done}/${j.total}`, j.total ? (j.done / j.total) * 100 : 0);
+            await new Promise((res) => setTimeout(res, 700));
+          }
+        }
+        r = await api(url());
+      }
+      if (!open() || my !== seq) return;
+      box.classList.remove('loading');
+      data = r; draw();
+    } catch (e) { if (my === seq) { box.classList.remove('loading'); box.innerHTML = `<div class="alert err">${esc(e.message)}</div>`; } }
+  };
+  $$('[data-sc]', body).forEach((b) => { b.onclick = () => { scope = b.dataset.sc; thr = thrOf(scope); box.innerHTML = ''; load(); }; });
+  thrIn.oninput = () => {
+    thr = +thrIn.value; showThr();
+    clearTimeout(timer); timer = setTimeout(() => { store.set(`finderDupThr_${scope}`, thr); load(); }, 300);
+  };
+  box.onclick = (e) => {
+    const g = e.target.closest('.fd-dup-group');
+    if (!g || !data) return;
+    const gi = +g.dataset.g;
+    if (e.target.matches('[data-skip]')) { if (e.target.checked) skip.delete(gi); else skip.add(gi); drawGroup(gi); count(); return; }
+    const img = e.target.closest('.fd-dup-img');
+    if (!img) return;
+    if (e.target.closest('[data-zoom]')) {
+      const i = imgs[img.dataset.id];
+      modal({ title: i ? `${i.name}${i.width ? `（${i.width}×${i.height}）` : ''}` : '', size: 'wide', body: `<div class="fd-preview"><img src="/api/finder/images/${img.dataset.id}/file" alt=""></div>` });
+      return;
+    }
+    keep.set(gi, img.dataset.id); skip.delete(gi); $('[data-skip]', g).checked = true; drawGroup(gi); count();
+  };
+  load();
+}
+
+function fdMarkButton(i) {
+  const b = (mark, cls, icon, key) => `<button class="fd-mark ${cls}" data-mark="${mark}" title="${esc(t(key))}">${icon}</button>`;
+  if (i.manual !== FD_KEEP && fdIsTarget(i) && fdTagBlock(i)) return b('keep', 'in', '＋', 'finder.mark_keep'); // 被 tag 篩掉的目標
+  if (i.manual) return b('clear', '', '↺', 'finder.mark_clear');
+  return fdIsMatch(i) ? b('exclude', 'ex', '✕', 'finder.mark_exclude') : b('include', 'in', '✓', 'finder.mark_include');
+}
+
+async function finderMark(ids, action, quiet = false) {
+  if (!ids.length) return;
+  try {
+    await api(`/finder/${fd.s.id}/manual`, { method: 'POST', body: { ids, action } });
+  } catch (e) { toast(e.message, 'err'); return; }
+  const value = { include: 1, exclude: -1, keep: FD_KEEP, clear: null }[action];
+  const set = new Set(ids);
+  fd.s.images.forEach((i) => { if (set.has(i.id)) i.manual = value; });
+  if (!fd.auto) ids.forEach((id) => (action === 'exclude' ? fd.sel.delete(id) : action !== 'clear' && fd.sel.add(id)));
+  if (!quiet) toast(t(`finder.marked_${action}`, { n: ids.length }), 'ok', 2500);
+  finderResultsBody();
+}
+
+function finderPreview(list, idx) {
+  const body = h('<div class="fd-preview"><img id="fdpImg" alt=""><div class="row" id="fdpMeta"></div><div class="fd-ptags" id="fdpTags"></div></div>');
+  const m = modal({ title: '', body, size: 'wide', onClose: () => { document.removeEventListener('keydown', keys); finderResultsBody(); } });
+  const show = (i) => {
+    idx = Math.max(0, Math.min(list.length - 1, i));
+    const img = list[idx];
+    $('#fdpImg', body).src = img.image_url;
+    $('.modal-head h3', m.el).textContent = `${img.original_name}（${idx + 1} / ${list.length}）`;
+    $('#fdpMeta', body).innerHTML = `<span>${img.score == null ? '' : `${esc(t('finder.diff', { v: img.score.toFixed(3) }))} · `}${esc(t(fdIsMatch(img) ? 'finder.is_match' : 'finder.not_match'))}${img.manual ? ` · ${esc(t(fdManualKey(img.manual)))}` : ''}${!fdIsMatch(img) && fdIsTarget(img) && fdTagBlock(img) ? ` · ${esc(t('finder.blocked_by_tags'))}` : ''}</span>
+      <span class="muted" style="font-size:12px">${esc(t('finder.preview_keys'))}</span><span class="spacer"></span>
+      <button class="btn ${img.manual === -1 ? 'active' : ''}" id="fdpEx">✕ ${esc(t('finder.mark_exclude'))}</button>
+      <button class="btn ${img.manual === 1 ? 'active' : ''}" id="fdpIn">✓ ${esc(t('finder.mark_include'))}</button>
+      ${img.manual === FD_KEEP || (fdIsTarget(img) && fdTagBlock(img)) ? `<button class="btn ${img.manual === FD_KEEP ? 'active' : ''}" id="fdpKeep" title="${esc(t('finder.mark_keep_help'))}">＋ ${esc(t('finder.mark_keep'))}</button>` : ''}
+      <label class="check"><input type="checkbox" id="fdpSel" ${fd.sel.has(img.id) ? 'checked' : ''}> ${esc(t('finder.select_this'))}</label>
+      <button class="btn" id="fdpPrev">‹</button><button class="btn" id="fdpNext">›</button>`;
+    const f = fd.s.tag_filter;
+    $('#fdpTags', body).innerHTML = img.tags ? img.tags.map((x) => `<span class="fd-ptag ${f.include.includes(x) ? 'inc' : f.exclude.includes(x) ? 'exc' : ''}">${esc(fdTagShow(x))}</span>`).join('') : '';
+    $('#fdpEx', body).onclick = () => markAndNext('exclude');
+    $('#fdpIn', body).onclick = () => markAndNext('include');
+    if ($('#fdpKeep', body)) $('#fdpKeep', body).onclick = () => markAndNext('keep');
+    $('#fdpSel', body).onchange = (e) => { fd.auto = false; if (e.target.checked) fd.sel.add(img.id); else fd.sel.delete(img.id); };
+    $('#fdpPrev', body).onclick = () => show(idx - 1);
+    $('#fdpNext', body).onclick = () => show(idx + 1);
+  };
+  // 判定後跳下一張：同一張再按一次就取消
+  const markAndNext = async (action) => {
+    const img = list[idx];
+    const same = img.manual === { exclude: -1, include: 1, keep: FD_KEEP }[action];
+    await finderMark([img.id], same ? 'clear' : action, true);
+    show(same ? idx : idx + 1);
+  };
+  const keys = (e) => {
+    if (e.key === 'ArrowLeft') show(idx - 1);
+    if (e.key === 'ArrowRight') show(idx + 1);
+    if (e.key === ' ') { e.preventDefault(); $('#fdpSel', body).click(); }
+    if (e.key === 'x' || e.key === 'X' || e.key === 'Delete') markAndNext('exclude');
+    if (e.key === 'v' || e.key === 'V') markAndNext('include');
+  };
+  document.addEventListener('keydown', keys);
+  show(idx);
+}
+
+async function finderUpload(role, pairs) {
+  const ok = /\.(png|jpe?g|jfif|webp|bmp|gif|tiff?|avif|zip)$/i;
+  pairs = pairs.filter(([, p]) => ok.test(p) && !p.split('/').some((seg) => seg.startsWith('.')));
+  if (!pairs.length) { toast(t('upload.none'), 'warn'); return; }
+  const batches = [];
+  let cur = [], size = 0;
+  for (const pair of pairs) {
+    if (cur.length && (cur.length >= 40 || size > 80e6)) { batches.push(cur); cur = []; size = 0; }
+    cur.push(pair); size += pair[0].size;
+  }
+  if (cur.length) batches.push(cur);
+  const total = pairs.reduce((s, p) => s + p[0].size, 0) || 1;
+  let sent = 0;
+  const result = { added: 0, skipped: [] };
+  const bar = $('#fdRun');
+  const draw = (loaded) => {
+    const pct = Math.round(((sent + loaded) / total) * 100);
+    bar.innerHTML = `<span>${esc(t('upload.progress', { pct }))}</span><div class="progress"><i style="width:${pct}%"></i></div>`;
+  };
+  draw(0);
+  try {
+    for (const b of batches) {
+      const r = await uploadXHR(`/api/finder/${fd.s.id}/upload?role=${role}`, b.map((x) => x[0]), b.map((x) => x[1]), draw);
+      sent += b.reduce((s, p) => s + p[0].size, 0);
+      result.added += r.added; result.skipped.push(...r.skipped);
+      draw(0);
+    }
+    finderImported(result);
+  } catch (e) {
+    toast(t('upload.failed', { error: e.message }), 'err');
+    await finderReload();
+  }
+}
+
+async function finderImported(r) {
+  importToast(r);
+  await finderReload();
+}
+
+async function finderProjectPicker(role) {
+  const projects = await api('/projects');
+  if (!projects.length) { toast(t('finder.no_projects'), 'warn'); return; }
+  const body = h(`<div class="fd-picker">
+      <div class="row"><select id="fpProj">${projects.map((p) => `<option value="${p.id}">${esc(p.name)}（${p.image_count}）</option>`).join('')}</select>
+        <span class="spacer"></span><button class="btn sm" id="fpAll">${esc(t('ws.select_all'))}</button><button class="btn sm ghost" id="fpNone">${esc(t('finder.sel_none'))}</button></div>
+      <div class="help">${esc(t(role === 'pool' ? 'finder.pick_pool_help' : 'finder.pick_ref_help'))}</div>
+      <div class="up-grid" id="fpGrid"></div></div>`);
+  let imgs = [];
+  const picked = new Set();
+  const m = modal({
+    title: t('finder.pick_title', { role: t(`finder.role_${role}`) }), body, size: 'mid',
+    actions: [
+      { label: t('common.cancel'), onClick: (c) => c() },
+      { label: t('finder.pick_add', { n: 0 }), primary: true, onClick: async (close) => {
+        if (!picked.size) return;
+        const r = await api(`/finder/${fd.s.id}/import-project`, { method: 'POST', body: { role, project_id: $('#fpProj', body).value, ids: [...picked] } });
+        close(); finderImported(r);
+      } },
+    ],
+  });
+  const addBtn = $('.modal-foot .primary', m.el);
+  const draw = () => {
+    $('#fpGrid', body).innerHTML = imgs.map((i) => `<div class="up-item fp-item ${picked.has(i.id) ? 'picked' : ''}" data-id="${i.id}" title="${esc(i.original_name)}"><img loading="lazy" src="${i.thumb_url}" alt=""><input type="checkbox" ${picked.has(i.id) ? 'checked' : ''}></div>`).join('');
+    addBtn.textContent = t('finder.pick_add', { n: picked.size }); addBtn.disabled = !picked.size;
+  };
+  const load = async () => {
+    imgs = await api(`/projects/${$('#fpProj', body).value}/images`);
+    picked.clear();
+    if (role === 'pool') imgs.forEach((i) => picked.add(i.id));
+    draw();
+  };
+  $('#fpProj', body).onchange = load;
+  $('#fpAll', body).onclick = () => { imgs.forEach((i) => picked.add(i.id)); draw(); };
+  $('#fpNone', body).onclick = () => { picked.clear(); draw(); };
+  $('#fpGrid', body).onclick = (e) => {
+    const it = e.target.closest('.fp-item');
+    if (!it) return;
+    if (picked.has(it.dataset.id)) picked.delete(it.dataset.id); else picked.add(it.dataset.id);
+    draw();
+  };
+  load();
+}
+
+async function finderDownload() {
+  const busy = toast(t('finder.zipping'), 'info', 600000);
+  try {
+    const r = await api(`/finder/${fd.s.id}/download`, { method: 'POST', body: { ids: [...fd.sel] } });
+    const a = document.createElement('a'); a.href = r.download_url; a.download = r.file; document.body.append(a); a.click(); a.remove();
+    toast(t('finder.downloaded', { n: r.count }), 'ok');
+  } catch (e) { toast(e.message, 'err'); } finally { busy.remove(); }
+}
+
+async function finderToProjectDialog() {
+  const projects = await api('/projects');
+  const lt = state.system.lora_types;
+  const body = h(`<div>
+    <label class="check"><input type="radio" name="fdDest" value="new" checked> ${esc(t('finder.dest_new'))}</label>
+    <div id="fdNewWrap" class="fd-dest">
+      <div class="field"><div class="lbl">${esc(t('newproj.name'))}</div><input type="text" id="fdpName" value="${esc(fd.s.name)}"></div>
+      <div class="row">
+        <div class="field grow"><div class="lbl">${esc(t('newproj.base_model'))}</div>${profileSelectHTML('fdpProfile', 'illustrious')}</div>
+        <div class="field grow"><div class="lbl">${esc(t('newproj.lora_type'))}</div><select id="fdpType">${Object.entries(lt).map(([k, v]) => `<option value="${k}">${esc(v.name)}</option>`).join('')}</select></div>
+      </div>
+      <div class="field"><div class="lbl">${esc(t('newproj.trigger'))}</div><input type="text" id="fdpTrigger" placeholder="${esc(t('newproj.trigger_ph'))}"></div>
+    </div>
+    ${projects.length ? `<label class="check"><input type="radio" name="fdDest" value="old"> ${esc(t('finder.dest_existing'))}</label>
+    <div id="fdOldWrap" class="fd-dest" hidden><select id="fdpProj">${projects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>` : ''}
+    <div class="help">${esc(t('finder.to_project_help'))}</div></div>`);
+  $$('input[name=fdDest]', body).forEach((r) => { r.onchange = () => { $('#fdNewWrap', body).hidden = r.value !== 'new' || !r.checked; if ($('#fdOldWrap', body)) $('#fdOldWrap', body).hidden = r.value !== 'old' || !r.checked; }; });
+  modal({
+    title: t('finder.to_project', { n: fd.sel.size }), body, size: 'mid',
+    actions: [
+      { label: t('common.cancel'), onClick: (c) => c() },
+      { label: t('common.import'), primary: true, onClick: async (close) => {
+        const isNew = $('input[name=fdDest]:checked', body).value === 'new';
+        const payload = { ids: [...fd.sel], ...(isNew
+          ? { new_project: { name: $('#fdpName', body).value, profile: $('#fdpProfile', body).value, lora_type: $('#fdpType', body).value, trigger: $('#fdpTrigger', body).value } }
+          : { project_id: $('#fdpProj', body).value }) };
+        const r = await api(`/finder/${fd.s.id}/to-project`, { method: 'POST', body: payload });
+        close();
+        const go = await confirmBox(t('finder.imported', { n: r.added, name: r.project.name, skipped: r.skipped.length }), { ok: t('finder.go_project') });
+        if (go) location.hash = `#/p/${r.project.id}`;
+      } },
+    ],
+  });
 }
 
 /* ================================================================ 底模指南 */

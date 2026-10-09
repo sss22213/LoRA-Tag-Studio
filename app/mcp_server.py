@@ -332,3 +332,15 @@ def list_active_civitai_trainings() -> list[dict[str, Any]]:
     """Civitai training runs in progress in any project (plus runs finished in the last 24 h) with their progress:
     summary.progress has percent, epochs_done / epochs_total, step / total_steps and remaining_seconds."""
     return civitai.active_runs()
+
+
+@_tool
+def import_lora_to_a1111(workflow_id: str, epoch: int, overwrite: bool = False) -> dict[str, Any]:
+    """Import one epoch of a finished Civitai training into A1111 / Forge's Lora folder (needs A1111_URL and Forge
+    Neo Chino's LoRA import API). Forge downloads the file itself; the card gets the trigger word, base model type
+    and a sample image. Returns name, relative_path and a ready-made prompt like "<lora:name:1> trigger".
+    An error mentioning overwrite means a different file with the same name exists: ask the user before retrying
+    with overwrite=true."""
+    from . import a1111
+
+    return a1111.import_epoch(workflow_id, epoch, overwrite)

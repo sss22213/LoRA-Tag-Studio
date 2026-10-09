@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import mimetypes
+import os
 import zipfile
 from typing import Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
-from . import civitai, exporter, i18n, jobs, services, storage
+from . import a1111, civitai, exporter, finder, i18n, jobs, services, smb, storage
 from .config import settings
 from .i18n import t, tr
 from .pipeline import quick_tag
@@ -81,6 +83,116 @@ class UpscaleRequest(BaseModel):
     scale: str | int = Field("auto", description="auto (2x, 4x when 2x stays below min_side) | 2 | 4 | 1 = noise "
                                                  "reduction only, size unchanged (without ids: JPEG / lossy WebP "
                                                  "images of any size that were not processed yet)")
+
+
+FinderModel = Literal["default", "large"]
+FinderRole = Literal["ref", "neg", "pool"]
+
+
+class FinderCreate(BaseModel):
+    name: str = Field("", description="Name of the search, e.g. the character")
+    model: FinderModel = Field("default", description="CCIP model: default (150 MB) | large (384 MB, slightly more "
+                                                      "accurate, about 1 GB more VRAM)")
+
+
+class FinderTagFilter(BaseModel):
+    include: list[str] = Field([], description="A CCIP match must have all of these WD14 tags (spaces or underscores)")
+    exclude: list[str] = Field([], description="A CCIP match must have none of these tags, e.g. multiple_girls")
+
+
+class FinderUpdate(BaseModel):
+    name: str | None = None
+    model: FinderModel | None = Field(None, description="Changing the model resets the threshold to its default")
+    threshold: float | None = Field(None, ge=0, le=2, description="Max difference to count as the same character")
+    reset_threshold: bool = Field(False, description="Go back to the model's default threshold")
+    tag_filter: FinderTagFilter | None = Field(None, description="Filter the CCIP matches by WD14 tags (needs tags "
+                                                                 "from POST /run with tags=true). While a filter is "
+                                                                 "set, images without tags do not match. It also applies "
+                                                                 "to manual = 1 (include); only manual = 2 (keep) and "
+                                                                 "-1 (exclude) ignore it")
+
+
+class FinderServerImport(BaseModel):
+    role: FinderRole = Field(..., description="ref = target character, neg = similar characters to exclude, "
+                                              "pool = images to search")
+    path: str = Field("", description="Sub folder inside the server import directory (see GET /api/import-dirs)")
+    recursive: bool = True
+
+
+class FinderProjectImport(BaseModel):
+    role: FinderRole
+    project_id: str
+    ids: list[str] | None = Field(None, description="Project image ids (default: all images of the project)")
+
+
+class FinderSelection(BaseModel):
+    ids: list[str] | None = Field(None, description="Images to use (default: the images that currently match)")
+
+
+class FinderManual(BaseModel):
+    ids: list[str]
+    action: Literal["include", "exclude", "keep", "clear"] = Field(
+        ..., description="include = it is the target (the model missed it; the tag filter still applies), exclude = "
+                         "it is not (the model picked it by mistake), keep = keep it even though the tag filter drops "
+                         "it (wrong WD14 tags), clear = back to the score")
+
+
+class FinderRun(BaseModel):
+    free_vram: bool = Field(False, description="Before running, unload WD14 / waifu2x and put the VLM (vLLM) to "
+                                               "sleep so CCIP has room")
+    tags: bool = Field(False, description="Also tag the pool with WD14 (for the tag filter); only missing tags are "
+                                          "computed")
+
+
+class FinderHash(BaseModel):
+    role: FinderRole = "pool"
+
+
+class FinderToProject(FinderSelection):
+    project_id: str | None = Field(None, description="Existing project to import into")
+    new_project: ProjectCreate | None = Field(None, description="Or create a new project with these settings")
+
+
+class SmbConnectionIn(BaseModel):
+    name: str = Field("", description="Display name (default: host/share)")
+    host: str = Field(..., description="Server name or IP, e.g. 192.168.1.20 or nas.local (\\\\nas\\share is "
+                                       "split automatically)")
+    share: str = Field("", description="Share name")
+    username: str = ""
+    password: str = Field("", description="Stored on the server; never returned by the API")
+    domain: str = ""
+    port: int = Field(445, ge=1, le=65535)
+
+
+class SmbConnectionPatch(BaseModel):
+    name: str | None = None
+    host: str | None = None
+    share: str | None = None
+    username: str | None = None
+    password: str | None = Field(None, description="Empty or omitted = keep the stored password")
+    domain: str | None = None
+    port: int | None = Field(None, ge=1, le=65535)
+
+
+class SmbTest(SmbConnectionIn):
+    id: str | None = Field(None, description="Existing connection: an empty password uses the stored one")
+
+
+class SmbItem(BaseModel):
+    conn_id: str = Field(..., description="SMB connection id")
+    path: str = Field("", description="Path inside the share ('' = the share's root)")
+    dir: bool = Field(True, description="true = a folder (its images are imported), false = one image")
+
+
+class SmbImport(BaseModel):
+    items: list[SmbItem] = Field(..., min_length=1, description="Folders and images to import; they may come from "
+                                                                "different connections")
+    recursive: bool = Field(True, description="Include the sub folders of the selected folders")
+    target: Literal["project", "finder"] = Field(..., description="project = download the images into a project; "
+                                                                   "finder = reference them in a character search")
+    project_id: str | None = None
+    session_id: str | None = Field(None, description="Character search id (target=finder)")
+    role: FinderRole = "pool"
 
 
 class UpscaleRestoreRequest(BaseModel):
@@ -213,12 +325,14 @@ def system_info() -> dict[str, Any]:
                  "available_providers": providers, "device": settings.ort_device},
         "vlm": vlm.status(),
         "civitai": civitai.info(),
+        "a1111": {"configured": a1111.configured(), "subfolder": settings.a1111_lora_subfolder},
         "lora_types": lora_types_view(),
         "caption_modes": caption_modes_view(),
         "prune_groups": {k: tr(f"prune_groups.{k}", default=k) for k in PRUNE_GROUPS},
         "export_formats": exporter.export_formats_view(),
         "bulk_actions": services.bulk_actions_view(),
         "upscale": services.upscale_options(),
+        "finder": {"models": {k: {"name": v, "threshold": finder.default_threshold(k)} for k, v in finder.MODELS.items()}},
         "settings_schema": BASE_SETTINGS,
         "nsfw_common": tr("nsfw_common", default=""),
         "lang": i18n.get_lang(),
@@ -237,7 +351,8 @@ def gpu_status() -> dict[str, Any]:
 
 
 @router.post("/gpu/{action}", operation_id="manage_vram",
-             summary="Free or load VRAM: release_wd14 | load_wd14 | sleep_vlm | wake_vlm | release_waifu2x",
+             summary="Free or load VRAM: release_wd14 | load_wd14 | sleep_vlm | wake_vlm | release_waifu2x | "
+                     "release_ccip",
              description="release_wd14 unloads the WD14 models (reloaded automatically on the next tagging). "
                          "release_waifu2x unloads the upscaling models (also done automatically after each "
                          "upscaling job). "
@@ -418,6 +533,223 @@ def upscale_restore(pid: str, body: UpscaleRestoreRequest | None = None) -> dict
     return services.restore_upscaled(pid, ids=body.ids if body else None)
 
 
+# ------------------------------------------------------------------ 角色篩選（CCIP）
+@router.get("/finder", operation_id="list_character_searches", summary="Character searches (CCIP), newest first")
+def finder_list() -> list[dict[str, Any]]:
+    return finder.list_sessions()
+
+
+@router.post("/finder", operation_id="create_character_search", status_code=201,
+             summary="Create a character search: pick images of one character out of a pile of images",
+             description="Separate from projects. Add reference images of the target character (role=ref), optional "
+                         "images of similar characters to exclude (role=neg) and the images to search (role=pool), then "
+                         "POST /run. Uses deepghs CCIP (OpenRAIL), downloaded from Hugging Face on first use.")
+def finder_create(body: FinderCreate) -> dict[str, Any]:
+    return finder.create_session(body.name, body.model)
+
+
+@router.get("/finder/{sid}", operation_id="get_character_search",
+            summary="Search settings and all its images with scores (score = median CCIP difference to the "
+                    "references; a pool image matches when manual = 2, or it is the target (manual = 1, or manual is "
+                    "not -1 and score <= threshold and score < neg_score) and it passes tag_filter)")
+def finder_get(sid: str) -> dict[str, Any]:
+    return finder.session_out(finder.require_session(sid), with_images=True)
+
+
+@router.patch("/finder/{sid}", operation_id="update_character_search",
+              summary="Rename, change the model, threshold or tag filter; images are included only when the model "
+                      "changed")
+def finder_update(sid: str, body: FinderUpdate) -> dict[str, Any]:
+    return finder.update_session(sid, body.name, body.model, body.threshold, body.reset_threshold,
+                                 body.tag_filter.model_dump() if body.tag_filter else None)
+
+
+@router.delete("/finder/{sid}", operation_id="delete_character_search",
+               summary="Delete the search and its stored images (server import folders are never touched)")
+def finder_delete(sid: str) -> dict[str, Any]:
+    finder.delete_session(sid)
+    return {"deleted": sid}
+
+
+@router.post("/finder/{sid}/upload", operation_id="upload_character_search_images",
+             summary="Upload images / folders / zip files to the references (ref), exclusions (neg) or pool")
+async def finder_upload(sid: str, role: FinderRole = Query(...), files: list[UploadFile] = File(...),
+                        paths: list[str] | None = Form(None, description="Relative paths (same order as files)")
+                        ) -> dict[str, Any]:
+    finder.require_session(sid)
+    entries, zips = [], []
+    for i, f in enumerate(files):
+        name = (paths[i] if paths and i < len(paths) and paths[i] else f.filename) or f"file_{i}"
+        if name.lower().endswith(".zip"):
+            zips.append((name, f.file))
+        else:
+            entries.append(storage.bytes_entry(name, await f.read()))
+    return await run_in_threadpool(finder.add_uploads, sid, role, entries, zips)
+
+
+@router.post("/finder/{sid}/import-server", operation_id="import_server_folder_to_character_search",
+             summary="Add a server import folder (files are referenced, not copied)")
+def finder_import_server(sid: str, body: FinderServerImport) -> dict[str, Any]:
+    return finder.add_server_folder(sid, body.role, body.path, body.recursive)
+
+
+@router.post("/finder/{sid}/import-project", operation_id="import_project_to_character_search",
+             summary="Add images of a project")
+def finder_import_project(sid: str, body: FinderProjectImport) -> dict[str, Any]:
+    return finder.add_from_project(sid, body.role, body.project_id, body.ids)
+
+
+@router.post("/finder/{sid}/images/delete", operation_id="remove_character_search_images")
+def finder_remove(sid: str, body: IdList) -> dict[str, Any]:
+    return {"removed": finder.remove_images(sid, body.ids)}
+
+
+@router.post("/finder/{sid}/clear", operation_id="clear_character_search_role",
+             summary="Remove every image of one role")
+def finder_clear(sid: str, role: FinderRole = Query(...)) -> dict[str, Any]:
+    return {"removed": finder.remove_images(sid, role=role)}
+
+
+@router.post("/finder/{sid}/manual", operation_id="mark_character_search_images",
+             summary="Manually mark pool images as the target or not; kept when the threshold changes or on re-runs")
+def finder_manual(sid: str, body: FinderManual) -> dict[str, Any]:
+    return {"updated": finder.set_manual(sid, body.ids, body.action)}
+
+
+@router.post("/finder/{sid}/run", operation_id="run_character_search",
+             summary="Compute missing CCIP features and score the pool (background job, poll GET /api/jobs/{id})")
+def finder_run(sid: str, body: FinderRun | None = None) -> dict[str, Any]:
+    return finder.start(sid, free_vram=bool(body and body.free_vram), tags=bool(body and body.tags))
+
+
+@router.post("/finder/{sid}/hash", operation_id="fingerprint_character_search_images",
+             summary="Read images that have no duplicate fingerprint yet (background job; returns job = null when "
+                     "every image already has one)")
+def finder_hash(sid: str, body: FinderHash | None = None) -> dict[str, Any]:
+    return {"job": finder.start_hash(sid, body.role if body else "pool")}
+
+
+@router.get("/finder/{sid}/duplicates", operation_id="find_character_search_duplicates",
+            summary="Groups of nearly identical images; the first id of each group is the suggested one to keep",
+            description="threshold: average difference of 32×32 thumbnails (0–255). ≤ 2 = practically identical "
+                        "(size, compression, subtitles); 3–6 = the same shot, mouth or blinking differs; 7–11 = "
+                        "expressions and gestures differ too; higher also groups camera moves. scope = matches only "
+                        "looks at the current results (exclude the others with POST /finder/{sid}/manual); all = the "
+                        "whole set (remove the others with POST /finder/{sid}/images/delete). missing > 0 means some "
+                        "images need POST /hash first.")
+def finder_duplicates(sid: str, role: FinderRole = Query("pool"),
+                      threshold: float = Query(finder.DUP_DEFAULT, gt=0, le=finder.DUP_MAX),
+                      scope: Literal["all", "matches"] = Query("all")) -> dict[str, Any]:
+    return finder.duplicates(sid, role, threshold, scope)
+
+
+@router.post("/finder/{sid}/download", operation_id="download_character_search_results",
+             summary="Zip the selected images (default: the current matches) → download_url")
+def finder_download(sid: str, body: FinderSelection | None = None) -> dict[str, Any]:
+    path, count = finder.download(sid, body.ids if body else None)
+    return {"download_url": services.absolute_url(f"/api/exports/{path.name}"), "file": path.name, "count": count}
+
+
+@router.post("/finder/{sid}/to-project", operation_id="import_character_search_results_to_project",
+             summary="Import the selected images (default: the current matches) into a new or existing project")
+def finder_to_project(sid: str, body: FinderToProject) -> dict[str, Any]:
+    finder.require_session(sid)
+    if body.project_id:
+        pid = body.project_id
+    elif body.new_project:
+        np_ = body.new_project
+        pid = services.create_project(np_.name, np_.profile, np_.lora_type, np_.trigger, np_.class_word,
+                                      **(np_.settings or {}))["id"]
+    else:
+        raise HTTPException(400, t("msg.finder_need_project"))
+    result = finder.to_project(sid, body.ids, pid)
+    return {"project": services.project_out(services.require_project(pid)), **result}
+
+
+@router.get("/finder/images/{fid}/thumb", operation_id="get_character_search_thumb", include_in_schema=False)
+def finder_thumb(fid: str) -> FileResponse:
+    img = finder.get_image(fid)
+    try:
+        path = finder.ensure_thumb(img)
+    except Exception as e:  # noqa: BLE001  壞檔或檔案已被移走
+        raise HTTPException(404, t("msg.cannot_read_image", error=e)) from e
+    return FileResponse(path, headers={"Cache-Control": "private, max-age=86400"})
+
+
+@router.get("/finder/images/{fid}/file", operation_id="get_character_search_file", include_in_schema=False)
+def finder_file(fid: str) -> FileResponse:
+    img = finder.get_image(fid)
+    if finder.is_remote(img):  # SMB：讀出來直接回傳
+        media = mimetypes.guess_type(img["original_name"])[0] or "application/octet-stream"
+        return Response(finder.read_bytes(img["path"]), media_type=media)
+    if not os.path.isfile(img["path"]):
+        raise HTTPException(404, t("msg.image_not_found", iid=fid))
+    return FileResponse(img["path"])
+
+
+# ------------------------------------------------------------------ SMB 來源
+@router.get("/smb", operation_id="list_smb_connections", summary="Saved SMB (NAS / Windows share) connections; "
+                                                                  "passwords are never returned")
+def smb_list() -> list[dict[str, Any]]:
+    return smb.list_connections()
+
+
+@router.post("/smb", operation_id="create_smb_connection", status_code=201,
+             summary="Save an SMB connection (tested before saving)")
+def smb_create(body: SmbConnectionIn) -> dict[str, Any]:
+    return smb.create(**body.model_dump())
+
+
+@router.patch("/smb/{cid}", operation_id="update_smb_connection")
+def smb_update(cid: str, body: SmbConnectionPatch) -> dict[str, Any]:
+    return smb.update(cid, **body.model_dump(exclude_none=True))
+
+
+@router.delete("/smb/{cid}", operation_id="delete_smb_connection",
+               summary="Delete a connection; character-search images added from it can no longer be read")
+def smb_delete(cid: str) -> dict[str, Any]:
+    smb.delete(cid)
+    return {"deleted": cid}
+
+
+@router.post("/smb/test", operation_id="test_smb_connection", summary="Check host, credentials and share")
+def smb_test(body: SmbTest) -> dict[str, Any]:
+    # 只用實際傳入的欄位覆蓋已存的設定（沒傳的連接埠不能被預設值 445 蓋掉）
+    return smb.test_settings(body.model_dump(exclude={"id"}, exclude_unset=bool(body.id)), body.id)
+
+
+@router.get("/smb/{cid}/browse", operation_id="browse_smb_folder",
+            summary="Sub folders and images (name, size, mtime) in one folder of the share")
+def smb_browse(cid: str, path: str = Query("", description="Folder inside the share")) -> dict[str, Any]:
+    return smb.browse(cid, path)
+
+
+@router.get("/smb/{cid}/thumb", operation_id="get_smb_thumbnail", include_in_schema=False)
+def smb_thumb(cid: str, path: str = Query(...), v: str = Query("", description="size-mtime from browse")) -> FileResponse:
+    # 網址裡有 v（大小-修改時間），檔案變了網址就變，瀏覽器可以放心快取
+    return FileResponse(smb.thumb(cid, path, v), media_type="image/webp",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
+@router.get("/smb/{cid}/file", operation_id="get_smb_file", include_in_schema=False)
+def smb_file(cid: str, path: str = Query(...)) -> Response:
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    media = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    if not media.startswith("image/"):
+        raise HTTPException(400, t("msg.smb_not_image", name=name))
+    return Response(smb.read_bytes(cid, path), media_type=media)
+
+
+@router.post("/smb/import", operation_id="import_from_smb",
+             summary="Import folders and images from SMB (background job, poll GET /api/jobs/{id})",
+             description="items are the selected folders and images, possibly from several connections. "
+                         "target=project downloads the images (and same-name .txt captions) into the project. "
+                         "target=finder only stores the SMB paths in a character search; files are read when needed.")
+def smb_import(body: SmbImport) -> dict[str, Any]:
+    return smb.start_import([i.model_dump() for i in body.items], body.recursive, body.target, body.project_id,
+                            body.session_id, body.role)
+
+
 @router.get("/jobs/{jid}", operation_id="get_job")
 def get_job(jid: str) -> dict[str, Any]:
     job = jobs.get(jid)
@@ -565,6 +897,29 @@ def civitai_submit(prep_id: str) -> dict[str, Any]:
 def civitai_runs(pid: str) -> list[dict[str, Any]]:
     services.require_project(pid)
     return civitai.list_runs(pid)
+
+
+class A1111Import(BaseModel):
+    epoch: int = Field(..., ge=1, description="Epoch to import (see summary.epochs of the run)")
+    overwrite: bool = Field(False, description="Replace a different file with the same name in Forge")
+
+
+@router.get("/a1111", operation_id="get_a1111_status",
+            summary="Whether A1111 / Forge is configured (A1111_URL) and has the LoRA import API")
+def a1111_status() -> dict[str, Any]:
+    return a1111.status(max_age=0)
+
+
+@router.post("/civitai/runs/{wid}/a1111", operation_id="import_lora_to_a1111",
+             summary="Import one epoch of a finished Civitai training into A1111 / Forge's Lora folder",
+             description="Forge downloads the .safetensors itself (needs Forge Neo Chino's POST /sdapi/v1/lora/import) "
+                         "and gets the trigger word as activation text, the base model type and a sample image as "
+                         "preview. HTTP 409 = a different file with the same name exists; retry with overwrite=true.")
+def a1111_import(wid: str, body: A1111Import) -> dict[str, Any]:
+    try:
+        return a1111.import_epoch(wid, body.epoch, body.overwrite)
+    except a1111.A1111Conflict as e:
+        raise HTTPException(409, str(e)) from e
 
 
 @router.get("/civitai/active", operation_id="list_active_civitai_trainings",

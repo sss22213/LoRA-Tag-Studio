@@ -94,6 +94,19 @@ def submit(project_id: str, image_ids: list[str], kind: str = "tag", params: dic
     return job
 
 
+def submit_task(owner_id: str, kind: str, image_ids: list[str] | None = None,
+                params: dict[str, Any] | None = None) -> Job:
+    """不屬於專案圖片的工作（例如角色篩選）；owner_id 放在 project_id，用來查詢進行中的工作。"""
+    job = Job(id=uuid.uuid4().hex[:12], project_id=owner_id, image_ids=list(image_ids or []), kind=kind,
+              params=params or {}, lang=get_lang())
+    _queue.put(job)
+    with _lock:
+        _jobs[job.id] = job
+        _prune_old()
+    start_worker()
+    return job
+
+
 def get(job_id: str) -> Job | None:
     return _jobs.get(job_id)
 
@@ -161,7 +174,34 @@ def _process_one(job: Job, project_settings: dict[str, Any], iid: str) -> None:
                                "error": error or t("msg.unknown_error", lang=job.lang)})
 
 
+def _run_task(job: Job) -> None:
+    """不屬於專案標註的工作：角色篩選、SMB 匯入。執行函式回傳完成訊息（語系鍵, 參數）。"""
+    from . import finder, smb
+
+    runner = {"finder": finder.run_job, "smb_import": smb.run_import}[job.kind]
+    job.status, job.started_at = "running", time.time()
+    try:
+        with use_lang(job.lang):
+            done = runner(job)
+        if job.cancel_event.is_set() or done is None:
+            job.status = "cancelled"
+            job.say("msg.job_cancelled")
+        else:
+            job.status = "done"
+            job.say(done[0], **done[1])
+    except Exception as e:  # noqa: BLE001
+        log.exception("工作失敗：%s", job.kind)
+        job.status, job.message_key, job.message_raw = "error", "", str(e)
+    finally:
+        if job.kind == "finder":
+            finder.unload_all()  # 偶爾才用，用完就釋放 VRAM
+        job.finished_at = time.time()
+
+
 def _run(job: Job) -> None:
+    if job.kind in ("finder", "smb_import"):
+        _run_task(job)
+        return
     project = db.get_project(job.project_id)
     if project is None:
         job.status = "error"

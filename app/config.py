@@ -62,10 +62,18 @@ class Settings:
         self.civitai_api_key = _env("CIVITAI_API_KEY")
         self.civitai_orchestration_url = _env("CIVITAI_ORCHESTRATION_URL", "https://orchestration.civitai.com").rstrip("/")
         self.civitai_site_url = _env("CIVITAI_SITE_URL", "https://civitai.com").rstrip("/")
+        # A1111 / Forge（Forge Neo Chino 的 LoRA 匯入 API）：訓練好的 LoRA 一鍵匯入；沒設定就不顯示
+        self.a1111_url = _env("A1111_URL").rstrip("/")
+        self.a1111_lora_subfolder = _env("A1111_LORA_SUBFOLDER", "LoRA-Tag-Studio")
+        self.a1111_api_auth = _env("A1111_API_AUTH")  # 帳號:密碼（Forge 有開 --api-auth 時）
 
     @property
     def projects_dir(self) -> Path:
         return self.data_dir / "projects"
+
+    @property
+    def finder_dir(self) -> Path:
+        return self.data_dir / "finder"
 
     @property
     def exports_dir(self) -> Path:

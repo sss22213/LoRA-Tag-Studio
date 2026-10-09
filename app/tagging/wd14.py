@@ -8,7 +8,7 @@ import threading
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from ..config import settings
 
@@ -107,8 +107,25 @@ class WD14Tagger:
         arr = np.asarray(padded, dtype=np.float32)[:, :, ::-1]  # RGB → BGR
         return np.ascontiguousarray(arr[np.newaxis, ...])
 
+    def prepare_fast(self, image: Image.Image) -> np.ndarray:
+        """角色篩選用：已經是 RGB（透明已補白）的圖先縮小再補邊，比 _prepare 快好幾倍，結果幾乎一樣。
+        可以在多個執行緒裡同時呼叫。"""
+        if image.mode != "RGB":
+            return self._prepare(image)
+        padded = ImageOps.pad(image, (self.size, self.size), Image.BICUBIC, color=(255, 255, 255))
+        arr = np.asarray(padded, dtype=np.float32)[:, :, ::-1]  # RGB → BGR
+        return np.ascontiguousarray(arr[np.newaxis, ...])
+
+    def predict_arrays(self, arrays: list[np.ndarray]) -> list[dict[str, Any]]:
+        """一次推論多張已經前處理好的圖（模型的 batch 維度是動態的）。"""
+        if not arrays:
+            return []
+        return [self._result(p) for p in self.session.run([self.output_name], {self.input_name: np.concatenate(arrays)})[0]]
+
     def predict(self, image: Image.Image) -> dict[str, Any]:
-        probs = self.session.run([self.output_name], {self.input_name: self._prepare(image)})[0][0]
+        return self._result(self.session.run([self.output_name], {self.input_name: self._prepare(image)})[0][0])
+
+    def _result(self, probs: np.ndarray) -> dict[str, Any]:
         rating = {self.names[i]: round(float(probs[i]), 4) for i in self.rating_idx}
         general = [[self.names[i], round(float(probs[i]), 4)] for i in self.general_idx if probs[i] >= RAW_FLOOR]
         character = [[self.names[i], round(float(probs[i]), 4)] for i in self.character_idx if probs[i] >= RAW_FLOOR]
@@ -137,6 +154,18 @@ def unload_all() -> list[str]:
     if names:
         log.info("已釋放 WD14 模型：%s", ", ".join(names))
     return names
+
+
+def unload(repo_id: str) -> bool:
+    """只釋放一個模型（角色篩選用完自己載入的模型時呼叫，不動標註正在用的其他模型）。"""
+    with _lock:
+        tagger = _taggers.pop(repo_id, None)
+    if tagger is None:
+        return False
+    del tagger
+    gc.collect()
+    log.info("已釋放 WD14 模型：%s", repo_id)
+    return True
 
 
 def loaded_models() -> list[dict[str, Any]]:
