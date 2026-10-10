@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS finder_sessions (
     model TEXT NOT NULL,
     threshold REAL,
     tag_filter TEXT,
+    people_mode TEXT,
+    people_min_side INTEGER,
+    people_recover REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -98,6 +101,8 @@ CREATE TABLE IF NOT EXISTS finder_images (
     phash TEXT,
     sig BLOB,
     tags TEXT,
+    people TEXT,
+    people_tags TEXT,
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_finder_images ON finder_images(session_id, role, created_at);
@@ -121,10 +126,15 @@ _IMAGE_FIELDS = {"tags", "nl_caption", "rating", "raw", "status", "error", "widt
 _JSON_FIELDS = ("raw", "blocks", "upscale")
 # 新增欄位（舊資料庫自動補上）
 # blocks：白色色塊偵測結果，NULL = 尚未偵測；upscale：waifu2x 放大紀錄（含原圖資訊），NULL = 沒放大過
-# 角色篩選：manual = 手動判定；phash / sig = 找重複圖片用的指紋；tags = WD14 標籤；tag_filter = 結果的 tag 篩選
+# 角色篩選：manual = 手動判定；phash / sig = 找重複圖片用的指紋；tags = WD14 標籤；tag_filter = 結果的 tag 篩選；
+# people = 多人圖偵測結果（每個人和每個頭的框、每個人和參考圖的差異）；people_tags = 處理後的圖的 tag（依模式）；
+# people_mode = 多人圖的處理方式（crop / mask，NULL = 不處理）；people_min_side = 裁切後短邊的下限（NULL = 預設）；
+# people_recover = 找回的搜尋範圍（門檻再加多少，NULL = 不找）
 _ADDED_COLUMNS = {"images": [("blocks", "TEXT"), ("upscale", "TEXT")],
-                  "finder_sessions": [("tag_filter", "TEXT")],
-                  "finder_images": [("manual", "INTEGER"), ("phash", "TEXT"), ("sig", "BLOB"), ("tags", "TEXT")]}
+                  "finder_sessions": [("tag_filter", "TEXT"), ("people_mode", "TEXT"),
+                                      ("people_min_side", "INTEGER"), ("people_recover", "REAL")],
+                  "finder_images": [("manual", "INTEGER"), ("phash", "TEXT"), ("sig", "BLOB"), ("tags", "TEXT"),
+                                    ("people", "TEXT"), ("people_tags", "TEXT")]}
 
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -374,7 +384,7 @@ def civitai_run_update(workflow_id: str, status: str, summary: dict[str, Any]) -
 # path：圖片檔的絕對路徑（上傳 / 從專案加入的放在 data/finder/<id>/，伺服器匯入資料夾的只記原位置）
 # manual：手動判定，1 = 是目標、-1 = 不是目標（模型挑錯）、NULL = 依分數；換門檻或重新辨識都保留
 _FINDER_FIELDS = {"width", "height", "feature", "feature_model", "score", "neg_score", "error", "sha1", "manual",
-                  "phash", "sig", "tags"}
+                  "phash", "sig", "tags", "people", "people_tags"}
 
 
 _IN_CHUNK = 900  # 一個 IN (...) 最多放幾個參數（舊版 SQLite 上限 999）
@@ -404,7 +414,8 @@ def finder_sessions() -> list[dict[str, Any]]:
 
 
 def finder_session_update(sid: str, **fields: Any) -> None:
-    keys = [k for k in fields if k in ("name", "model", "threshold", "tag_filter")]
+    keys = [k for k in fields if k in ("name", "model", "threshold", "tag_filter", "people_mode",
+                                         "people_min_side", "people_recover")]
     if keys:
         _x(f"UPDATE finder_sessions SET {', '.join(f'{k}=?' for k in keys)}, updated_at=? WHERE id=?",
            [fields[k] for k in keys] + [time.time(), sid])
@@ -429,7 +440,8 @@ def finder_image_add(session_id: str, role: str, original_name: str, path: str, 
 def finder_images(session_id: str, role: str | None = None, ids: Iterable[str] | None = None,
                   with_feature: bool = False) -> list[dict[str, Any]]:
     cols = "*" if with_feature else ("id, session_id, role, original_name, rel_path, path, sha1, width, height, "
-                                     "feature_model, score, neg_score, manual, error, phash, tags, created_at")
+                                     "feature_model, score, neg_score, manual, error, phash, tags, people, "
+                                     "people_tags, created_at")
     sql, params = f"SELECT {cols} FROM finder_images WHERE session_id=?", [session_id]
     if role:
         sql += " AND role=?"
@@ -490,8 +502,9 @@ def finder_set_manual(session_id: str, ids: Iterable[str], value: int | None) ->
 
 
 def finder_clear_scores(session_id: str) -> None:
-    """參考圖或排除參考圖變了：之前算的分數都不能用了（特徵還能用）。"""
-    _x("UPDATE finder_images SET score=NULL, neg_score=NULL WHERE session_id=?", (session_id,))
+    """參考圖或排除參考圖變了：之前算的分數和多人圖裡每個人的差異都不能用了（特徵還能用）。"""
+    _x("UPDATE finder_images SET score=NULL, neg_score=NULL, people=NULL, people_tags=NULL WHERE session_id=?",
+       (session_id,))
 
 
 def finder_images_delete(session_id: str, ids: Iterable[str] | None = None, role: str | None = None) -> list[dict[str, Any]]:

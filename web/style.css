@@ -444,6 +444,7 @@ a.cv-active-item:hover { border-color: var(--accent); }
 .fd-tagsug { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; font-size: 12.5px; }
 .fd-sug { display: inline-flex; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; background: var(--panel-2); }
 .fd-sug.char { border-color: var(--accent); }
+.fd-sug.ptag { border-color: var(--warn); border-style: dashed; }
 .fd-sug button { border: 0; background: none; color: var(--text); cursor: pointer; padding: 2px 8px; font: inherit; }
 .fd-sug button + button { border-left: 1px solid var(--border); padding: 2px 7px; color: var(--muted); }
 .fd-sug button:hover { background: var(--panel-3); }
@@ -454,6 +455,17 @@ a.cv-active-item:hover { border-color: var(--accent); }
 .fd-ptag { padding: 1px 7px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
 .fd-ptag.inc { color: var(--ok); border-color: rgba(62, 207, 142, .45); }
 .fd-ptag.exc { color: var(--err); border-color: rgba(243, 85, 90, .45); }
+/* 多人圖 */
+.fd-people { display: flex; flex-direction: column; gap: 10px; }
+.fd-people p { margin: 0; }
+.fd-people .seg { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.fd-pm-opts { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+.fd-pm-opts .help { margin-top: 4px; }
+.fd-pm-opts .fd-thr { flex-wrap: wrap; margin-top: 6px; }
+.fd-pm-opts[hidden], .fd-pm-opts [hidden] { display: none; }
+.fd-pm-stats { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); }
+.fd-pm-stats b { font-variant-numeric: tabular-nums; }
+.fd-pm-stats .badge { margin-left: 4px; }
 /* 移除重複 */
 .fd-dups { display: flex; flex-direction: column; gap: 10px; min-height: 100%; }
 .fd-dups .help { margin: 0; }

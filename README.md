@@ -182,6 +182,16 @@ Images on a NAS or a Windows shared folder can be added without going through th
    - The filter is saved, and downloads and project imports use the filtered result. If tags were not generated, a "Generate tags" button above the results adds them without recomputing features.
 8. **Download** the selected images as a zip, or **import them into a new or existing project** (images only, duplicates skipped).
 
+- **Group shots** (the "Group shots" button in the results bar): keeps only the target character in target images that show several people. In anime screenshot sets, a third to a half of the CCIP matches are group shots, and the tag filter usually drops them.
+  - **How**: an anime person detector and a head detector find every person and head; each person is compared with the references (CCIP), and the most similar one within the threshold is the target.
+  - **Crop the target** (recommended): the target becomes a solo image. The crop avoids other people's bodies and never contains another person's head.
+  - **Cover the others with white**: the whole frame stays and the others are covered with white blocks; projects detect the blocks and add the white block keyword (see [White masking blocks](#white-masking-blocks)).
+  - **Skipped and left as they are**: heads that overlap, crops whose short side is below the minimum (default 384 px, adjustable; use 512 or more for SDXL-type training), nobody similar enough, or two equally similar people. The "Group shots" tab shows each result or the reason, and the preview switches between the processed image and the original.
+  - Skipped images get the tag `people_overlap`, `people_small`, `people_no_target` or `people_ambiguous` for the tag filter. They are listed first in the tag suggestions (as "Group: overlap" and so on), so one click excludes them or shows only them.
+  - **Recover missed targets** (option): with several people or a small character, the whole image is often not similar enough to pass the threshold. Non-matching images up to the threshold + a search range (default +0.10) are also checked person by person, and one person within the threshold makes the image a target ("Recovered", tag `people_recovered`). A wider range recovers more but checks more images.
+  - Processed images are tagged again with WD14 and the tag filter uses those tags (a crop no longer has `multiple girls`; one that still shows part of someone else usually does, so it stays filtered). Downloads and project imports get the processed image as PNG; originals are not changed.
+  - While a mode is on, new target images are processed during the search. On the author's 2,083 target images of one character: 796 cropped, 162 skipped, 1,125 already solo; matches with the tag filter went from 973 to 1,544. About 80 s for 2,000 images from a NAS on an RTX 5090. Recovery with +0.10 checked 1,171 more images in about 2 minutes and found 655 more images of the character; in spot checks almost all were correct.
+  - **Models**: [deepghs/anime_person_detection](https://huggingface.co/deepghs/anime_person_detection) (`person_detect_v1.1_m`, 103 MB) and [deepghs/anime_head_detection](https://huggingface.co/deepghs/anime_head_detection) (`head_detect_v2.0_s`, 44 MB), MIT license, downloaded on first use and freed with CCIP.
 - **Remove duplicates**: lists groups of nearly identical images and acts only after you confirm. Two places:
   - **In the results** (the button in the results bar, or the ⋯ menu at the top right): only the current matches are compared, and duplicates are excluded (restore them with ↺ in the "Others" tab).
   - **In all images to search** (the button in the "Images to search" header): duplicates are removed from the search. 50,000 images take a few seconds the first time; changing the tolerance afterwards is almost instant.
@@ -196,7 +206,7 @@ Images on a NAS or a Windows shared folder can be added without going through th
 - **Speed and VRAM**: about 35 ms per image on an RTX 5090 (mostly image decoding), about 130 ms on CPU. The model is freed when the job ends; generating tags loads WD14 for the run and frees it again if it was not loaded before. The search shares the job queue with tagging and upscaling, so they never run at the same time. Next to "Run" there is the same VRAM menu as in the top bar, and "Free other models' VRAM first" unloads WD14 and waifu2x and puts JoyCaption to sleep before the search starts.
 - **Model**: [deepghs/ccip_onnx](https://huggingface.co/deepghs/ccip_onnx) (OpenRAIL license), downloaded from Hugging Face on first use.
 - Files: uploads live in `data/finder/<id>/`. Deleting a search deletes them; files in the server import folder are never touched.
-- API: `POST /api/finder`, `POST /api/finder/{id}/upload?role=ref|neg|pool`, `/import-server`, `/import-project`, `/run` (`tags: true` also tags the pool), `/manual`, `PATCH /api/finder/{id}` (`tag_filter`), `GET /duplicates?threshold=1–16&scope=all|matches`, `/hash`, `/download`, `/to-project` (see `/docs`).
+- API: `POST /api/finder`, `POST /api/finder/{id}/upload?role=ref|neg|pool`, `/import-server`, `/import-project`, `/run` (`tags: true` also tags the pool), `/manual`, `PATCH /api/finder/{id}` (`tag_filter`), `GET /duplicates?threshold=1–16&scope=all|matches`, `/hash`, `PATCH` with `people_mode` (`off` / `crop` / `mask`), `people_min_side` and `people_recover`, and `POST /people` (group shots), `/download`, `/to-project` (see `/docs`).
 
 ## Danbooru tags from a VLM (JoyCaption)
 
@@ -401,6 +411,7 @@ app/
   a1111.py           Import trained LoRAs into A1111 / Forge
   upscale.py         waifu2x upscaling: model download, tiled inference, backup / restore
   finder.py          Character finder: CCIP features, scoring, tag filter, duplicates, image sources, download / import
+  people.py          Group shots: person / head detection, picking the target, crop or white blocks
   smb.py             SMB sources: saved connections, browsing and thumbnails, importing ticked folders / images
   storage.py         Uploads, folder / zip import, thumbnails
   db.py              SQLite

@@ -186,6 +186,16 @@ NAS 或 Windows 分享資料夾裡的圖片，可以由伺服器直接讀取，�
    - 篩選條件會存起來，下載和匯入專案都照篩選後的結果。辨識時沒勾的話，結果上方也有「產生 tag」按鈕，只補 tag、不重算特徵。
 8. **下載**選取的圖片（zip），或**匯入新的 / 既有的專案**。只匯入圖片，重複的會略過。
 
+- **多人圖**（結果列的「多人圖」按鈕）：在有好幾個人的目標圖片裡，只留下目標角色。動畫截圖裡 CCIP 挑出的圖有三分之一到一半是多人圖，用 tag 篩選通常會被排除。
+  - **做法**：用動漫人物偵測和頭部偵測找出每個人和每個頭，每個人和參考圖比對（CCIP），門檻內最像的是目標。
+  - **裁出目標**（建議）：把目標裁成單人圖。會避開別人的身體，而且一定不含別人的頭。
+  - **白色方塊蓋住別人**：保留整張畫面，其他人用白色方塊蓋住；匯入專案後會偵測到白色色塊並加上關鍵字（見[白色色塊](#白色色塊遮擋其他人的白色矩形)）。
+  - **跳過、保持原樣**：頭重疊、裁下來的短邊小於最小短邊（預設 384 px，可以調整；用 SDXL 類模型訓練建議 512 以上）、沒有人夠像參考圖，或兩個人一樣像。「多人圖」分頁會列出每張的結果或跳過的原因，放大檢視可以切換處理後 / 原圖。
+  - 跳過的圖會加上 `people_overlap`、`people_small`、`people_no_target` 或 `people_ambiguous` 這些 tag 給 tag 篩選用。它們排在常見 tag 的最前面（顯示成「多人圖：重疊」等），點一下就能排除或只看這些圖。
+  - **撈回漏掉的目標**（選項）：多人同框、人物很小時，整張圖常常不夠像參考圖、沒過門檻。整張差異在門檻 + 搜尋範圍（預設 +0.10）以內、沒符合的圖片也逐人比對，有一個人在門檻內就算目標（標成「找回」，tag `people_recovered`）。範圍越大找回越多，但要比對的圖片也越多。
+  - 處理後的圖會用 WD14 重新產生 tag，tag 篩選改看處理後的圖（裁切後就沒有 `multiple girls`；還留著別人一部分的通常仍會被標，照樣篩掉）。下載和匯入專案時輸出處理後的圖（PNG），原圖不會改。
+  - 開啟後，辨識時會順便處理新的目標圖片。作者用同一個角色的 2083 張目標圖片測試：796 張裁出、162 張跳過、1125 張本來就是單人；加上 tag 篩選後的符合從 973 張變成 1544 張。在 RTX 5090 上從 NAS 讀 2000 張約 80 秒。用 +0.10 找回時，多比對 1171 張約 2 分鐘，多找到 655 張這個角色的圖，抽查幾乎都正確。
+  - **模型**：[deepghs/anime_person_detection](https://huggingface.co/deepghs/anime_person_detection)（`person_detect_v1.1_m`，103 MB）與 [deepghs/anime_head_detection](https://huggingface.co/deepghs/anime_head_detection)（`head_detect_v2.0_s`，44 MB），MIT 授權，第一次使用時下載，和 CCIP 一起釋放。
 - **移除重複**：列出幾乎相同的圖片分組，確認後才處理。有兩個地方：
   - **在篩選結果裡**（結果列的按鈕，或右上角 ⋯ 選單）：只比對目前符合的圖片，重複的改成手動排除（在「不符合」分頁按 ↺ 可以復原）。
   - **在所有要篩選的圖片裡**（「要篩選的圖片」標題列右邊的按鈕）：重複的從這個篩選移除。5 萬張第一次約幾秒，之後調整差異容許幾乎立即更新。
@@ -204,7 +214,7 @@ NAS 或 Windows 分享資料夾裡的圖片，可以由伺服器直接讀取，�
 - **速度與 VRAM**：RTX 5090 每張約 35 ms（大多花在讀圖），CPU 約 130 ms。工作結束時自動釋放模型；產生 tag 時會暫時載入 WD14，原本沒載入的話結束時一起釋放。和標註、放大共用同一個工作佇列，不會同時跑。「開始辨識」旁邊有和右上角相同的 VRAM 選單；勾選「辨識前先釋放其他模型的 VRAM」，開始前會釋放 WD14、waifu2x，並讓 JoyCaption 休眠。
 - **模型**：[deepghs/ccip_onnx](https://huggingface.co/deepghs/ccip_onnx)（OpenRAIL 授權），第一次使用時從 Hugging Face 下載。
 - **檔案**：上傳的圖片存在 `data/finder/<id>/`，刪除篩選時一起刪除；伺服器匯入資料夾裡的原檔不會動。
-- **API**：`POST /api/finder`、`POST /api/finder/{id}/upload?role=ref|neg|pool`、`/import-server`、`/import-project`、`/run`（`tags: true` 同時產生 tag）、`/manual`、`PATCH /api/finder/{id}`（`tag_filter`）、`GET /duplicates?threshold=1–16&scope=all|matches`、`/hash`、`/download`、`/to-project`，詳見 `/docs`。
+- **API**：`POST /api/finder`、`POST /api/finder/{id}/upload?role=ref|neg|pool`、`/import-server`、`/import-project`、`/run`（`tags: true` 同時產生 tag）、`/manual`、`PATCH /api/finder/{id}`（`tag_filter`）、`GET /duplicates?threshold=1–16&scope=all|matches`、`/hash`、`PATCH` 的 `people_mode`（`off` / `crop` / `mask`）、`people_min_side`、`people_recover` 與 `POST /people`（多人圖）、`/download`、`/to-project`，詳見 `/docs`。
 
 ## 用 VLM 產生 Danbooru 標籤（JoyCaption）
 
@@ -407,6 +417,7 @@ app/
   a1111.py           訓練好的 LoRA 匯入 A1111 / Forge
   upscale.py         waifu2x 放大：模型下載、切塊推論、原圖備份 / 還原
   finder.py          角色篩選：CCIP 特徵、比對分數、tag 篩選、找重複、圖片來源、下載 / 匯入專案
+  people.py          多人圖：人物 / 頭部偵測、判斷目標、裁切或白色方塊
   smb.py             SMB 來源：連線設定、瀏覽與縮圖、匯入勾選的資料夾 / 圖片
   storage.py         上傳、資料夾 / zip 匯入、縮圖
   db.py              SQLite

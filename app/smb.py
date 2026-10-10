@@ -13,6 +13,7 @@ import io
 import logging
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
@@ -246,13 +247,19 @@ def read_bytes(cid: str, rel: str) -> bytes:
     import smbclient
 
     c = require(cid)
-    try:
-        with smbclient.open_file(_unc(c, rel), mode="rb", **_kw(c)) as f:
-            return f.read()
-    except BadRequest:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise _error(e) from e
+    for attempt in range(6):
+        try:
+            with smbclient.open_file(_unc(c, rel), mode="rb", **_kw(c)) as f:
+                return f.read()
+        except BadRequest:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # 很多執行緒同時讀同一台時，伺服器給的 credits 暫時用完：等一下再試（不是讀不到）
+            if "credits" in str(e) and attempt < 5:
+                time.sleep(0.2 * 2 ** attempt)
+                continue
+            raise _error(e) from e
+    raise AssertionError("unreachable")
 
 
 def thumb(cid: str, rel: str, version: str = "") -> Path:

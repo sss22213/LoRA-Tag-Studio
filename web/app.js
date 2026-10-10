@@ -2282,20 +2282,62 @@ const fdThreshold = () => (fd.s.threshold ?? fd.s.default_threshold);
 const fdCcipMatch = (i) => i.scored && i.score <= fdThreshold() && (i.neg_score == null || i.score < i.neg_score);
 // tag 篩選只用在 CCIP 挑出的結果上；有設定篩選時，還沒產生 tag 的圖片無法確認，先不算符合
 const fdTagNorm = (s) => s.trim().toLowerCase().split(/\s+/).join('_');
-const fdTagShow = (s) => (s.length > 3 ? s.replace(/_/g, ' ') : s); // ^_^ 這類表情 tag 保留底線
+// 多人圖加的 tag（people_overlap 這類）顯示成說明文字
+const fdPeopleTagKey = (x) => (x.startsWith('people_') ? Object.keys(fd.s?.people_tags || {}).find((k) => fd.s.people_tags[k] === x) : null);
+const fdTagShow = (s) => { const k = fdPeopleTagKey(s); return k ? t(`finder.ptag_${k}`) : s.length > 3 ? s.replace(/_/g, ' ') : s; }; // ^_^ 這類表情 tag 保留底線
 const fdTagActive = () => fd.s.tag_filter.include.length + fd.s.tag_filter.exclude.length > 0;
+// 多人圖：逐人比對（和 people.judge 相同）：found（最像的人在門檻內）/ no_target / ambiguous
+const fdJudge = (p) => {
+  const d = [...(p.d || [])].sort((a, b) => a[0] - b[0]), thr = fdThreshold();
+  if (!d.length || d[0][0] > thr || (d[0][1] != null && d[0][1] <= d[0][0])) return 'no_target';
+  if (d.length > 1 && d[1][0] <= thr && d[1][0] - d[0][0] < fd.s.people_ambiguous) return 'ambiguous';
+  return 'found';
+};
+// 多人圖：目前的模式、門檻和最小短邊下的狀態（和 people.state 相同）。null = 沒開或還沒偵測；ok = 會被處理（裁切 / 白色方塊）
+const fdPeopleState = (i) => {
+  const mode = fd.s.people_mode, p = i.people;
+  if (!mode || !p) return null;
+  if (p.n < 2) return 'single';
+  const found = fdJudge(p);
+  if (found !== 'found') return found;
+  return mode === 'crop' && p.crop === 'ok' && p.side < fd.s.people_min_side ? 'small' : p[mode];
+};
+const fdProcessed = (i) => fdPeopleState(i) === 'ok';
+const FD_SKIPPED = ['overlap', 'small', 'no_target', 'ambiguous'];
+// 找回：整張圖沒符合，但差異在門檻 + 搜尋範圍內，逐人比對時有一個人在門檻內（和 finder._recovered 相同）
+const fdInRecoverRange = (i) => !!fd.s.people_mode && fd.s.people_recover != null && i.role === 'pool' && i.manual !== -1
+  && i.scored && i.score <= fdThreshold() + fd.s.people_recover && !fdCcipMatch(i);
+const fdRecovered = (i) => fdInRecoverRange(i) && !!i.people && fdJudge(i.people) === 'found';
+const fdBestPerson = (i) => Math.min(...i.people.d.map((x) => x[0])); // 畫面裡最像的人的差異
+// 多人圖還沒處理：目標圖片還沒偵測，或會被處理但還沒有這個模式處理後的 tag；找回的範圍內還沒逐人比對
+// （辨識或「多人圖」裡的「開始處理」會補上）
+const fdPeoplePending = (i) => !!fd.s.people_mode && i.role === 'pool' && !i.error && (fdIsTarget(i)
+  ? !i.people || (fdProcessed(i) && !i.people_tags?.[fd.s.people_mode])
+  : !i.people && fdInRecoverRange(i));
+// tag 篩選用的 tag：處理過的多人圖用處理後的圖的 tag（裁切後就沒有 multiple girls）；
+// 跳過的多人圖加上跳過原因的 tag，找回的加上 people_recovered（和 finder._filter_tags 相同）
+const fdTagList = (i) => {
+  const st = fdPeopleState(i);
+  const tags = st === 'ok' ? i.people_tags?.[fd.s.people_mode]?.tags ?? null : i.tags;
+  if (!tags) return null;
+  const extra = [...(FD_SKIPPED.includes(st) ? [fd.s.people_tags[st]] : []), ...(fdRecovered(i) ? [fd.s.people_tags.recovered] : [])];
+  return extra.length ? [...tags, ...extra] : tags;
+};
+const fdTagChar = (i) => (fdProcessed(i) ? i.people_tags?.[fd.s.people_mode]?.char ?? 0 : i.tags_char || 0);
+const fdThumb = (i) => (fdProcessed(i) ? `${i.thumb_url}?people=${fd.s.people_mode}` : i.thumb_url);
 const fdTagBlock = (i) => { // 被 tag 篩掉的原因（缺少的 / 不能有的 tag / 還沒有 tag），沒被篩掉回傳 null
   if (!fdTagActive()) return null;
-  if (!i.tags) return { kind: 'untagged' };
-  const miss = fd.s.tag_filter.include.find((x) => !i.tags.includes(x));
+  const tags = fdTagList(i);
+  if (!tags) return { kind: 'untagged' };
+  const miss = fd.s.tag_filter.include.find((x) => !tags.includes(x));
   if (miss) return { tag: miss, kind: 'missing' };
-  const bad = fd.s.tag_filter.exclude.find((x) => i.tags.includes(x));
+  const bad = fd.s.tag_filter.exclude.find((x) => tags.includes(x));
   return bad ? { tag: bad, kind: 'excluded' } : null;
 };
 // 手動判定（換門檻、改 tag 篩選或重新辨識都保留）：✕ 不是目標；✓ 是目標（只蓋過 CCIP 的判定，tag 篩選仍然套用）；
 // 2 = 忽略 tag 保留（WD14 標錯時用）
 const FD_KEEP = 2;
-const fdIsTarget = (i) => i.manual === 1 || (i.manual !== -1 && fdCcipMatch(i));
+const fdIsTarget = (i) => i.manual === 1 || (i.manual !== -1 && (fdCcipMatch(i) || fdRecovered(i)));
 const fdIsMatch = (i) => (i.manual === -1 ? false : i.manual === FD_KEEP ? true : fdIsTarget(i) && !fdTagBlock(i));
 const fdManualKey = (m) => ({ 1: 'finder.manual_included', [-1]: 'finder.manual_excluded', [FD_KEEP]: 'finder.manual_kept' })[m];
 const fdImages = (role) => fd.s.images.filter((i) => i.role === role);
@@ -2445,13 +2487,15 @@ function finderRunBar(job = null) {
   }
   const wantTags = store.get('finderTags', true);
   const untagged = wantTags ? pool.filter((i) => !i.tags && !i.error).length : 0;
-  const stale = pool.some((i) => !i.scored && !i.error) || refs.some((i) => !i.has_feature && !i.error) || untagged > 0;
+  const people = pool.filter(fdPeoplePending).length; // 辨識時會順便處理
+  const stale = pool.some((i) => !i.scored && !i.error) || refs.some((i) => !i.has_feature && !i.error) || untagged > 0 || people > 0;
   const ready = refs.length && pool.length;
   const scoredAny = pool.some((i) => i.scored);
   bar.innerHTML = `<div class="row"><button class="btn primary" id="fdStart" ${ready && stale ? '' : 'disabled'}>▶ ${esc(t(scoredAny ? 'finder.rerun' : 'finder.run'))}</button>
     <span class="muted">${esc(!refs.length ? t('finder.need_refs') : !pool.length ? t('finder.need_pool')
       : stale ? (scoredAny && !pool.some((i) => !i.scored && !i.error) && untagged ? t('finder.need_tags', { n: untagged })
-        : t(scoredAny ? 'finder.stale' : 'finder.ready', { n: pool.length })) : t('finder.up_to_date'))}</span>
+        : scoredAny && !pool.some((i) => !i.scored && !i.error) && people ? t('finder.need_people', { n: people })
+          : t(scoredAny ? 'finder.stale' : 'finder.ready', { n: pool.length })) : t('finder.up_to_date'))}</span>
     <span class="spacer"></span>
     <label class="check" title="${esc(t('finder.gen_tags_help'))}"><input type="checkbox" id="fdTags" ${wantTags ? 'checked' : ''}> ${esc(t('finder.gen_tags'))}</label>
     <label class="check" title="${esc(t('finder.free_vram_help'))}"><input type="checkbox" id="fdFreeVram" ${store.get('finderFreeVram', false) ? 'checked' : ''}> ${esc(t('finder.free_vram'))}</label>
@@ -2519,16 +2563,26 @@ function finderResultsBody() {
   const blocked = pool.filter((i) => i.manual !== FD_KEEP && fdIsTarget(i) && fdTagBlock(i));
   const tagOut = blocked.filter((i) => fdTagBlock(i).kind !== 'untagged');
   const untagged = blocked.filter((i) => fdTagBlock(i).kind === 'untagged');
-  if ((fd.filter === 'tagout' && !tagOut.length) || (fd.filter === 'untagged' && !untagged.length)) fd.filter = 'match';
+  const group = fd.s.people_mode ? pool.filter((i) => fdIsTarget(i) && (i.people?.n >= 2 || fdRecovered(i))) : []; // 多人圖（處理的、跳過的和找回的）
+  if ((fd.filter === 'tagout' && !tagOut.length) || (fd.filter === 'untagged' && !untagged.length)
+    || (fd.filter === 'people' && !group.length)) fd.filter = 'match';
   if (fd.auto) fd.sel = new Set(matches.map((i) => i.id));
   const list = fd.filter === 'match' ? matches : fd.filter === 'other' ? pool.filter((i) => !fdIsMatch(i))
-    : fd.filter === 'tagout' ? tagOut : fd.filter === 'untagged' ? untagged : pool;
+    : fd.filter === 'tagout' ? tagOut : fd.filter === 'untagged' ? untagged : fd.filter === 'people' ? group : pool;
   $('#fdMatchCount').textContent = t('finder.match_count', { n: matches.length, total: pool.length });
   finderTagBar();
+  // 多人圖的處理結果：已裁切 / 已遮擋，或跳過的原因
+  const peopleBadge = (i) => {
+    const st = fdPeopleState(i);
+    const found = fdRecovered(i) ? `<span class="badge ok" title="${esc(t('finder.people_recovered_help', { v: fdBestPerson(i).toFixed(3) }))}">${esc(t('finder.people_recovered'))}</span>` : '';
+    if (!st || st === 'single') return found;
+    return found + (st === 'ok' ? `<span class="badge ok" title="${esc(t('finder.people_done_help'))}">${esc(t(`finder.people_done_${fd.s.people_mode}`))}</span>`
+      : `<span class="badge warn" title="${esc(t(`finder.people_skip_${st}_help`, { n: fd.s.people_min_side }))}">${esc(t(`finder.people_skip_${st}`))}</span>`);
+  };
   const why = (i) => { const b = fd.filter === 'tagout' && fdTagBlock(i); return b && b.kind !== 'untagged' ? `<span class="badge warn" title="${esc(t(`finder.tag_why_${b.kind}`, { tag: fdTagShow(b.tag) }))}">${b.kind === 'missing' ? '∅' : '−'} ${esc(fdTagShow(b.tag))}</span>` : ''; };
   body.innerHTML = `<div class="fd-res-bar">
       <div class="seg">${[['match', matches.length], ...(tagOut.length ? [['tagout', tagOut.length]] : []), ...(untagged.length ? [['untagged', untagged.length]] : []),
-        ['other', pool.length - matches.length], ['all', pool.length]].map(([f, n]) => `<button class="btn sm ${fd.filter === f ? 'active' : ''}" data-f="${f}" ${['tagout', 'untagged'].includes(f) || (f === 'match' && fdTagActive()) ? `title="${esc(t(`finder.filter_${f}_help`))}"` : ''}>${esc(t(`finder.filter_${f}`))} <small>${n}</small></button>`).join('')}</div>
+        ...(group.length ? [['people', group.length]] : []), ['other', pool.length - matches.length], ['all', pool.length]].map(([f, n]) => `<button class="btn sm ${fd.filter === f ? 'active' : ''}" data-f="${f}" ${['tagout', 'untagged', 'people'].includes(f) || (f === 'match' && fdTagActive()) ? `title="${esc(t(`finder.filter_${f}_help`))}"` : ''}>${esc(t(`finder.filter_${f}`))} <small>${n}</small></button>`).join('')}</div>
       <span class="muted">${esc(t('finder.selected', { n: fd.sel.size }))}${fd.auto ? ` · ${esc(t('finder.auto_select'))}` : ''}</span>
       <span class="spacer"></span>
       <button class="btn sm" data-s="match">${esc(t('finder.sel_match'))}</button>
@@ -2536,18 +2590,20 @@ function finderResultsBody() {
       <button class="btn sm" data-s="invert">${esc(t('finder.sel_invert'))}</button>
       <button class="btn sm ghost" data-s="none">${esc(t('finder.sel_none'))}</button>
       <button class="btn sm" id="fdDups" ${matches.length > 1 ? '' : 'disabled'} title="${esc(t('finder.dup_scope_matches_help'))}">${esc(t('finder.dup_button'))}</button>
+      <button class="btn sm ${fd.s.people_mode ? 'active' : ''}" id="fdPeople" title="${esc(t('finder.people_button_help'))}">${esc(t('finder.people_button'))}</button>
       <button class="btn sm" data-m="exclude" ${fd.sel.size ? '' : 'disabled'}>✕ ${esc(t('finder.bulk_exclude', { n: fd.sel.size }))}</button>
       <button class="btn sm" data-m="include" ${fd.sel.size ? '' : 'disabled'}>✓ ${esc(t('finder.bulk_include', { n: fd.sel.size }))}</button>
       <button class="btn sm primary" id="fdDownload" ${fd.sel.size ? '' : 'disabled'}>⬇ ${esc(t('finder.download', { n: fd.sel.size }))}</button>
       <button class="btn sm primary" id="fdToProject" ${fd.sel.size ? '' : 'disabled'}>→ ${esc(t('finder.to_project', { n: fd.sel.size }))}</button></div>
     <div class="fd-grid">${list.slice(0, fd.shown).map((i) => `<div class="fd-card ${fd.sel.has(i.id) ? 'selected' : ''} ${fdIsMatch(i) ? 'match' : ''}" data-id="${i.id}" title="${esc(i.rel_path || i.original_name)}">
-        <div class="thumb"><img loading="lazy" src="${i.thumb_url}" alt=""></div>
+        <div class="thumb"><img loading="lazy" src="${fdThumb(i)}" alt=""></div>
         <div class="sel"><input type="checkbox" ${fd.sel.has(i.id) ? 'checked' : ''}></div>
         <div class="fd-tools">${fdMarkButton(i)}<button class="fd-zoom" title="${esc(t('finder.preview'))}">⤢</button></div>
-        <div class="fd-score"><span>${i.score == null ? '' : esc(t('finder.diff', { v: i.score.toFixed(3) }))}</span>${why(i)}${i.manual ? `<span class="badge ${i.manual > 0 ? 'ok' : 'warn'}">${esc(t(fdManualKey(i.manual)))}</span>` : ''}${i.neg_score != null && i.neg_score <= i.score ? `<span class="badge warn" title="${esc(t('finder.neg_closer_help', { v: i.neg_score.toFixed(3) }))}">${esc(t('finder.neg_closer'))}</span>` : ''}</div></div>`).join('')}</div>
+        <div class="fd-score"><span>${i.score == null ? '' : esc(t('finder.diff', { v: i.score.toFixed(3) }))}</span>${why(i)}${peopleBadge(i)}${i.manual ? `<span class="badge ${i.manual > 0 ? 'ok' : 'warn'}">${esc(t(fdManualKey(i.manual)))}</span>` : ''}${i.neg_score != null && i.neg_score <= i.score ? `<span class="badge warn" title="${esc(t('finder.neg_closer_help', { v: i.neg_score.toFixed(3) }))}">${esc(t('finder.neg_closer'))}</span>` : ''}</div></div>`).join('')}</div>
     ${list.length > fd.shown ? `<div class="row" style="justify-content:center;margin-top:14px"><button class="btn" id="fdMore">${esc(t('finder.show_more', { n: list.length - fd.shown }))}</button></div>` : ''}
     ${!list.length ? `<div class="empty">${esc(t('finder.no_results'))}</div>` : `<div class="help" style="margin-top:10px">${esc(t('finder.manual_help'))}</div>`}`;
   $('#fdDups', body).onclick = () => finderDupDialog('pool', 'matches');
+  $('#fdPeople', body).onclick = () => finderPeopleDialog();
   $$('[data-m]', body).forEach((b) => {
     b.onclick = async () => {
       const ids = [...fd.sel];
@@ -2590,7 +2646,7 @@ function finderTagBar() {
   if (!bar) return;
   const f = fd.s.tag_filter;
   const ccip = fdImages('pool').filter(fdIsTarget);
-  const tagged = ccip.filter((i) => i.tags);
+  const tagged = ccip.filter(fdTagList);
   const missing = ccip.length - tagged.length;
   const focused = document.activeElement?.id === 'fdTagIn';
   if (!tagged.length) {
@@ -2601,17 +2657,20 @@ function finderTagBar() {
   }
   // 常見 tag：角色 tag 在前；每張都有的 tag 拿來篩沒有意義，不列
   const count = new Map(), chars = new Set();
-  for (const i of tagged) i.tags.forEach((x, k) => { count.set(x, (count.get(x) || 0) + 1); if (k < (i.tags_char || 0)) chars.add(x); });
+  for (const i of tagged) fdTagList(i).forEach((x, k) => { count.set(x, (count.get(x) || 0) + 1); if (k < fdTagChar(i)) chars.add(x); });
   const used = new Set([...f.include, ...f.exclude]);
   const ranked = [...count].filter(([x, n]) => !used.has(x) && (n < tagged.length || tagged.length === 1)).sort((a, b) => b[1] - a[1]);
-  const sug = [...ranked.filter(([x]) => chars.has(x)).slice(0, 6), ...ranked.filter(([x]) => !chars.has(x)).slice(0, 18)];
+  // 多人圖加的 tag（重疊、找回…）排最前面，方便快速篩選
+  const sug = [...ranked.filter(([x]) => fdPeopleTagKey(x)), ...ranked.filter(([x]) => chars.has(x)).slice(0, 6),
+    ...ranked.filter(([x]) => !chars.has(x) && !fdPeopleTagKey(x)).slice(0, 18)];
   const chip = (x, kind) => `<span class="fd-tchip ${kind}" title="${esc(t(`finder.tag_${kind}_help`))}">${kind === 'inc' ? '✓' : '✕'} ${esc(fdTagShow(x))}<button data-rm="${esc(x)}" title="${esc(t('common.delete'))}">✕</button></span>`;
   bar.innerHTML = `<div class="row fd-tagrow"><b>${esc(t('finder.tag_filter'))}</b>
       <input type="text" id="fdTagIn" list="fdTagList" placeholder="${esc(t('finder.tag_ph'))}" autocomplete="off">
-      <datalist id="fdTagList">${[...count].sort((a, b) => b[1] - a[1]).slice(0, 800).map(([x, n]) => `<option value="${esc(fdTagShow(x))}">${n}</option>`).join('')}</datalist>
+      <datalist id="fdTagList">${[...count].sort((a, b) => b[1] - a[1]).slice(0, 800).map(([x, n]) => (fdPeopleTagKey(x)
+        ? `<option value="${esc(x)}">${esc(fdTagShow(x))} · ${n}</option>` : `<option value="${esc(fdTagShow(x))}">${n}</option>`)).join('')}</datalist>
       ${f.include.map((x) => chip(x, 'inc')).join('')}${f.exclude.map((x) => chip(x, 'exc')).join('')}
       ${used.size ? `<button class="btn sm ghost" id="fdTagClear">${esc(t('finder.tag_clear'))}</button>` : ''}</div>
-    ${sug.length ? `<div class="fd-tagsug"><span class="muted">${esc(t('finder.tag_common'))}</span>${sug.map(([x, n]) => `<span class="fd-sug ${chars.has(x) ? 'char' : ''}">
+    ${sug.length ? `<div class="fd-tagsug"><span class="muted">${esc(t('finder.tag_common'))}</span>${sug.map(([x, n]) => `<span class="fd-sug ${chars.has(x) ? 'char' : fdPeopleTagKey(x) ? 'ptag' : ''}">
         <button data-inc="${esc(x)}" title="${esc(t('finder.tag_add_inc', { tag: fdTagShow(x) }))}">${esc(fdTagShow(x))} <small>${n}</small></button><button data-exc="${esc(x)}" title="${esc(t('finder.tag_add_exc', { tag: fdTagShow(x) }))}">−</button></span>`).join('')}</div>` : ''}
     <div class="help">${esc(t('finder.tag_help'))}${missing ? ` ${esc(t(used.size ? 'finder.tags_missing_filtered' : 'finder.tags_missing', { n: missing }))}` : ''}
       ${missing ? `<button class="btn sm ghost" id="fdTagGen">${esc(t('finder.tags_generate'))}</button>` : ''}</div>`;
@@ -2788,6 +2847,88 @@ async function finderDupDialog(role = 'pool', scope = null) {
   load();
 }
 
+// 多人圖：在目標圖片裡找出每個人，只留下目標角色（裁切或白色方塊蓋住別人）；可以順便找回整張圖不夠像的目標
+async function finderPeopleDialog() {
+  const sid = fd.s.id;
+  const body = h(`<div class="fd-people">
+      <p>${esc(t('finder.people_intro'))}</p>
+      <div class="seg">${['off', 'crop', 'mask'].map((x) => `<button class="btn sm" data-pm="${x}">${esc(t(`finder.people_mode_${x}`))}</button>`).join('')}</div>
+      <div class="muted" id="fdPmHelp"></div>
+      <div class="fd-pm-opts" id="fdPmOpts">
+        <div id="fdPmSideBox"><label class="fd-thr">${esc(t('finder.people_min_side'))}
+          <input type="range" id="fdPmSide" min="0" max="1024" step="32"><b id="fdPmSideVal"></b></label>
+          <div class="help">${esc(t('finder.people_min_side_help'))}</div></div>
+        <div><label class="check"><input type="checkbox" id="fdPmRec"> ${esc(t('finder.people_recover'))}</label>
+          <label class="fd-thr" id="fdPmRecBox">${esc(t('finder.people_recover_range'))}
+            <input type="range" id="fdPmRecR" min="0.02" max="0.5" step="0.01"><b id="fdPmRecVal"></b></label>
+          <div class="help" id="fdPmRecHelp"></div></div></div>
+      <div id="fdPmStats"></div>
+      <div class="help">${esc(t('finder.people_help'))}</div></div>`);
+  const m = modal({
+    title: t('finder.people_title'), body,
+    actions: [
+      { label: t('common.close'), onClick: (c) => c() },
+      { label: t('finder.people_start', { n: 0 }), primary: true, onClick: async (close) => {
+        try {
+          const { job } = await api(`/finder/${sid}/people`, { method: 'POST' });
+          close();
+          if (job) finderWatch(job.id);
+        } catch (e) { toast(e.message, 'err'); }
+      } },
+    ],
+  });
+  const btn = $('.modal-foot .primary', m.el);
+  const side = $('#fdPmSide', body), rec = $('#fdPmRec', body), range = $('#fdPmRecR', body);
+  const save = async (patch) => {
+    try {
+      const r = await api(`/finder/${sid}`, { method: 'PATCH', body: patch });
+      fd.s = { ...fd.s, ...r };
+    } catch (e) { toast(e.message, 'err'); }
+    draw(); finderResultsBody();
+  };
+  const draw = () => {
+    const mode = fd.s.people_mode || 'off';
+    $$('[data-pm]', body).forEach((b) => b.classList.toggle('active', b.dataset.pm === mode));
+    $('#fdPmHelp', body).textContent = t(`finder.people_mode_${mode}_help`);
+    $('#fdPmOpts', body).hidden = mode === 'off';
+    $('#fdPmSideBox', body).hidden = mode !== 'crop';
+    side.value = fd.s.people_min_side;
+    $('#fdPmSideVal', body).textContent = +fd.s.people_min_side ? `${fd.s.people_min_side} px` : t('finder.people_min_side_none');
+    const r = fd.s.people_recover;
+    rec.checked = r != null;
+    $('#fdPmRecBox', body).hidden = r == null;
+    if (r != null) range.value = r;
+    $('#fdPmRecVal', body).textContent = r == null ? '' : `+${r.toFixed(2)}`;
+    const pool = fdImages('pool').filter((i) => !i.error);
+    const inRange = r == null || mode === 'off' ? [] : pool.filter(fdInRecoverRange);
+    $('#fdPmRecHelp', body).textContent = r == null ? t('finder.people_recover_help')
+      : t('finder.people_recover_info', { max: (fdThreshold() + r).toFixed(3), n: inRange.length, todo: inRange.filter((i) => !i.people).length });
+    const targets = pool.filter(fdIsTarget);
+    const todo = mode === 'off' ? 0 : pool.filter(fdPeoplePending).length;
+    btn.textContent = t('finder.people_start', { n: todo }); btn.hidden = !todo;
+    if (mode === 'off') { $('#fdPmStats', body).innerHTML = ''; return; }
+    const st = {};
+    targets.forEach((i) => { const k = fdPeoplePending(i) ? 'pending' : fdPeopleState(i); st[k] = (st[k] || 0) + 1; });
+    const skip = FD_SKIPPED.filter((k) => st[k]);
+    const found = targets.filter(fdRecovered).length, unchecked = inRange.filter((i) => !i.people).length;
+    $('#fdPmStats', body).innerHTML = `<div class="fd-pm-stats">
+        <div><b>${st.ok || 0}</b> ${esc(t(`finder.people_stat_ok_${mode}`))}</div>
+        <div><b>${skip.reduce((n, k) => n + st[k], 0)}</b> ${esc(t('finder.people_stat_skip'))}${skip.map((k) => ` <span class="badge warn" title="${esc(t(`finder.people_skip_${k}_help`, { n: fd.s.people_min_side }))}">${esc(t(`finder.people_skip_${k}`))} ${st[k]}</span>`).join('')}</div>
+        <div><b>${st.single || 0}</b> ${esc(t('finder.people_stat_single'))}</div>
+        ${r != null ? `<div><b>${found}</b> ${esc(t('finder.people_stat_found'))}</div>` : ''}
+        ${st.pending ? `<div><b>${st.pending}</b> ${esc(t('finder.people_stat_pending'))}</div>` : ''}
+        ${unchecked ? `<div><b>${unchecked}</b> ${esc(t('finder.people_stat_unchecked'))}</div>` : ''}</div>`;
+  };
+  $$('[data-pm]', body).forEach((b) => { b.onclick = () => save({ people_mode: b.dataset.pm }); });
+  // 拖曳時先在本機套用（統計和結果跟著變），放開才存
+  side.oninput = () => { fd.s.people_min_side = +side.value; draw(); finderResultsSoon(); };
+  side.onchange = () => save({ people_min_side: +side.value });
+  range.oninput = () => { fd.s.people_recover = +range.value; draw(); finderResultsSoon(); };
+  range.onchange = () => { store.set('finderRecover', +range.value); save({ people_recover: +range.value }); };
+  rec.onchange = () => save({ people_recover: rec.checked ? +store.get('finderRecover', 0.1) : 0 });
+  draw();
+}
+
 function fdMarkButton(i) {
   const b = (mark, cls, icon, key) => `<button class="fd-mark ${cls}" data-mark="${mark}" title="${esc(t(key))}">${icon}</button>`;
   if (i.manual !== FD_KEEP && fdIsTarget(i) && fdTagBlock(i)) return b('keep', 'in', '＋', 'finder.mark_keep'); // 被 tag 篩掉的目標
@@ -2811,23 +2952,27 @@ async function finderMark(ids, action, quiet = false) {
 function finderPreview(list, idx) {
   const body = h('<div class="fd-preview"><img id="fdpImg" alt=""><div class="row" id="fdpMeta"></div><div class="fd-ptags" id="fdpTags"></div></div>');
   const m = modal({ title: '', body, size: 'wide', onClose: () => { document.removeEventListener('keydown', keys); finderResultsBody(); } });
+  let original = false; // 多人圖：看處理後的圖（預設）或原圖
   const show = (i) => {
     idx = Math.max(0, Math.min(list.length - 1, i));
-    const img = list[idx];
-    $('#fdpImg', body).src = img.image_url;
+    const img = list[idx], processed = fdProcessed(img);
+    $('#fdpImg', body).src = processed && !original ? `${img.image_url}?people=${fd.s.people_mode}` : img.image_url;
     $('.modal-head h3', m.el).textContent = `${img.original_name}（${idx + 1} / ${list.length}）`;
-    $('#fdpMeta', body).innerHTML = `<span>${img.score == null ? '' : `${esc(t('finder.diff', { v: img.score.toFixed(3) }))} · `}${esc(t(fdIsMatch(img) ? 'finder.is_match' : 'finder.not_match'))}${img.manual ? ` · ${esc(t(fdManualKey(img.manual)))}` : ''}${!fdIsMatch(img) && fdIsTarget(img) && fdTagBlock(img) ? ` · ${esc(t('finder.blocked_by_tags'))}` : ''}</span>
+    $('#fdpMeta', body).innerHTML = `<span>${img.score == null ? '' : `${esc(t('finder.diff', { v: img.score.toFixed(3) }))} · `}${esc(t(fdIsMatch(img) ? 'finder.is_match' : 'finder.not_match'))}${img.manual ? ` · ${esc(t(fdManualKey(img.manual)))}` : ''}${fdRecovered(img) ? ` · ${esc(t('finder.people_recovered_help', { v: fdBestPerson(img).toFixed(3) }))}` : ''}${!fdIsMatch(img) && fdIsTarget(img) && fdTagBlock(img) ? ` · ${esc(t('finder.blocked_by_tags'))}` : ''}</span>
       <span class="muted" style="font-size:12px">${esc(t('finder.preview_keys'))}</span><span class="spacer"></span>
+      ${processed ? `<button class="btn ${original ? 'active' : ''}" id="fdpOrig" title="${esc(t('finder.people_original_help'))}">${esc(t('finder.people_original'))}</button>` : ''}
       <button class="btn ${img.manual === -1 ? 'active' : ''}" id="fdpEx">✕ ${esc(t('finder.mark_exclude'))}</button>
       <button class="btn ${img.manual === 1 ? 'active' : ''}" id="fdpIn">✓ ${esc(t('finder.mark_include'))}</button>
       ${img.manual === FD_KEEP || (fdIsTarget(img) && fdTagBlock(img)) ? `<button class="btn ${img.manual === FD_KEEP ? 'active' : ''}" id="fdpKeep" title="${esc(t('finder.mark_keep_help'))}">＋ ${esc(t('finder.mark_keep'))}</button>` : ''}
       <label class="check"><input type="checkbox" id="fdpSel" ${fd.sel.has(img.id) ? 'checked' : ''}> ${esc(t('finder.select_this'))}</label>
       <button class="btn" id="fdpPrev">‹</button><button class="btn" id="fdpNext">›</button>`;
     const f = fd.s.tag_filter;
-    $('#fdpTags', body).innerHTML = img.tags ? img.tags.map((x) => `<span class="fd-ptag ${f.include.includes(x) ? 'inc' : f.exclude.includes(x) ? 'exc' : ''}">${esc(fdTagShow(x))}</span>`).join('') : '';
+    const ptags = fdTagList(img);
+    $('#fdpTags', body).innerHTML = ptags ? ptags.map((x) => `<span class="fd-ptag ${f.include.includes(x) ? 'inc' : f.exclude.includes(x) ? 'exc' : ''}">${esc(fdTagShow(x))}</span>`).join('') : '';
     $('#fdpEx', body).onclick = () => markAndNext('exclude');
     $('#fdpIn', body).onclick = () => markAndNext('include');
     if ($('#fdpKeep', body)) $('#fdpKeep', body).onclick = () => markAndNext('keep');
+    if ($('#fdpOrig', body)) $('#fdpOrig', body).onclick = () => { original = !original; show(idx); };
     $('#fdpSel', body).onchange = (e) => { fd.auto = false; if (e.target.checked) fd.sel.add(img.id); else fd.sel.delete(img.id); };
     $('#fdpPrev', body).onclick = () => show(idx - 1);
     $('#fdpNext', body).onclick = () => show(idx + 1);

@@ -15,6 +15,9 @@
 - 找重複：讀圖時順便算指紋（64 位元感知雜湊 + 32×32 小圖）。先用雜湊挑出候選，再比小圖的平均差異，門檻由使用者調整
   （小 = 幾乎一樣；大 = 同一個鏡頭表情、動作不同也算）。每組保留畫質最好的一張（目前符合的優先，不會留下別人那張、
   丟掉目標角色那張），其他的要使用者確認後才移除。可以只在目前的結果裡找（重複的標成不符合，可以復原）。
+- 多人圖（people.py）：在目標圖片裡找出每個人，只留下目標角色（裁切或白色方塊蓋住別人）。開啟後辨識時會順便處理，
+  處理後的圖重新產生 tag 給 tag 篩選用，下載和匯入專案時輸出處理後的圖；原圖不變。跳過的圖加上 people_overlap 這類 tag，
+  方便用 tag 篩選。可以順便「找回」：整張差異在門檻 + 搜尋範圍內的圖也逐人比對，有一個人在門檻內就算目標。
 - tag 篩選：辨識時可以順便用 WD14 產生 tag，只用在 CCIP 挑出的結果上（必須有 / 不能有某些 tag）。
   有設定篩選時，還沒有 tag 的圖片先不算符合。手動 ✓（是目標）也會套用 tag 篩選；WD14 標錯時可以「忽略 tag 保留」。
 """
@@ -39,7 +42,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import db, storage
+from . import db, people, storage
 from .config import settings
 from .i18n import t
 from .services import BadRequest, NotFound
@@ -67,6 +70,8 @@ DUP_PREFILTER = 16  # 感知雜湊距離在這以內才比小圖（平均差異 
 _DCT = np.sqrt(2 / 32) * np.cos(np.pi * (2 * np.arange(32)[None, :] + 1) * np.arange(32)[:, None] / 64)
 _DCT[0] /= np.sqrt(2)
 KEEP = 2  # 手動判定「忽略 tag 保留」（manual 欄位；1 = 是目標、-1 = 不是目標）
+MIN_SIDE_MAX = 2048  # 多人圖裁切後最小短邊的上限
+RECOVER_MAX = 1.0  # 找回的搜尋範圍上限（差異最大約 1）
 # WD14 tag 門檻（和專案的預設相同）
 TAG_GENERAL = 0.35
 TAG_CHARACTER = 0.85
@@ -134,11 +139,11 @@ def default_threshold(model: str) -> float:
     return THRESHOLDS[model]
 
 
-def get_image(fid: str) -> dict[str, Any]:
+def get_image(fid: str, full: bool = False) -> dict[str, Any]:
     img = db.finder_image_get(fid)
     if img is None:
         raise NotFound(t("msg.image_not_found", iid=fid))
-    return img
+    return db.finder_images(img["session_id"], ids=[fid])[0] if full else img
 
 
 def session_out(s: dict[str, Any], with_images: bool = False) -> dict[str, Any]:
@@ -147,6 +152,11 @@ def session_out(s: dict[str, Any], with_images: bool = False) -> dict[str, Any]:
     out = {k: s[k] for k in ("id", "name", "model", "threshold", "created_at", "updated_at")}
     out["default_threshold"] = default_threshold(s["model"])
     out["tag_filter"] = tag_filter(s)
+    out["people_mode"] = s.get("people_mode") if s.get("people_mode") in people.MODES else None
+    out["people_min_side"] = _min_side(s)  # 裁切後短邊的下限
+    out["people_recover"] = _recover_range(s)  # 找回的搜尋範圍（門檻再加多少），None = 不找
+    out["people_ambiguous"] = people.AMBIGUOUS  # 網頁判斷多人圖狀態用（和 people.state 相同）
+    out["people_tags"] = people.TAGS
     for k in ("ref_count", "pool_count", "cover_id"):
         if k in s:
             out[k] = s[k]
@@ -161,7 +171,7 @@ def session_out(s: dict[str, Any], with_images: bool = False) -> dict[str, Any]:
 
 def image_out(img: dict[str, Any], model: str) -> dict[str, Any]:
     current = img["feature_model"] == model
-    return {
+    out = {
         "id": img["id"], "role": img["role"], "original_name": img["original_name"], "rel_path": img["rel_path"],
         "width": img["width"], "height": img["height"], "error": img["error"],
         "score": img["score"] if current else None,  # 和參考圖差異的中位數（參考圖：和其他參考圖的差異）
@@ -174,6 +184,13 @@ def image_out(img: dict[str, Any], model: str) -> dict[str, Any]:
         "thumb_url": f"/api/finder/images/{img['id']}/thumb",
         "image_url": f"/api/finder/images/{img['id']}/file",
     }
+    info = _people_info(img, model)
+    if info is not None:  # 多人圖：人數、每個人和參考圖的差異、兩種模式能不能處理（網頁依門檻判斷狀態）
+        out["people"] = people.summary(info)
+    if img.get("people_tags"):  # 處理後的圖的 tag（依模式；角色 tag 在前，char 是角色 tag 的數量）
+        out["people_tags"] = {m: {"tags": v.get("character", []) + v.get("general", []), "char": len(v.get("character", []))}
+                              for m, v in json.loads(img["people_tags"]).items()}
+    return out
 
 
 def list_sessions() -> list[dict[str, Any]]:
@@ -216,7 +233,8 @@ def _tag_list(img: dict[str, Any]) -> list[str] | None:
 
 def update_session(sid: str, name: str | None = None, model: str | None = None,
                    threshold: float | None = None, reset_threshold: bool = False,
-                   tags: dict[str, list[str]] | None = None) -> dict[str, Any]:
+                   tags: dict[str, list[str]] | None = None, people_mode: str | None = None,
+                   people_min_side: int | None = None, people_recover: float | None = None) -> dict[str, Any]:
     s = require_session(sid)
     fields: dict[str, Any] = {}
     if name is not None and name.strip():
@@ -233,6 +251,18 @@ def update_session(sid: str, name: str | None = None, model: str | None = None,
         clean = {k: list(dict.fromkeys(t for t in map(norm_tag, tags.get(k) or []) if t)) for k in ("include", "exclude")}
         clean["include"] = [t for t in clean["include"] if t not in clean["exclude"]]
         fields["tag_filter"] = json.dumps(clean, ensure_ascii=False)
+    if people_mode is not None:
+        if people_mode not in ("off", *people.MODES):
+            raise BadRequest(t("msg.finder_bad_people_mode", modes=", ".join(("off", *people.MODES))))
+        fields["people_mode"] = None if people_mode == "off" else people_mode
+    if people_min_side is not None:
+        if not 0 <= people_min_side <= MIN_SIDE_MAX:
+            raise BadRequest(t("msg.finder_bad_min_side", max=MIN_SIDE_MAX))
+        fields["people_min_side"] = int(people_min_side)
+    if people_recover is not None:  # 0 = 不找
+        if not 0 <= people_recover <= RECOVER_MAX:
+            raise BadRequest(t("msg.finder_bad_recover", max=RECOVER_MAX))
+        fields["people_recover"] = float(people_recover) or None
     if fields:
         db.finder_session_update(sid, **fields)
     # 圖片清單只有換模型（分數全部失效）時才回傳：5 萬張的篩選整包有幾十 MB，調門檻、改 tag 篩選不必重抓
@@ -258,6 +288,8 @@ def remove_images(sid: str, ids: list[str] | None = None, role: str | None = Non
         if _owned(img):
             Path(img["path"]).unlink(missing_ok=True)
         thumb_path(img).unlink(missing_ok=True)
+        for mode in people.MODES:
+            people_thumb_path(img, mode).unlink(missing_ok=True)
     db.finder_session_touch(sid)
     return len(removed)
 
@@ -390,28 +422,30 @@ _lock = threading.Lock()
 _sessions: dict[str, Any] = {}
 
 
-def _ort(name: str) -> Any:
+def _ort(name: str, repo: str = REPO) -> Any:
+    """ONNX 模型（CCIP，或多人圖用的人物 / 頭部偵測）；載入一次，辨識工作結束時一起釋放。"""
     import onnxruntime as ort
     from huggingface_hub import hf_hub_download
 
     from .tagging.wd14 import ort_providers
 
+    key = name if repo == REPO else f"{repo}/{name}"
     with _lock:
-        sess = _sessions.get(name)
+        sess = _sessions.get(key)
         if sess is None:
-            path = hf_hub_download(REPO, name)
+            path = hf_hub_download(repo, name)
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             opts.log_severity_level = 3
             providers = [(p, {"arena_extend_strategy": "kSameAsRequested"}) if p == "CUDAExecutionProvider" else p
                          for p in ort_providers()]
             sess = ort.InferenceSession(path, sess_options=opts, providers=providers)
-            _sessions[name] = sess
+            _sessions[key] = sess
         return sess
 
 
 def unload_all() -> list[str]:
-    """釋放 CCIP 模型（GPU 版會釋放 VRAM）。辨識工作結束時會自動呼叫。"""
+    """釋放 CCIP 與多人圖偵測模型（GPU 版會釋放 VRAM）。辨識工作結束時會自動呼叫。"""
     with _lock:
         names = list(_sessions)
         _sessions.clear()
@@ -465,15 +499,22 @@ def run_job(job: Any) -> tuple[str, dict[str, Any]] | None:
     """背景工作：算還沒算過的特徵（可順便產生 WD14 tag），再和參考圖比對（由 jobs 的 worker 呼叫，與標註、放大輪流使用 GPU）。"""
     if job.params.get("task") == "hash":
         return _run_hash(job)
+    if job.params.get("task") == "people":
+        if not _run_people(job, job.project_id):
+            return None
+        s = require_session(job.project_id)
+        imgs = db.finder_images(job.project_id, role="pool")
+        n = sum(1 for i in imgs if _is_target(i, s) and processed_mode(i, s))
+        found = sum(1 for i in imgs if _recovered(i, s))
+        return ("msg.finder_people_done_found", {"n": n, "found": found}) if found else ("msg.finder_people_done", {"n": n})
     from .tagging import wd14
 
     sid = job.project_id
     s = require_session(sid)
     model = MODELS[s["model"]]
     imgs = db.finder_images(sid)
-    need_feat = {i["id"] for i in imgs if i["feature_model"] != model}
-    need_tags = {i["id"] for i in imgs if job.params.get("tags") and i["role"] == "pool" and i["tags"] is None
-                 and not (i["error"] and i["feature_model"] == model)}
+    need_feat = {i["id"] for i in imgs if i["feature_model"] != model or i["error"]}  # 上次讀不到的再試一次
+    need_tags = {i["id"] for i in imgs if job.params.get("tags") and i["role"] == "pool" and i["tags"] is None}
     todo = [i for i in imgs if i["id"] in need_feat or i["id"] in need_tags]
     job.image_ids = [i["id"] for i in todo]
     if job.params.get("free_vram"):
@@ -547,8 +588,149 @@ def run_job(job: Any) -> tuple[str, dict[str, Any]] | None:
             wd14.unload(settings.wd14_default_model)
     job.say("msg.finder_comparing")
     _score(sid, model)
+    if not _run_people(job, sid):  # 有開多人圖處理時，順便處理新的目標圖片
+        return None
     db.finder_session_touch(sid)
     return "msg.finder_done", {"n": len(matches(require_session(sid)))}
+
+
+def people_thumb_path(img: dict[str, Any], mode: str) -> Path:
+    return session_dir(img["session_id"]) / "thumbs" / f"{img['id']}.{mode}.webp"
+
+
+def _people_todo(s: dict[str, Any], imgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """要（重新）偵測，或要補處理後的 tag / 縮圖的目標圖片；開了找回時，還有搜尋範圍內還沒偵測的圖片。"""
+    mode, model = s.get("people_mode"), MODELS[s["model"]]
+    if mode not in people.MODES:
+        return []
+    todo = []
+    for i in imgs:
+        if i["error"] or i["role"] != "pool":
+            continue
+        info = _people_info(i, model)
+        if _is_target(i, s):
+            if info is None or (people_state(i, s) == "ok" and (
+                    mode not in json.loads(i.get("people_tags") or "{}") or not people_thumb_path(i, mode).exists())):
+                todo.append(i)
+        elif info is None and _in_recover_range(i, s):
+            todo.append(i)
+    return todo
+
+
+def _run_people(job: Any, sid: str) -> bool:
+    """多人圖：目標圖片裡找出每個人，判斷哪個是目標，做出處理後的圖（產生 tag 與縮圖）。沒開就不做；取消時回傳 False。"""
+    from .tagging import wd14
+
+    s = require_session(sid)
+    mode, model, thr = s.get("people_mode"), MODELS[s["model"]], _threshold(s)
+    if mode not in people.MODES:
+        return True
+    refs = [np.frombuffer(i["feature"], np.float32) for i in db.finder_images(sid, role="ref", with_feature=True)
+            if i["feature_model"] == model and i["feature"]]
+    negs = [np.frombuffer(i["feature"], np.float32) for i in db.finder_images(sid, role="neg", with_feature=True)
+            if i["feature_model"] == model and i["feature"]]
+    todo = _people_todo(s, db.finder_images(sid, role="pool"))
+    if not refs or not todo:
+        return True
+    job.image_ids = [*job.image_ids, *(i["id"] for i in todo)]  # 進度接在辨識後面
+    job.say("msg.finder_people_loading")
+    try:
+        person = _ort(people.PERSON_MODEL[1], people.PERSON_MODEL[0])
+        head = _ort(people.HEAD_MODEL[1], people.HEAD_MODEL[0])
+        feat = _ort(f"{model}/model_feat.onnx")
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(t("msg.finder_download_failed", error=e)) from e
+    repo = settings.wd14_default_model
+    own_tagger = repo not in {m["repo_id"] for m in wd14.loaded_models()}  # 原本沒載入：用完就釋放
+    try:
+        tagger = wd14.get_tagger(repo)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(t("msg.finder_tagger_failed", error=e)) from e
+    head_feats, k, n = np.stack(refs + negs), len(refs), len(negs)
+
+    def score(crops: list[Image.Image]) -> list[tuple[float, float | None]]:
+        f = feat.run(["output"], {"input": np.stack([_ccip_input(c) for c in crops])})[0]
+        d = _differences(np.concatenate([head_feats, f]), model)[k + n:]
+        return [(float(np.median(row[:k])), float(row[k:k + n].min()) if n else None) for row in d]
+
+    def process(img: dict[str, Any], im: Image.Image) -> tuple[dict[str, Any], dict[str, list[str]] | None]:
+        """偵測、比對；能處理的做出處理後的圖並產生 tag 與縮圖（不看最小短邊，調整時不必重做）。
+        用到 GPU，只在主執行緒呼叫（多個執行緒同時跑不同模型會出錯）。"""
+        info = _people_info(img, model)
+        if info is None:
+            info = {**people.analyze(im, person, head, score), "model": model}
+        tags = None
+        if people.judge(info, thr) == "found" and people.geometry(info, mode)[0] == "ok":
+            out = people.render(im, info, mode)
+            r = tagger.predict_arrays([tagger.prepare_fast(out)])[0]
+            tags = {"character": [x for x, p in r["character"] if p >= TAG_CHARACTER],
+                    "general": [x for x, p in r["general"] if p >= TAG_GENERAL]}
+            storage.make_thumb(out, people_thumb_path(img, mode))
+        return info, tags
+
+    job.say("msg.finder_people_detecting")
+    batches = deque(todo[k:k + BATCH] for k in range(0, len(todo), BATCH))
+    pending: deque[tuple[list[dict[str, Any]], list[Future]]] = deque()
+    try:
+        with ThreadPoolExecutor(WORKERS) as pool:  # 執行緒只讀圖（NAS 上的圖主要在等網路）
+            def refill() -> None:
+                while batches and len(pending) < PREFETCH:
+                    b = batches.popleft()
+                    pending.append((b, [pool.submit(_load, i) for i in b]))
+
+            refill()
+            while pending:
+                if job.cancel_event.is_set():
+                    for _, futs in pending:
+                        for f in futs:
+                            f.cancel()
+                    return False
+                batch, futs = pending.popleft()
+                refill()
+                for img, (im, err) in zip(batch, (f.result() for f in futs)):
+                    if im is None:
+                        job.failed += 1
+                        job.errors.append({"image_id": img["id"], "file": img["original_name"], "error": err})
+                    else:
+                        info, tags = process(img, im)
+                        # 重新偵測過的，其他模式的 tag 也要重做
+                        pt = json.loads(img.get("people_tags") or "{}") if _people_info(img, model) else {}
+                        if tags is not None:
+                            pt[mode] = tags
+                        db.finder_image_update(img["id"], people=json.dumps(info),
+                                               people_tags=json.dumps(pt, ensure_ascii=False) if pt else None)
+                    job.done += 1
+    finally:
+        if own_tagger:
+            wd14.unload(repo)
+    return True
+
+
+def start_people(sid: str) -> dict[str, Any] | None:
+    """處理還沒處理的多人圖（背景工作）；都處理過了回傳 None。"""
+    from . import jobs
+
+    s = require_session(sid)
+    if s.get("people_mode") not in people.MODES:
+        raise BadRequest(t("msg.finder_people_off"))
+    if not _people_todo(s, db.finder_images(sid, role="pool")):
+        return None
+    return jobs.submit_task(sid, "finder", [], params={"task": "people"}).to_dict()
+
+
+def people_image(img: dict[str, Any], mode: str) -> Image.Image:
+    """處理後的圖（預覽、匯出用）；沒有偵測結果或這個模式不能處理時回傳原圖。"""
+    s = require_session(img["session_id"])
+    im = _open(img["path"])
+    info = _people_info(img, MODELS[s["model"]])
+    return people.render(im, info, mode) if info and mode in people.MODES else im
+
+
+def ensure_people_thumb(img: dict[str, Any], mode: str) -> Path:
+    dest = people_thumb_path(img, mode)
+    if not dest.exists():
+        storage.make_thumb(people_image(img, mode), dest)
+    return dest
 
 
 def _run_hash(job: Any) -> tuple[str, dict[str, Any]] | None:
@@ -596,11 +778,91 @@ def _score(sid: str, model: str) -> None:
                                    neg_score=float(row[k:k + n].min()) if n else None)
 
 
+def _threshold(s: dict[str, Any]) -> float:
+    return s["threshold"] if s["threshold"] is not None else default_threshold(s["model"])
+
+
+def _min_side(s: dict[str, Any]) -> int:
+    return s["people_min_side"] if s.get("people_min_side") is not None else people.MIN_SIDE
+
+
+def _recover_range(s: dict[str, Any]) -> float | None:
+    return s.get("people_recover") or None
+
+
+def _ccip_match(i: dict[str, Any], model: str, thr: float) -> bool:
+    """整張圖 CCIP 判定符合：差異 ≤ 門檻，且比任何一張排除參考圖都更像目標。"""
+    return (i["feature_model"] == model and i["score"] is not None and i["score"] <= thr
+            and (i["neg_score"] is None or i["score"] < i["neg_score"]))
+
+
+def _in_recover_range(i: dict[str, Any], s: dict[str, Any]) -> bool:
+    """找回的對象：開了多人圖和找回，整張圖沒符合，但差異在門檻 + 搜尋範圍內（✕ 的不找）。"""
+    r, model, thr = _recover_range(s), MODELS[s["model"]], _threshold(s)
+    return (s.get("people_mode") in people.MODES and r is not None and i["role"] == "pool" and i["manual"] != -1
+            and i["feature_model"] == model and i["score"] is not None and i["score"] <= thr + r
+            and not _ccip_match(i, model, thr))
+
+
+def _recovered(i: dict[str, Any], s: dict[str, Any]) -> bool:
+    """找回的目標：整張圖沒符合，但逐人比對時有一個人在門檻內（多人同框、人物很小時整張圖常常不夠像）。"""
+    if not _in_recover_range(i, s):
+        return False
+    info = _people_info(i, MODELS[s["model"]])
+    return info is not None and people.judge(info, _threshold(s)) == "found"
+
+
+def _is_target(i: dict[str, Any], s: dict[str, Any]) -> bool:
+    """是目標角色：手動 ✓ / 忽略 tag 保留、CCIP 判定符合，或逐人比對找回（✕ 一定不是）。不看 tag。"""
+    if i["role"] != "pool" or i["manual"] == -1:
+        return False
+    if i["manual"] in (1, KEEP):
+        return True
+    return _ccip_match(i, MODELS[s["model"]], _threshold(s)) or _recovered(i, s)
+
+
+def _people_info(img: dict[str, Any], model: str) -> dict[str, Any] | None:
+    """多人圖偵測結果（用目前的模型和偵測版本算的才算數）。"""
+    if not img.get("people"):
+        return None
+    try:
+        info = json.loads(img["people"])
+    except ValueError:
+        return None
+    return info if info.get("v") == people.VERSION and info.get("model") == model else None
+
+
+def people_state(img: dict[str, Any], s: dict[str, Any]) -> str | None:
+    """多人圖在目前的模式、門檻和最小短邊下的狀態（people.state）；沒開或還沒偵測回傳 None。"""
+    mode = s.get("people_mode")
+    if mode not in people.MODES or not img.get("people"):
+        return None
+    return people.state(_people_info(img, MODELS[s["model"]]), mode, _threshold(s), _min_side(s))
+
+
+def processed_mode(img: dict[str, Any], s: dict[str, Any]) -> str | None:
+    """這張圖在目前的多人圖設定下會被處理（回傳 crop / mask），不處理回傳 None。"""
+    return s["people_mode"] if people_state(img, s) == "ok" else None
+
+
+def _filter_tags(img: dict[str, Any], s: dict[str, Any]) -> list[str] | None:
+    """tag 篩選用的 tag：處理過的多人圖用處理後的圖的 tag（例如裁切後就沒有 multiple girls）；
+    跳過的多人圖加上跳過原因的 tag（people_overlap 這類），找回的加上 people_recovered。"""
+    st = people_state(img, s)
+    if st == "ok":
+        pt = json.loads(img.get("people_tags") or "{}").get(s["people_mode"])
+        tags = None if pt is None else pt.get("character", []) + pt.get("general", [])
+    else:
+        tags = _tag_list(img)
+    if tags is None:
+        return None
+    extra = [people.TAGS[st]] if st in people.SKIPPED else []
+    return tags + extra + ([people.TAGS["recovered"]] if _recovered(img, s) else [])
+
+
 def matches(s: dict[str, Any], imgs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """目前門檻與 tag 篩選下符合的圖片（依差異由小到大）。
     手動 ✓（是目標）只蓋過分數，tag 篩選仍然套用；✕ 一定不符合；「忽略 tag 保留」（WD14 標錯時）一定符合。"""
-    thr = s["threshold"] if s["threshold"] is not None else default_threshold(s["model"])
-    model = MODELS[s["model"]]
     imgs = imgs if imgs is not None else db.finder_images(s["id"], role="pool")
 
     f = tag_filter(s)
@@ -609,21 +871,16 @@ def matches(s: dict[str, Any], imgs: list[dict[str, Any]] | None = None) -> list
     def tag_ok(i: dict[str, Any]) -> bool:
         if not (inc or exc):
             return True
-        tags = _tag_list(i)
-        if tags is None:  # 有設定篩選時，還沒產生 tag 的圖片無法確認，先不算符合（手動 ✓ 仍然算）
+        tags = _filter_tags(i, s)
+        if tags is None:  # 有設定篩選時，還沒產生 tag 的圖片無法確認，先不算符合
             return False
         have = set(tags)
         return inc <= have and not (exc & have)
 
     def ok(i: dict[str, Any]) -> bool:
-        if i["role"] != "pool" or i["manual"] == -1:
-            return False
-        if i["manual"] == KEEP:
+        if i["role"] == "pool" and i["manual"] == KEEP:
             return True
-        scored = i["feature_model"] == model and i["score"] is not None
-        target = i["manual"] == 1 or (scored and i["score"] <= thr
-                                      and (i["neg_score"] is None or i["score"] < i["neg_score"]))
-        return target and tag_ok(i)
+        return _is_target(i, s) and tag_ok(i)
 
     return sorted((i for i in imgs if ok(i)), key=lambda i: (i["score"] is None, i["score"] or 0))
 
@@ -670,7 +927,7 @@ def start(sid: str, free_vram: bool = False, tags: bool = False) -> dict[str, An
         raise BadRequest(t("msg.finder_need_pool"))
     model = MODELS[require_session(sid)["model"]]
     todo = [i["id"] for i in db.finder_images(sid)
-            if i["feature_model"] != model or (tags and i["role"] == "pool" and i["tags"] is None)]
+            if i["feature_model"] != model or i["error"] or (tags and i["role"] == "pool" and i["tags"] is None)]
     return jobs.submit_task(sid, "finder", todo, params={"free_vram": free_vram, "tags": tags}).to_dict()
 
 
@@ -798,18 +1055,32 @@ def _selected(sid: str, ids: list[str] | None) -> list[dict[str, Any]]:
     return imgs
 
 
-def _unique_names(imgs: list[dict[str, Any]]) -> list[str]:
+def _export_name(img: dict[str, Any], s: dict[str, Any]) -> str:
+    """處理過的多人圖存成 PNG（不再壓縮一次）。"""
+    return f"{PurePosixPath(img['original_name']).stem}.png" if processed_mode(img, s) else img["original_name"]
+
+
+def _export_bytes(img: dict[str, Any], s: dict[str, Any]) -> bytes:
+    """要匯出的內容：處理過的多人圖輸出處理後的圖，其他的用原檔。"""
+    mode = processed_mode(img, s)
+    if mode is None:
+        return read_bytes(img["path"])
+    buf = io.BytesIO()
+    people_image(img, mode).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _unique_names(names: list[str]) -> list[str]:
     seen: dict[str, int] = {}
-    names = []
-    for img in imgs:
-        name = img["original_name"]
+    out = []
+    for name in names:
         n = seen.get(name.lower(), 0)
         seen[name.lower()] = n + 1
         if n:
             stem, ext = os.path.splitext(name)
             name = f"{stem} ({n + 1}){ext}"
-        names.append(name)
-    return names
+        out.append(name)
+    return out
 
 
 def download(sid: str, ids: list[str] | None = None) -> tuple[Path, int]:
@@ -821,9 +1092,9 @@ def download(sid: str, ids: list[str] | None = None) -> tuple[Path, int]:
     out = settings.exports_dir / f"{safe}_finder_{time.strftime('%Y%m%d-%H%M%S')}.zip"
     count = 0
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as zf:  # 圖片本來就壓縮過
-        for img, name in zip(imgs, _unique_names(imgs)):
+        for img, name in zip(imgs, _unique_names([_export_name(i, s) for i in imgs])):
             try:
-                zf.writestr(name, read_bytes(img["path"]))
+                zf.writestr(name, _export_bytes(img, s))
                 count += 1
             except (OSError, BadRequest) as e:  # 檔案被移走、SMB 連不上：略過這張
                 log.warning("打包時讀不到 %s：%s", img["path"], e)
@@ -835,16 +1106,17 @@ def to_project(sid: str, ids: list[str] | None, project_id: str) -> dict[str, An
     p = db.get_project(project_id)
     if p is None:
         raise NotFound(t("msg.project_not_found", pid=project_id))
+    s = require_session(sid)
     imgs = _selected(sid, ids)
-    def reader(path: str) -> Callable[[], bytes]:
+    def reader(img: dict[str, Any]) -> Callable[[], bytes]:
         def read() -> bytes:
             try:
-                return read_bytes(path)
+                return _export_bytes(img, s)
             except BadRequest as e:  # SMB 連不上：這張略過，不中斷整批
                 raise OSError(str(e)) from e
         return read
 
-    entries = [(name, reader(img["path"])) for img, name in zip(imgs, _unique_names(imgs))]
+    entries = [(name, reader(img)) for img, name in zip(imgs, _unique_names([_export_name(i, s) for i in imgs]))]
     result = storage.import_entries(project_id, entries, trigger=p["settings"].get("trigger", ""))
     result.pop("added_ids", None)
     return result

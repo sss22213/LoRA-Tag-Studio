@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import mimetypes
 import os
 import zipfile
@@ -110,6 +111,17 @@ class FinderUpdate(BaseModel):
                                                                  "set, images without tags do not match. It also applies "
                                                                  "to manual = 1 (include); only manual = 2 (keep) and "
                                                                  "-1 (exclude) ignore it")
+    people_mode: Literal["off", "crop", "mask"] | None = Field(
+        None, description="Images with several people: crop = cut out the target character, mask = cover the others "
+                          "with white blocks, off = leave them as they are. Processed images use the tags of the "
+                          "processed image for tag_filter, and downloads / project imports get the processed image "
+                          "(PNG). Run POST /finder/{sid}/people (or /run) to process the targets.")
+    people_min_side: int | None = Field(None, ge=0, le=2048, description="Crops whose short side is below this (px) "
+                                                                          "are skipped (status small); default 384")
+    people_recover: float | None = Field(
+        None, ge=0, le=1, description="Also compare each person in images whose difference is within threshold + "
+                                      "this (needs people_mode); a person within the threshold makes the image a "
+                                      "target (recovered). 0 = off")
 
 
 class FinderServerImport(BaseModel):
@@ -551,7 +563,8 @@ def finder_create(body: FinderCreate) -> dict[str, Any]:
 @router.get("/finder/{sid}", operation_id="get_character_search",
             summary="Search settings and all its images with scores (score = median CCIP difference to the "
                     "references; a pool image matches when manual = 2, or it is the target (manual = 1, or manual is "
-                    "not -1 and score <= threshold and score < neg_score) and it passes tag_filter)")
+                    "not -1 and score <= threshold and score < neg_score, or recovered by people_recover) and it "
+                    "passes tag_filter)")
 def finder_get(sid: str) -> dict[str, Any]:
     return finder.session_out(finder.require_session(sid), with_images=True)
 
@@ -561,7 +574,8 @@ def finder_get(sid: str) -> dict[str, Any]:
                       "changed")
 def finder_update(sid: str, body: FinderUpdate) -> dict[str, Any]:
     return finder.update_session(sid, body.name, body.model, body.threshold, body.reset_threshold,
-                                 body.tag_filter.model_dump() if body.tag_filter else None)
+                                 body.tag_filter.model_dump() if body.tag_filter else None, body.people_mode,
+                                 body.people_min_side, body.people_recover)
 
 
 @router.delete("/finder/{sid}", operation_id="delete_character_search",
@@ -629,6 +643,21 @@ def finder_hash(sid: str, body: FinderHash | None = None) -> dict[str, Any]:
     return {"job": finder.start_hash(sid, body.role if body else "pool")}
 
 
+@router.post("/finder/{sid}/people", operation_id="process_character_search_group_shots",
+             summary="Find the people in target images with several people and crop / mask them according to "
+                     "people_mode (background job; returns job = null when everything is processed)",
+             description="Each person is compared with the references (CCIP); the most similar one within the "
+                         "threshold is the target. Images where heads overlap, the crop would be too small, or the "
+                         "target is unclear are skipped and stay as they are; for tag_filter they get the tag "
+                         "people_overlap / people_small / people_no_target / people_ambiguous. With people_recover, "
+                         "non-matching images within threshold + people_recover are checked too, and those with a "
+                         "person within the threshold become targets (tag people_recovered). GET /finder/{sid} "
+                         "returns per image people = {n, d: [[difference, exclusion difference] per person], crop, "
+                         "mask, side (crop short side)} and people_tags = {mode: tags}.")
+def finder_people(sid: str) -> dict[str, Any]:
+    return {"job": finder.start_people(sid)}
+
+
 @router.get("/finder/{sid}/duplicates", operation_id="find_character_search_duplicates",
             summary="Groups of nearly identical images; the first id of each group is the suggested one to keep",
             description="threshold: average difference of 32×32 thumbnails (0–255). ≤ 2 = practically identical "
@@ -667,17 +696,21 @@ def finder_to_project(sid: str, body: FinderToProject) -> dict[str, Any]:
 
 
 @router.get("/finder/images/{fid}/thumb", operation_id="get_character_search_thumb", include_in_schema=False)
-def finder_thumb(fid: str) -> FileResponse:
-    img = finder.get_image(fid)
+def finder_thumb(fid: str, people: Literal["crop", "mask"] | None = Query(None)) -> FileResponse:
+    img = finder.get_image(fid, full=people is not None)
     try:
-        path = finder.ensure_thumb(img)
+        path = finder.ensure_people_thumb(img, people) if people else finder.ensure_thumb(img)
     except Exception as e:  # noqa: BLE001  壞檔或檔案已被移走
         raise HTTPException(404, t("msg.cannot_read_image", error=e)) from e
     return FileResponse(path, headers={"Cache-Control": "private, max-age=86400"})
 
 
 @router.get("/finder/images/{fid}/file", operation_id="get_character_search_file", include_in_schema=False)
-def finder_file(fid: str) -> FileResponse:
+def finder_file(fid: str, people: Literal["crop", "mask"] | None = Query(None)) -> Response:
+    if people:  # 多人圖處理後的樣子（預覽用）
+        buf = io.BytesIO()
+        finder.people_image(finder.get_image(fid, full=True), people).save(buf, "JPEG", quality=92)
+        return Response(buf.getvalue(), media_type="image/jpeg")
     img = finder.get_image(fid)
     if finder.is_remote(img):  # SMB：讀出來直接回傳
         media = mimetypes.guess_type(img["original_name"])[0] or "application/octet-stream"
