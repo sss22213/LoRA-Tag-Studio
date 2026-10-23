@@ -1025,6 +1025,7 @@
       "finished_fail": "訓練失敗，點這裡到專案查看原因。",
       "views": "訓練量：{steps} 步 × batch {batch} ÷ {n} 張 ≈ 每張圖被看到 {views} 次",
       "views_low": "偏少：只出現在部分圖片的細節（衣服、配件）可能學不完整。約 {suggest} 步可讓每張圖被看到約 {target} 次。",
+      "views_untagged": "這個專案還沒有標註完成的圖片，先用全部 {n} 張估算；上傳時只會送出標註完成的圖片。",
       "apply_suggest": "套用 {steps} 步",
       "run_params": "{steps} 步 · {epochs} epochs · 學習率 {lr} · dim {dim}/{alpha} · {optimizer}",
       "priority": "排隊優先度",

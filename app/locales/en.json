@@ -1025,6 +1025,7 @@
       "finished_fail": "Training failed — open the project to see why.",
       "views": "Training amount: {steps} steps × batch {batch} ÷ {n} images ≈ each image seen {views} times",
       "views_low": "That is low — details that appear only in some images (outfits, accessories) may not be learned. About {suggest} steps would show each image ~{target} times.",
+      "views_untagged": "No images in this project are tagged yet, so this uses all {n} images as an estimate; only tagged images are uploaded.",
       "apply_suggest": "Use {steps} steps",
       "run_params": "{steps} steps · {epochs} epochs · LR {lr} · dim {dim}/{alpha} · {optimizer}",
       "priority": "Queue priority",

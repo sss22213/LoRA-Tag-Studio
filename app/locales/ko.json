@@ -1025,6 +1025,7 @@
       "finished_fail": "학습에 실패했습니다. 클릭해서 프로젝트에서 원인을 확인하세요.",
       "views": "학습량: {steps}스텝 × 배치 {batch} ÷ {n}장 ≈ 이미지당 {views}회",
       "views_low": "적은 편입니다. 일부 이미지에만 있는 디테일(의상, 소품)이 충분히 학습되지 않을 수 있습니다. 약 {suggest}스텝이면 이미지당 약 {target}회가 됩니다.",
+      "views_untagged": "이 프로젝트에는 아직 태그가 완료된 이미지가 없어 전체 {n}장으로 추정했습니다. 업로드는 태그가 완료된 이미지만 합니다.",
       "apply_suggest": "{steps}스텝 적용",
       "run_params": "{steps}스텝 · {epochs} 에폭 · 학습률 {lr} · dim {dim}/{alpha} · {optimizer}",
       "priority": "대기열 우선순위",

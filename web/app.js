@@ -2134,7 +2134,11 @@ async function civitaiDialog({ focusRuns = false } = {}) {
   const VIEWS_TARGET = 10;
   const VIEWS_LOW = 8;
   const updateViews = () => {
-    const n = imgs.filter((i) => !i.flag && (!$('#cvDone', body).checked || i.status === 'done')).length;
+    const usable = imgs.filter((i) => !i.flag);
+    let n = usable.filter((i) => !$('#cvDone', body).checked || i.status === 'done').length;
+    // 還沒有標註完成的圖片時（剛匯入、還沒標註），先用全部圖片估算，不然這裡會整個不見
+    const estimate = !n && usable.length > 0;
+    if (estimate) n = usable.length;
     const steps = parseInt($('#cvSteps', body).value, 10);
     const batch = parseInt($('#cvBatch', body).value, 10) || 1;
     const box = $('#cvViews', body);
@@ -2143,6 +2147,7 @@ async function civitaiDialog({ focusRuns = false } = {}) {
     const suggest = Math.min(10000, Math.ceil((n * VIEWS_TARGET) / batch / 100) * 100);
     const low = views < VIEWS_LOW && suggest > steps;
     box.innerHTML = `<div class="alert ${low ? 'warn' : 'info'}">${esc(t('civitai.views', { steps, batch, n, views: views.toFixed(1) }))}
+      ${estimate ? `<div class="muted" style="margin-top:4px">${esc(t('civitai.views_untagged', { n }))}</div>` : ''}
       ${low ? `<div style="margin-top:4px">${esc(t('civitai.views_low', { suggest, target: VIEWS_TARGET }))}
         <button class="btn sm" id="cvApplySuggest" style="margin-left:6px">${esc(t('civitai.apply_suggest', { steps: suggest }))}</button></div>` : ''}</div>`;
     if (low) $('#cvApplySuggest', box).onclick = () => { $('#cvSteps', body).value = suggest; updatePrice(); };

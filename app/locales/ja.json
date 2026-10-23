@@ -1025,6 +1025,7 @@
       "finished_fail": "学習に失敗しました。クリックしてプロジェクトで原因を確認できます。",
       "views": "学習量：{steps} ステップ × バッチ {batch} ÷ {n} 枚 ≈ 1 枚あたり {views} 回",
       "views_low": "少なめです。一部の画像にしかない細部（衣装・小物）が学習しきれない可能性があります。約 {suggest} ステップで 1 枚あたり約 {target} 回になります。",
+      "views_untagged": "このプロジェクトにはまだタグ付けが終わった画像がないため、全 {n} 枚で見積もっています。アップロードされるのはタグ付けが終わった画像だけです。",
       "apply_suggest": "{steps} ステップにする",
       "run_params": "{steps} ステップ · {epochs} エポック · 学習率 {lr} · dim {dim}/{alpha} · {optimizer}",
       "priority": "キュー優先度",

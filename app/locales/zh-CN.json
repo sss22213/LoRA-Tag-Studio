@@ -1025,6 +1025,7 @@
       "finished_fail": "训练失败，点这里到项目查看原因。",
       "views": "训练量：{steps} 步 × batch {batch} ÷ {n} 张 ≈ 每张图被看到 {views} 次",
       "views_low": "偏少：只出现在部分图片的细节（衣服、配件）可能学不完整。约 {suggest} 步可让每张图被看到约 {target} 次。",
+      "views_untagged": "这个项目还没有标注完成的图片，先用全部 {n} 张估算；上传时只会发送标注完成的图片。",
       "apply_suggest": "使用 {steps} 步",
       "run_params": "{steps} 步 · {epochs} epochs · 学习率 {lr} · dim {dim}/{alpha} · {optimizer}",
       "priority": "排队优先级",
