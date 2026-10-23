@@ -452,6 +452,7 @@ DATA_DIR=./data IMPORT_DIR=./import VLM_BACKEND=none uvicorn app.main:app --relo
 - **VLM 顯示無法連線**：確認有加 `--profile vlm`，且 `docker compose logs ollama-pull` 顯示模型已下載完成。
 - **VLM 回 404**：模型名稱與 `ollama list` 不一致。
 - **GPU 沒有被使用**：右上角顯示「WD14 · CPU」時，確認使用了 `docker-compose.gpu.yml` 並重新 `--build`，以及 `docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi` 能正常執行。
+- **GPU 本來能用，過幾天模型卻改用 CPU 載入**：主機的 systemd 重新載入設定時（系統自動更新、snap 更新都會觸發），用 `deploy.resources` 拿到 GPU 的容器會失去 GPU；已經載入的模型照常運作，下次載入時會悄悄改用 CPU，`docker exec <容器> nvidia-smi` 會顯示 `Failed to initialize NVML: Unknown Error`。所以 `docker-compose.gpu.yml` 改用 CDI 把 GPU 交給容器（`devices: - nvidia.com/gpu=all`），重新載入後也不會失去。這需要 CDI 規格檔：NVIDIA Container Toolkit 1.18 以上會自動產生；較舊的版本執行一次 `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`。用舊設定建立的容器要重新建立（`up -d --force-recreate`）。
 - **JoyCaption 記憶體不足**：調低 `JOYCAPTION_GPU_UTIL` 或改用較小的 VLM；WD14 GPU 版約佔 1–2GB。和其他工具共用顯示卡時，不標註的時候可以從「VRAM ▾」讓 JoyCaption 休眠。
 - **VRAM 選單說 VLM 不能休眠**：joycaption 容器建立時還沒有休眠模式，用 `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption` 重新建立。
 - **`docker compose down` 出現 `Network lora-tag-studio_default  Resource is still in use`**：還有 profile 裡的容器（JoyCaption 或 Ollama）在跑。改用 `docker compose --profile vlm --profile joycaption down`（見[停止](#停止)）。
