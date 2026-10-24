@@ -119,6 +119,11 @@ CREATE TABLE IF NOT EXISTS smb_connections (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+-- 整個 app 的設定（不屬於某個專案的，例如 VLM 的休眠等級），value 是 JSON
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 _IMAGE_FIELDS = {"tags", "nl_caption", "rating", "raw", "status", "error", "width", "height", "filename", "size", "blocks",
@@ -550,3 +555,18 @@ def smb_delete(cid: str) -> None:
 def smb_finder_refs(cid: str) -> int:
     """角色篩選裡有幾張圖片是從這個連線加入的（只記路徑，刪掉連線就讀不到）。"""
     return _q("SELECT COUNT(*) FROM finder_images WHERE path LIKE ?", (f"smb://{cid}/%",))[0][0]
+
+
+# ------------------------------------------------------------------ app 設定
+def setting_get(key: str, default: Any = None) -> Any:
+    rows = _q("SELECT value FROM app_settings WHERE key=?", (key,))
+    return json.loads(rows[0][0]) if rows else default
+
+
+def setting_set(key: str, value: Any) -> None:
+    """value = None 時刪除（回到預設）。"""
+    if value is None:
+        _x("DELETE FROM app_settings WHERE key=?", (key,))
+    else:
+        _x("INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+           (key, json.dumps(value)))

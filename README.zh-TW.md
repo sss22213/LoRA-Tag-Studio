@@ -238,14 +238,16 @@ JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danboor
 右上角的「VRAM ▾」可以釋放本機模型占用的 VRAM，需要時再載回。和 ComfyUI 等工具共用顯示卡時很有用。
 
 - **WD14**：「釋放 WD14 的 VRAM」會卸載模型，下次標註時自動載回（約數秒），也可以按「載入 WD14」先載入。CUDA 本身約 0.5 GB 的占用要重啟 app 才會歸零。
-- **JoyCaption**：「讓 VLM 休眠」使用 vLLM 的休眠模式，模型權重移到系統記憶體（約 17 GB），不必停容器就能釋放 VRAM。下次呼叫 VLM 時自動喚醒（約數秒），也可以按「喚醒 VLM」。如果這段期間 VRAM 被其他程式占走，喚醒會失敗。
+- **JoyCaption**：「讓 VLM 休眠」使用 vLLM 的休眠模式，不必停容器就能釋放 VRAM。下次呼叫 VLM 時自動喚醒，也可以按「喚醒 VLM」。如果這段期間 VRAM 被其他程式占走，喚醒會失敗。選單裡有兩種休眠方式：
+  - **保留在系統記憶體**（預設，vLLM 第 1 級）：模型權重移到系統記憶體（JoyCaption 約 17–23 GB），喚醒只要幾秒。這些記憶體在喚醒後 vLLM 也不會還回去，要等容器重新啟動。
+  - **連系統記憶體一起釋放**（第 2 級）：權重直接丟掉，喚醒時從硬碟（Hugging Face 快取）重新讀取，比較慢。從第一種改過來後，要重新啟動 JoyCaption 容器一次，才會釋放之前已經占用的記憶體。休眠中的 VLM 一定會用當初的方式喚醒，app 重啟後也一樣。
 - **waifu2x**：只在放大時載入，工作結束時自動釋放。「釋放 waifu2x 的 VRAM」是給工作中斷時用的。
 - 標註或放大工作排隊中或進行中時不能釋放。
 - 內建的 `joycaption` 服務以 `--enable-sleep-mode` 和 `VLLM_SERVER_DEV_MODE=1` 啟動 vLLM。容器是在加入這個設定之前建立的話，用 `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption` 重新建立。這會開啟 vLLM 的開發用端點，但這個服務沒有開放埠，只有 app 連得到。
 - Ollama 閒置 `OLLAMA_KEEP_ALIVE`（預設 10 分鐘）後會自己卸載模型，這裡不能讓它休眠。
 - 有 `nvidia-smi` 時，選單也會顯示整張 GPU 的 VRAM 用量（含其他程式）。
 - **CCIP**（角色篩選）：只在辨識時載入，結束時自動釋放。
-- API：`GET /api/gpu`、`POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip}`。
+- API：`GET /api/gpu`、`POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip}`、`PATCH /api/gpu`（`vlm_sleep_level`：1 或 2）。
 
 ## 送到 Civitai 雲端訓練
 

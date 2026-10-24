@@ -230,14 +230,16 @@ JoyCaption Beta One has a built-in "Danbooru tag list" mode. Settings → "Danbo
 The "VRAM ▾" button in the top-right corner frees the VRAM held by the local models and loads them back, which helps when the GPU is shared with ComfyUI or other tools.
 
 - **WD14**: "Free WD14's VRAM" unloads the model. The next tagging loads it again automatically (a few seconds), or use "Load WD14" to load it in advance. About 0.5 GB used by CUDA itself stays until the app restarts.
-- **JoyCaption**: "Put the VLM to sleep" uses vLLM's sleep mode. The model weights move to system RAM (about 17 GB) and the VRAM is freed without stopping the container. The next VLM call wakes it automatically (a few seconds), or use "Wake the VLM". Waking fails if other programs have taken the VRAM in the meantime.
+- **JoyCaption**: "Put the VLM to sleep" uses vLLM's sleep mode and frees the VRAM without stopping the container. The next VLM call wakes it automatically, or use "Wake the VLM". Waking fails if other programs have taken the VRAM in the meantime. The menu offers two sleep modes:
+  - **Keep in system RAM** (default, vLLM level 1): the weights move to system RAM (about 17–23 GB for JoyCaption) and waking takes a few seconds. vLLM keeps that RAM allocated even after waking, until the container restarts.
+  - **Free system RAM too** (level 2): the weights are dropped and reloaded from disk (the Hugging Face cache) when it wakes, which is slower. After switching from the first mode, restart the JoyCaption container once to free the RAM it already took. A sleeping VLM always wakes the way it was put to sleep, also after an app restart.
 - **waifu2x**: loaded only while upscaling and freed automatically when the job ends. "Free waifu2x's VRAM" is there in case a job was interrupted.
 - Freeing is refused while a tagging or upscaling job is queued or running.
 - The bundled `joycaption` service starts vLLM with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1`. If your container was created before this, recreate it with `docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile joycaption up -d joycaption`. The development endpoints this turns on are only reachable from the app, because the service publishes no port.
 - Ollama unloads its model by itself after `OLLAMA_KEEP_ALIVE` (default 10 minutes) and cannot be put to sleep from here.
 - The menu also shows the GPU's total VRAM use (all programs) when `nvidia-smi` is available.
 - **CCIP** (character finder): loaded only while a search runs and freed automatically.
-- API: `GET /api/gpu`, `POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip}`.
+- API: `GET /api/gpu`, `POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip}`, `PATCH /api/gpu` (`vlm_sleep_level`: 1 or 2).
 
 ## Civitai cloud training
 

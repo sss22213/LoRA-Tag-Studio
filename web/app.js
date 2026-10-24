@@ -284,16 +284,33 @@ async function vramMenu(anchor) {
   else if (v.online === false) items.push({ info: t('vram.vlm_offline'), cls: 'warn' });
   else if (!v.supported) items.push({ info: t('vram.vlm_unsupported'), cls: 'warn' });
   else if (v.sleeping) {
-    items.push({ info: t('vram.vlm_sleeping', { model: v.model }) });
-    items.push({ label: t('vram.vlm_wake'), help: t('vram.vlm_wake_help'), onClick: () => vramAction('wake_vlm') });
+    const lv = v.slept_level === 2 ? '_2' : ''; // 依當初的休眠等級說明
+    items.push({ info: t(`vram.vlm_sleeping${lv}`, { model: v.model }) });
+    items.push({ label: t('vram.vlm_wake'), help: t(`vram.vlm_wake_help${lv}`), onClick: () => vramAction('wake_vlm') });
   } else {
     items.push({ info: t('vram.vlm_awake', { model: v.model }), cls: 'ok' });
-    items.push({ label: t('vram.vlm_sleep'), help: t(g.busy ? 'vram.busy' : 'vram.vlm_sleep_help'), disabled: g.busy,
+    items.push({ label: t('vram.vlm_sleep'), help: t(g.busy ? 'vram.busy' : `vram.vlm_sleep_help${v.sleep_level === 2 ? '_2' : ''}`), disabled: g.busy,
       onClick: () => vramAction('sleep_vlm') });
+  }
+  // 休眠方式：1 = 權重留在系統記憶體（喚醒快）；2 = 連系統記憶體一起釋放（喚醒要重新讀模型）
+  if (v.backend === 'openai' && v.supported) {
+    const other = v.sleep_level === 2 ? 1 : 2;
+    items.push({ info: t('vram.vlm_level', { level: t(`vram.vlm_level_${v.sleep_level}`) }) });
+    items.push({ label: t(`vram.vlm_level_use_${other}`), help: t(`vram.vlm_level_use_${other}_help`), onClick: () => vramSetLevel(other, v) });
   }
   items.push('-');
   items.push({ info: t('vram.auto_note') });
   dropdown(anchor, items);
+}
+
+async function vramSetLevel(level, v) {
+  try {
+    await api('/gpu', { method: 'PATCH', body: { vlm_sleep_level: level } });
+  } catch (e) { toast(e.message, 'err'); return; }
+  // 已經在休眠的不變：醒來時依當初的等級喚醒
+  const later = v.sleeping && (v.slept_level || 1) !== level;
+  // 第 1 級休眠時 vLLM 配置的系統記憶體（pinned memory）不會還回去，要重啟容器
+  toast(`${t('vram.vlm_level_saved', { level: t(`vram.vlm_level_${level}`) })}${later ? ` ${t('vram.vlm_level_next')}` : ''}${level === 2 ? ` ${t('vram.vlm_level_restart')}` : ''}`, 'ok', 10000);
 }
 
 async function vramAction(action, body = {}) {

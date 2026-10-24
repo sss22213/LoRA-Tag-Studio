@@ -451,10 +451,23 @@ def gpu_status() -> dict[str, Any]:
         "wd14": {"loaded": loaded_models(), "default_model": settings.wd14_default_model},
         "waifu2x": {"loaded": upscale.loaded_models()},
         "ccip": {"loaded": finder.loaded_models()},
-        "vlm": {"backend": settings.vlm_backend, "model": settings.vlm_model, **vlm.sleep_status()},
+        "vlm": {"backend": settings.vlm_backend, "model": settings.vlm_model, **vlm.sleep_status(),
+                "sleep_level": vlm.sleep_level(), "slept_level": vlm.slept_level()},
         "busy": jobs.any_active(),
         "memory": _gpu_memory(),
     }
+
+
+def gpu_settings(vlm_sleep_level: int | None = None) -> dict[str, Any]:
+    """VRAM 相關設定：VLM 的休眠等級（1 = 權重留在系統記憶體、喚醒快；2 = 連系統記憶體一起釋放、喚醒要重新讀權重）。"""
+    from .tagging import vlm
+
+    if vlm_sleep_level is not None:
+        try:
+            vlm.set_sleep_level(vlm_sleep_level)
+        except vlm.VLMError as e:
+            raise BadRequest(str(e)) from e
+    return gpu_status()
 
 
 def gpu_action(action: str, model: str | None = None) -> dict[str, Any]:

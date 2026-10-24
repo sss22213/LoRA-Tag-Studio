@@ -172,9 +172,12 @@ def _caption_openai(image: Image.Image, system: str, prompt: str, temperature: f
 
 
 # ---------------------------------------------------------------- vLLM 休眠（JoyCaption）
-# vLLM 以 --enable-sleep-mode 啟動、並設定 VLLM_SERVER_DEV_MODE=1 時有 /sleep、/wake_up、/is_sleeping。
-# level 1：模型權重移到系統記憶體、丟掉 KV cache，釋放大部分 VRAM；喚醒只要把權重搬回 GPU。
+# vLLM 以 --enable-sleep-mode 啟動、並設定 VLLM_SERVER_DEV_MODE=1 時有 /sleep、/wake_up、/is_sleeping、/collective_rpc。
+# level 1：模型權重移到系統記憶體、丟掉 KV cache，釋放大部分 VRAM；喚醒只要把權重搬回 GPU（幾秒）。
+# level 2：權重和 KV cache 都丟掉，系統記憶體也釋放；喚醒時要重新從硬碟讀權重（reload_weights），比較慢。
+#   沒有重新讀權重就喚醒會輸出亂碼，所以記住上次用哪一級休眠（app 重啟後 vLLM 可能還在休眠）。
 SLEEP_CHECK_TTL = 60  # 不支援休眠的端點（Ollama、未開休眠模式的 vLLM）多久再檢查一次
+SLEEP_LEVELS = (1, 2)
 _sleep_lock = threading.Lock()
 _sleep_unsupported_until = 0.0
 
@@ -207,30 +210,68 @@ def sleep_status() -> dict[str, Any]:
     return {"supported": True, "sleeping": sleeping, "online": True}
 
 
-def sleep() -> None:
-    """讓 vLLM 休眠（level 1）：等進行中的請求完成，模型移到系統記憶體，釋放 VRAM。"""
+def sleep_level() -> int:
+    """休眠等級的設定（預設 1）。"""
+    from .. import db
+
+    level = db.setting_get("vlm_sleep_level", 1)
+    return level if level in SLEEP_LEVELS else 1
+
+
+def set_sleep_level(level: int) -> None:
+    """下次休眠時用的等級；已經在休眠的不變（醒來時依當初的等級喚醒）。"""
+    from .. import db
+
+    if level not in SLEEP_LEVELS:
+        raise VLMError(t("msg.vlm_bad_sleep_level", levels=", ".join(map(str, SLEEP_LEVELS))))
+    db.setting_set("vlm_sleep_level", level)
+
+
+def slept_level() -> int:
+    """上次休眠用的等級（沒有紀錄時當作 1，舊版只用 1）。"""
+    from .. import db
+
+    return 2 if db.setting_get("vlm_slept_level") == 2 else 1
+
+
+def _post(path: str, failed_key: str, timeout: float, **kw: Any) -> None:
     try:
-        r = httpx.post(f"{_server_root()}/sleep", params={"level": 1, "mode": "wait"}, headers=_headers(), timeout=300)
+        r = httpx.post(f"{_server_root()}{path}", headers=_headers(), timeout=timeout, **kw)
     except httpx.HTTPError as e:
-        raise VLMError(t("msg.vlm_connect_failed", url=settings.vlm_base_url, error=e)) from e
+        if failed_key == "msg.vlm_sleep_failed":
+            raise VLMError(t("msg.vlm_connect_failed", url=settings.vlm_base_url, error=e)) from e
+        raise VLMError(t(failed_key, error=e)) from e
     if r.status_code == 404:
         raise VLMError(t("msg.vlm_sleep_unsupported"))
     if r.status_code >= 400:
-        raise VLMError(t("msg.vlm_sleep_failed", error=f"HTTP {r.status_code} {r.text[:200]}"))
-    log.info("VLM 已休眠")
+        raise VLMError(t(failed_key, error=f"HTTP {r.status_code} {r.text[:200]}"))
+
+
+def sleep() -> None:
+    """讓 vLLM 休眠（等級依設定）：等進行中的請求完成後釋放 VRAM。"""
+    from .. import db
+
+    level = sleep_level()
+    _post("/sleep", "msg.vlm_sleep_failed", 300, params={"level": level, "mode": "wait"})
+    db.setting_set("vlm_slept_level", level)
+    log.info("VLM 已休眠（level %d）", level)
 
 
 def wake_up() -> None:
-    """喚醒 vLLM：把模型搬回 GPU。VRAM 不夠時會失敗。"""
-    try:
-        r = httpx.post(f"{_server_root()}/wake_up", headers=_headers(), timeout=600)
-    except httpx.HTTPError as e:
-        raise VLMError(t("msg.vlm_wake_failed", error=e)) from e
-    if r.status_code == 404:
-        raise VLMError(t("msg.vlm_sleep_unsupported"))
-    if r.status_code >= 400:
-        raise VLMError(t("msg.vlm_wake_failed", error=f"HTTP {r.status_code} {r.text[:200]}"))
-    log.info("VLM 已喚醒")
+    """喚醒 vLLM：把模型搬回 GPU；level 2 休眠的要先配置權重的記憶體、重新讀權重，再配置 KV cache。VRAM 不夠時會失敗。"""
+    from .. import db
+
+    if slept_level() == 2:
+        # 中途失敗時紀錄保持 level 2，下次喚醒會從頭再做一次（已經醒來的部分 vLLM 會略過）
+        t0 = time.time()
+        _post("/wake_up", "msg.vlm_wake_failed", 600, params={"tags": "weights"})
+        _post("/collective_rpc", "msg.vlm_wake_failed", 900, json={"method": "reload_weights"})
+        _post("/wake_up", "msg.vlm_wake_failed", 600, params={"tags": "kv_cache"})
+        log.info("VLM 已喚醒（level 2，重新讀權重 %.1f 秒）", time.time() - t0)
+    else:
+        _post("/wake_up", "msg.vlm_wake_failed", 600)
+        log.info("VLM 已喚醒")
+    db.setting_set("vlm_slept_level", None)
 
 
 def ensure_awake() -> None:

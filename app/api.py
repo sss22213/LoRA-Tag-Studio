@@ -356,10 +356,23 @@ class GpuActionRequest(BaseModel):
     model: str | None = Field(None, description="load_wd14 only: WD14 model repo (default: the server default)")
 
 
+class GpuSettings(BaseModel):
+    vlm_sleep_level: Literal[1, 2] | None = Field(
+        None, description="How sleep_vlm puts vLLM to sleep. 1 = weights move to system RAM (wakes in seconds); "
+                          "2 = weights are dropped, freeing the system RAM too (waking reloads them from disk, "
+                          "slower). Applies from the next sleep; a sleeping vLLM wakes the way it was put to sleep")
+
+
 @router.get("/gpu", operation_id="get_gpu_status",
-            summary="VRAM: loaded WD14 / waifu2x models, whether the VLM (vLLM) is sleeping, GPU memory use")
+            summary="VRAM: loaded WD14 / waifu2x models, whether the VLM (vLLM) is sleeping and its sleep level "
+                    "(sleep_level = setting, slept_level = level of the current sleep), GPU memory use")
 def gpu_status() -> dict[str, Any]:
     return services.gpu_status()
+
+
+@router.patch("/gpu", operation_id="update_vram_settings", summary="Change VRAM settings: vlm_sleep_level (1 or 2)")
+def gpu_settings(body: GpuSettings) -> dict[str, Any]:
+    return services.gpu_settings(body.vlm_sleep_level)
 
 
 @router.post("/gpu/{action}", operation_id="manage_vram",
@@ -368,8 +381,9 @@ def gpu_status() -> dict[str, Any]:
              description="release_wd14 unloads the WD14 models (reloaded automatically on the next tagging). "
                          "release_waifu2x unloads the upscaling models (also done automatically after each "
                          "upscaling job). "
-                         "sleep_vlm puts vLLM (JoyCaption) to sleep: weights move to system RAM and the VRAM is "
-                         "freed; it wakes automatically before the next VLM call. Releasing is refused while a "
+                         "sleep_vlm puts vLLM (JoyCaption) to sleep at vlm_sleep_level (PATCH /gpu): level 1 moves "
+                         "the weights to system RAM, level 2 drops them; either way the VRAM is freed and it wakes "
+                         "automatically before the next VLM call. Releasing is refused while a "
                          "tagging or upscaling job is queued or running. vLLM must run with --enable-sleep-mode and "
                          "VLLM_SERVER_DEV_MODE=1 (the bundled joycaption service does).")
 def gpu_action(action: str, body: GpuActionRequest | None = None) -> dict[str, Any]:

@@ -86,7 +86,8 @@ services:
       - --max-model-len=4096
       - --gpu-memory-utilization=${JOYCAPTION_GPU_UTIL:-0.7}
       - --enable-prefix-caching
-      # 休眠模式：WebUI 右上角「VRAM」可讓 JoyCaption 休眠（模型移到系統記憶體、釋放 VRAM），標註時自動喚醒
+      # 休眠模式：WebUI 右上角「VRAM」可讓 JoyCaption 休眠（釋放 VRAM；模型移到系統記憶體，或選擇連系統記憶體一起釋放），
+      # 標註時自動喚醒
       - --enable-sleep-mode
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
