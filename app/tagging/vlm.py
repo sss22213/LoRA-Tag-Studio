@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import base64
-import io
 import logging
 import re
 import threading
@@ -19,6 +18,7 @@ from PIL import Image
 
 from ..config import settings
 from ..i18n import t
+from . import cli
 from .postprocess import canon
 
 log = logging.getLogger(__name__)
@@ -123,13 +123,7 @@ def clean_caption(text: str) -> str:
 
 
 def _encode(image: Image.Image) -> str:
-    img = image.convert("RGBA")
-    bg = Image.new("RGB", img.size, (255, 255, 255))
-    bg.paste(img, mask=img.split()[3])
-    bg.thumbnail((settings.vlm_max_side, settings.vlm_max_side), Image.LANCZOS)
-    buf = io.BytesIO()
-    bg.save(buf, format="JPEG", quality=90)
-    return base64.standard_b64encode(buf.getvalue()).decode("ascii")
+    return base64.standard_b64encode(cli._jpeg(image)).decode("ascii")
 
 
 # ---------------------------------------------------------------- OpenAI 相容
@@ -343,12 +337,29 @@ def _caption_anthropic(image: Image.Image, system: str, prompt: str) -> str:
     return "".join(b.text for b in resp.content if b.type == "text")
 
 
+def engine_of(s: dict[str, Any] | None) -> tuple[str, str]:
+    """專案用哪個 VLM：server = 伺服器設定的 VLM_BACKEND；claude / codex = 已登入的 CLI（訂閱帳號）。"""
+    s = s or {}
+    engine = s.get("vlm_engine") or "server"
+    return (engine if engine in cli.ENGINES else "server"), (s.get("vlm_cli_model") or "")
+
+
+def ask_cli(engine: str, model: str, system: str, prompt: str, image: Image.Image | None) -> str:
+    try:
+        return cli.ask(engine, model, system, prompt, image)
+    except cli.CLIError as e:
+        raise VLMError(str(e)) from e
+
+
 def caption_image(image: Image.Image, project: dict[str, Any], hint_tags: list[str] | None = None) -> str:
+    engine, model = engine_of(project)
     backend = settings.vlm_backend
-    if backend in ("", "none", "off"):
+    if engine == "server" and backend in ("", "none", "off"):
         raise VLMError(t("msg.vlm_disabled"))
     system, prompt = build_prompt(project, hint_tags)
-    if backend == "anthropic":
+    if engine != "server":
+        raw = ask_cli(engine, model, system, prompt, image)
+    elif backend == "anthropic":
         raw = _caption_anthropic(image, system, prompt)
     else:
         raw = _caption_openai(image, system, prompt)
@@ -397,12 +408,15 @@ def parse_booru_tags(text: str) -> dict[str, list[str]]:
     return out
 
 
-def tag_image(image: Image.Image) -> dict[str, list[str]]:
-    """用 VLM 產生 Danbooru 標籤（建議 JoyCaption Beta One）。"""
+def tag_image(image: Image.Image, project: dict[str, Any] | None = None) -> dict[str, list[str]]:
+    """用 VLM 產生 Danbooru 標籤（建議 JoyCaption Beta One；也可以用 Claude / Codex CLI）。"""
+    engine, model = engine_of(project)
     backend = settings.vlm_backend
-    if backend in ("", "none", "off"):
+    if engine == "server" and backend in ("", "none", "off"):
         raise VLMError(t("msg.vlm_disabled"))
-    if backend == "anthropic":
+    if engine != "server":
+        raw = ask_cli(engine, model, "You tag images for a text-to-image training dataset.", BOORU_PROMPT, image)
+    elif backend == "anthropic":
         raw = _caption_anthropic(image, "You tag images for a text-to-image training dataset.", BOORU_PROMPT)
     else:
         # 取樣參數照 JoyCaption 官方預設；temperature 0 容易陷入重複

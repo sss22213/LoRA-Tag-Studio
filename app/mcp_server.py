@@ -170,9 +170,31 @@ def start_tagging(project_id: str, only_untagged: bool = True, image_ids: list[s
 
 
 @_tool
+def tag_with_claude_or_codex(project_id: str, engine: str, model: str = "", content: str = "both",
+                             tag_mode: str = "only", image_ids: list[str] | None = None,
+                             only_untagged: bool = False) -> dict[str, Any]:
+    """Tag images directly with the user's logged-in Claude Code (engine=claude) or OpenAI Codex (engine=codex) CLI.
+    content: both | tags | caption (the other one is left as it is). tag_mode: only (tags come from the model, WD14
+    only gives the rating) | merge (together with WD14). The choice is saved in the project settings. Replaced tags
+    and captions can be restored with bulk_edit_tags(action="undo_refine"). Background job; poll get_job_status."""
+    return services.start_ai_tagging(project_id, engine, model, content, tag_mode, image_ids, only_untagged)
+
+
+@_tool
+def refine_captions(project_id: str, engine: str, model: str = "", target: str = "both", instructions: str = "",
+                    image_ids: list[str] | None = None) -> dict[str, Any]:
+    """Correct tags / captions with the user's logged-in Claude Code (engine=claude) or OpenAI Codex (engine=codex)
+    CLI: the model looks at each image, removes wrong tags (not visible, contradicting, another character), adds
+    clearly visible missing ones and fixes the caption. target: both | tags | caption. The project's prune groups,
+    blacklist, trigger and max_tags still apply. Undo with bulk_edit_tags(action="undo_refine"). Background job; poll
+    get_job_status. Default: every tagged image."""
+    return services.start_refine(project_id, engine, image_ids, model, target, instructions)
+
+
+@_tool
 def get_job_status(job_id: str) -> dict[str, Any]:
-    """Progress of a tagging or upscaling job (kind: tag | upscale; status: queued | running | done | cancelled |
-    error)."""
+    """Progress of a tagging, upscaling or correction job (kind: tag | upscale | refine; status: queued | running |
+    done | cancelled | error)."""
     job = jobs.get(job_id)
     if job is None:
         raise ValueError("job not found")
@@ -233,7 +255,8 @@ def restore_upscaled_images(project_id: str, image_ids: list[str] | None = None)
 def bulk_edit_tags(project_id: str, action: str, tags: list[str] | None = None, find: str = "", replace: str = "",
                    image_ids: list[str] | None = None, position: str = "back") -> dict[str, Any]:
     """Bulk edit tags. action: add | remove (supports * wildcard) | replace (find→replace) |
-    reapply (regenerate from WD14 scores with current settings) | filter (apply prune groups + blacklist) | clear_nl."""
+    reapply (regenerate from WD14 scores with current settings) | filter (apply prune groups + blacklist) | clear_nl |
+    undo_refine (restore the tags / caption from before the last refine_captions)."""
     return services.bulk_edit(project_id, action, image_ids, tags, find, replace, position)
 
 

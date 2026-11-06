@@ -491,6 +491,35 @@ def finder_image_update(iid: str, **fields: Any) -> None:
            [fields[k] for k in keys] + [iid])
 
 
+def finder_images_copy(src_session: str, dest_session: str, role: str, rows: list[tuple[str, str, str, float]]) -> int:
+    """從另一個篩選複製圖片。rows = [(來源 id, 新 id, 新路徑, created_at)]。
+    一起複製只跟圖片本身有關的結果（CCIP 特徵、WD14 tag、找重複的指紋、尺寸），不複製和參考圖有關的
+    分數、多人圖的逐人比對，也不複製手動判定。來源讀取失敗的不帶特徵（新的篩選辨識時會再試）。
+    幾萬張也只要一個交易：特徵和指紋直接在 SQLite 裡複製，不經過 Python。"""
+    with _lock:
+        c = connect()
+        c.execute("BEGIN")
+        try:
+            c.execute("CREATE TEMP TABLE IF NOT EXISTS finder_copy_map "
+                      "(src TEXT PRIMARY KEY, id TEXT NOT NULL, path TEXT NOT NULL, created_at REAL NOT NULL)")
+            c.execute("DELETE FROM finder_copy_map")
+            c.executemany("INSERT INTO finder_copy_map VALUES (?,?,?,?)", rows)
+            n = c.execute(
+                """INSERT INTO finder_images (id, session_id, role, original_name, rel_path, path, sha1, width, height,
+                                              feature, feature_model, phash, sig, tags, created_at)
+                   SELECT m.id, ?, ?, s.original_name, s.rel_path, m.path, s.sha1, s.width, s.height,
+                          CASE WHEN s.error IS NULL THEN s.feature END, CASE WHEN s.error IS NULL THEN s.feature_model END,
+                          s.phash, s.sig, s.tags, m.created_at
+                   FROM finder_copy_map m JOIN finder_images s ON s.id = m.src AND s.session_id = ?""",
+                (dest_session, role, src_session)).rowcount
+            c.execute("DELETE FROM finder_copy_map")
+            c.execute("COMMIT")
+        except BaseException:
+            c.execute("ROLLBACK")
+            raise
+    return n
+
+
 def finder_has(session_id: str, role: str, sha1: str | None = None, path: str | None = None) -> bool:
     """同一個篩選、同一個角色裡是否已有這張圖（比對內容雜湊或檔案路徑）。"""
     col, val = ("sha1", sha1) if sha1 else ("path", path)

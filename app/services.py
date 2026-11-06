@@ -63,6 +63,9 @@ def image_out(img: dict[str, Any], s: dict[str, Any]) -> dict[str, Any]:
         "has_blocks": has_blocks(img.get("blocks")),
         "block_tag_applied": bool(block_tags(img, s)),  # caption 已加上白色色塊關鍵字
         "upscale": img.get("upscale"),  # waifu2x 放大 / 降噪紀錄（含原圖尺寸），null = 沒處理過
+        # 上次用 Claude / Codex 修正的紀錄（可以還原），null = 沒修正過
+        "refined": ({k: prev.get(k) for k in ("engine", "model", "changes", "kind", "at")}
+                    if (prev := (img.get("raw") or {}).get("refine_prev")) else None),
         "lossy": _is_lossy(img),  # 目前的檔案有壓縮雜訊（JPEG / 有損 WebP），可以只降噪
         "flag": policy_flag(img["tags"], img.get("rating"), img.get("nl_caption") or ""),
         "image_url": f"/api/images/{img['id']}/file?v={int(img['updated_at'])}",
@@ -126,7 +129,7 @@ def update_project(pid: str, name: str | None = None, patch: dict[str, Any] | No
     if patch:
         if reset_to_profile and patch.get("profile"):
             # 切換底模：套用新底模的預設值，但保留 trigger 等專案資訊
-            keep = {k: s[k] for k in ("trigger", "class_word", "blacklist")}
+            keep = {k: s[k] for k in ("trigger", "class_word", "blacklist", "vlm_engine", "vlm_cli_model")}
             keep.update({k: v for k, v in patch.items() if k in keep})
             s = default_settings(patch["profile"], patch.get("lora_type", s["lora_type"]), **keep)
         else:
@@ -350,6 +353,46 @@ def start_tagging(pid: str, ids: list[str] | None = None, only_untagged: bool = 
     return jobs.submit(pid, [i["id"] for i in imgs]).to_dict()
 
 
+AI_TAG_CONTENTS = ("both", "tags", "caption")
+AI_TAG_MODES = ("only", "merge")
+
+
+def start_ai_tagging(pid: str, engine: str, model: str = "", content: str = "both", tag_mode: str = "only",
+                     ids: list[str] | None = None, only_untagged: bool = False) -> dict[str, Any]:
+    """直接用已登入的 Claude / Codex CLI 標註（背景工作）。
+
+    content：both = 標籤和自然語句；tags / caption = 只產生一種，另一種不動。tag_mode：only = 標籤全部由模型產生
+    （WD14 只負責分級）；merge = 和 WD14 的標籤合併。選擇會存進專案設定：之後加入的圖片用同一個引擎，
+    「重新套用」也不會把模型產生的標籤換回 WD14 的。原本的內容會留著，可以還原。"""
+    from .tagging import cli
+
+    p = require_project(pid)
+    st = cli.status().get(engine)
+    if st is None:
+        raise BadRequest(t("msg.cli_bad_engine", engines=", ".join(cli.ENGINES)))
+    if not st["available"]:
+        raise BadRequest(t(f"msg.cli_{st['reason']}", engine=engine))
+    if content not in AI_TAG_CONTENTS or tag_mode not in AI_TAG_MODES:
+        raise BadRequest(t("msg.ai_tag_bad_option", contents=", ".join(AI_TAG_CONTENTS), modes=", ".join(AI_TAG_MODES)))
+    s = normalize_settings(p["settings"])
+    if content != "tags" and s["caption_mode"] not in ("natural", "hybrid"):
+        raise BadRequest(t("msg.ai_tag_no_caption"))
+    imgs = db.list_images(pid, ids=ids)
+    if only_untagged:
+        imgs = [i for i in imgs if i["status"] in ("pending", "error")]
+    if not imgs:
+        raise BadRequest(t("msg.ai_tag_nothing"))
+    model = model or cli.default_model(engine)
+    patch: dict[str, Any] = {"vlm_engine": engine, "vlm_cli_model": model}
+    if content != "caption":
+        patch["vlm_tags"] = tag_mode
+    if content != "tags":
+        patch["use_vlm"] = True
+    update_project(pid, patch=patch)
+    params = {"engine": engine, "model": model, "only": None if content == "both" else content}
+    return jobs.submit(pid, [i["id"] for i in imgs], params=params).to_dict()
+
+
 def tag_stats(pid: str) -> dict[str, Any]:
     require_project(pid)
     imgs = db.list_images(pid)
@@ -367,7 +410,7 @@ def tag_stats(pid: str) -> dict[str, Any]:
     }
 
 
-BULK_ACTIONS = ("add", "remove", "replace", "reapply", "filter", "clear_nl")
+BULK_ACTIONS = ("add", "remove", "replace", "reapply", "filter", "clear_nl", "undo_refine")
 
 
 def bulk_actions_view() -> dict[str, str]:
@@ -405,11 +448,40 @@ def bulk_edit(pid: str, action: str, ids: list[str] | None = None, tags: Iterabl
             new = apply_filters(old, s)
         elif action == "clear_nl":
             nl = ""
+        elif action == "undo_refine":  # 還原上次 Claude / Codex 的修正
+            prev = (img.get("raw") or {}).get("refine_prev")
+            if not prev:
+                continue
+            raw = {k: v for k, v in img["raw"].items() if k != "refine_prev"}
+            db.update_image(img["id"], tags=prev["tags"], nl_caption=prev["nl_caption"], raw=raw)
+            changed += 1
+            continue
         if new != old or nl != img["nl_caption"]:
             db.update_image(img["id"], tags=new, nl_caption=nl)
             changed += 1
     db.touch_project(pid)
     return {"action": action, "changed": changed}
+
+
+def start_refine(pid: str, engine: str, ids: list[str] | None = None, model: str = "", target: str = "both",
+                 instructions: str = "") -> dict[str, Any]:
+    """用已登入的 Claude / Codex CLI 看圖修正標註（背景工作）。預設處理所有標註完成的圖片。"""
+    from .tagging import cli, refine
+
+    p = require_project(pid)
+    st = cli.status().get(engine)
+    if st is None:
+        raise BadRequest(t("msg.cli_bad_engine", engines=", ".join(cli.ENGINES)))
+    if not st["available"]:
+        raise BadRequest(t(f"msg.cli_{st['reason']}", engine=engine))
+    if target not in refine.TARGETS:
+        raise BadRequest(t("msg.refine_bad_target", targets=", ".join(refine.TARGETS)))
+    imgs = [i for i in db.list_images(pid, ids=ids) if i["status"] == "done" and (i["tags"] or i["nl_caption"])]
+    if not imgs:
+        raise BadRequest(t("msg.refine_nothing"))
+    params = {"engine": engine, "model": model or cli.default_model(engine), "target": target,
+              "instructions": (instructions or "").strip()[:2000]}
+    return jobs.submit(p["id"], [i["id"] for i in imgs], kind="refine", params=params).to_dict()
 
 
 def captions(pid: str, limit: int = 1000, offset: int = 0) -> dict[str, Any]:

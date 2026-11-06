@@ -24,7 +24,7 @@ class Job:
     id: str
     project_id: str
     image_ids: list[str]
-    kind: str = "tag"  # tag：標註 | upscale：waifu2x 放大
+    kind: str = "tag"  # tag：標註 | upscale：waifu2x 放大 | refine：用 Claude / Codex 修正標註
     params: dict[str, Any] = field(default_factory=dict)
     status: str = "queued"  # queued | running | done | cancelled | error
     done: int = 0
@@ -159,7 +159,13 @@ def _process_one(job: Job, project_settings: dict[str, Any], iid: str) -> None:
     try:
         im = storage.load_image(img)
         with use_lang(job.lang):  # 執行緒池不繼承 contextvars，明確設定
-            fields = tag_pil(im, project_settings, prev=img)
+            fields = tag_pil(im, project_settings, prev=img, only=job.params.get("only"))
+        engine = job.params.get("engine")
+        if engine and fields["status"] == "done" and (img["tags"] or img["nl_caption"]):
+            # 用 Claude / Codex 標註會蓋掉原本的內容：留一份，可以和修正一樣還原
+            fields["raw"] = {**(fields["raw"] or {}), "refine_prev": {
+                "tags": img["tags"], "nl_caption": img["nl_caption"], "engine": engine,
+                "model": job.params.get("model", ""), "changes": "", "kind": "tag", "at": time.time()}}
         db.update_image(iid, **fields)
         error = fields["error"] if fields["status"] == "error" else None
     except Exception as e:  # noqa: BLE001
@@ -210,7 +216,7 @@ def _run(job: Job) -> None:
     s = normalize_settings(project["settings"])
     job.status, job.started_at = "running", time.time()
     job.say("msg.job_processing")
-    done_key = {"tag": "msg.job_done", "upscale": "msg.upscale_done"}[job.kind]
+    done_key = {"tag": "msg.job_done", "upscale": "msg.upscale_done", "refine": "msg.refine_done"}[job.kind]
     if job.kind == "upscale" and job.params.get("scale") == "1":
         done_key = "msg.denoise_done"
     try:
@@ -219,6 +225,8 @@ def _run(job: Job) -> None:
 
             with use_lang(job.lang):
                 upscale.run_job(job)
+        elif job.kind == "refine":
+            _run_refine(job, s, project["name"])
         else:
             _run_tagging(job, s)
         if job.cancel_event.is_set():
@@ -226,10 +234,11 @@ def _run(job: Job) -> None:
             job.say("msg.job_cancelled")
         else:
             job.status = "done"
+            changed = job.params.get("changed", 0)  # refine：有修改的張數
             if job.failed:
-                job.say(f"{done_key}_failed", ok=job.done - job.failed, failed=job.failed)
+                job.say(f"{done_key}_failed", ok=job.done - job.failed, failed=job.failed, changed=changed)
             else:
-                job.say(done_key, ok=job.done)
+                job.say(done_key, ok=job.done, changed=changed)
     except Exception as e:  # noqa: BLE001
         log.exception("工作失敗")
         job.status, job.message_key, job.message_raw = "error", "", str(e)
@@ -244,8 +253,8 @@ def _run(job: Job) -> None:
 
 
 def _run_tagging(job: Job, s: dict[str, Any]) -> None:
-    # 第一次使用時會下載模型，先在主執行緒載入以取得清楚的錯誤訊息
-    if s.get("use_wd14", True):
+    # 第一次使用時會下載模型，先在主執行緒載入以取得清楚的錯誤訊息（只補自然語句時通常用不到 WD14）
+    if s.get("use_wd14", True) and job.params.get("only") != "caption":
         job.say("msg.job_loading_model")
         from .tagging.wd14 import get_tagger
 
@@ -253,6 +262,47 @@ def _run_tagging(job: Job, s: dict[str, Any]) -> None:
         job.say("msg.job_processing")
     with ThreadPoolExecutor(max_workers=settings.tag_concurrency) as pool:
         list(pool.map(lambda iid: _process_one(job, s, iid), job.image_ids))
+
+
+def _refine_one(job: Job, s: dict[str, Any], project_name: str, iid: str) -> None:
+    """用 Claude / Codex 修正一張圖的標註；修正前的內容存在 raw["refine_prev"]（可以還原）。失敗時不動原本的標註。"""
+    from .tagging import refine
+
+    if job.cancel_event.is_set():
+        return
+    img = db.get_image(iid)
+    if img is None:
+        return
+    db.set_status([iid], "processing")
+    p = job.params
+    error = None
+    try:
+        im = storage.load_image(img)
+        with use_lang(job.lang):
+            r = refine.refine_image(im, img, s, project_name, p["engine"], p.get("model", ""), p.get("target", "both"),
+                                    p.get("instructions", ""))
+        if r["tags"] != img["tags"] or r["nl_caption"] != img["nl_caption"]:
+            raw = dict(img.get("raw") or {})
+            raw["refine_prev"] = {"tags": img["tags"], "nl_caption": img["nl_caption"], "engine": p["engine"],
+                                  "model": p.get("model", ""), "changes": r["changes"], "kind": "refine",
+                                  "at": time.time()}
+            db.update_image(iid, tags=r["tags"], nl_caption=r["nl_caption"], raw=raw)
+            with _lock:
+                p["changed"] = p.get("changed", 0) + 1
+    except Exception as e:  # noqa: BLE001  單張失敗不影響其他張，也不改那張的狀態
+        log.warning("修正標註失敗 %s：%s", iid, e)
+        error = str(e)
+    db.restore_status([iid])
+    with _lock:
+        job.done += 1
+        if error is not None:
+            job.failed += 1
+            job.errors.append({"image_id": iid, "file": img["original_name"], "error": error})
+
+
+def _run_refine(job: Job, s: dict[str, Any], project_name: str) -> None:
+    with ThreadPoolExecutor(max_workers=settings.tag_concurrency) as pool:
+        list(pool.map(lambda iid: _refine_one(job, s, project_name, iid), job.image_ids))
 
 
 def _loop() -> None:

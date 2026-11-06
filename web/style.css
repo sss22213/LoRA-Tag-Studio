@@ -456,6 +456,13 @@ a.cv-active-item:hover { border-color: var(--accent); }
 .fd-ptag.inc { color: var(--ok); border-color: rgba(62, 207, 142, .45); }
 .fd-ptag.exc { color: var(--err); border-color: rgba(243, 85, 90, .45); }
 /* 多人圖 */
+.fd-copy p { margin-top: 0; }
+.fd-copy-list { display: flex; flex-direction: column; gap: 4px; max-height: 50vh; overflow-y: auto; margin-bottom: 10px; }
+.fd-copy-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; min-width: 0; }
+.fd-copy-item:hover { background: var(--panel-2); }
+.fd-copy-item:has(input:checked) { border-color: var(--accent); }
+.fd-copy-item .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.fd-copy-item .muted { white-space: nowrap; font-size: 12.5px; }
 .fd-people { display: flex; flex-direction: column; gap: 10px; }
 .fd-people p { margin: 0; }
 .fd-people .seg { display: inline-flex; flex-wrap: wrap; gap: 4px; }
@@ -549,3 +556,6 @@ a.cv-active-item:hover { border-color: var(--accent); }
   .smb-browse { flex: none; }
   .smb-list { overflow: visible; min-height: 0; }
 }
+.badge.ai { background: rgba(167, 139, 250, .18); color: var(--accent); }
+.refine p { margin-top: 0; }
+.refine .seg { display: inline-flex; flex-wrap: wrap; gap: 4px; }

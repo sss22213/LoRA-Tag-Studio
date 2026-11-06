@@ -208,13 +208,14 @@ NAS 或 Windows 分享資料夾裡的圖片，可以由伺服器直接讀取，�
   - SMB 伺服器（只記路徑，見[SMB 伺服器](#smb-伺服器nas--分享資料夾)）
   - 伺服器匯入資料夾 `./import`（只記路徑，不複製）
   - 既有專案的圖片（用硬連結，不多佔空間）
+- **重用其他篩選的圖片**：同一部作品換角色找時，「要篩選的圖片」用「＋ 加入 → 從其他篩選」加進來。CCIP 特徵（兩邊同一個模型時）、WD14 tag、找重複的指紋一起帶過來，只要再算參考圖：25,000 張約 5 秒加完，結果和原本的篩選一樣。分數、多人圖和手動 ✓ ✕ 跟參考圖有關，不會帶過來；已經有的圖會略過；上傳的圖用硬連結，刪掉原本的篩選也不影響。
 - 特徵會存起來，所以調門檻是即時的，加入新圖片也只算新的那幾張。參考圖或排除參考圖改變時，特徵可以沿用，但要重新辨識；換模型則全部重算。
 - **準確度**：在作者的動畫截圖資料集上測試，包含同系列 5 個長得像的角色和另一部作品的 1 個角色。每個角色只給 1–5 張參考圖，單人圖的辨識正確率是 99.7%；WD14 認不出的圖也能找回約三分之二。
 - **限制**：CCIP 是整張圖比對。人物很小、多人同框，或畫面大半被白色色塊蓋住的圖，可能漏掉或認錯。沒有測過原創角色和很新的角色。
 - **速度與 VRAM**：RTX 5090 每張約 35 ms（大多花在讀圖），CPU 約 130 ms。工作結束時自動釋放模型；產生 tag 時會暫時載入 WD14，原本沒載入的話結束時一起釋放。和標註、放大共用同一個工作佇列，不會同時跑。「開始辨識」旁邊有和右上角相同的 VRAM 選單；勾選「辨識前先釋放其他模型的 VRAM」，開始前會釋放 WD14、waifu2x，並讓 JoyCaption 休眠。
 - **模型**：[deepghs/ccip_onnx](https://huggingface.co/deepghs/ccip_onnx)（OpenRAIL 授權），第一次使用時從 Hugging Face 下載。
 - **檔案**：上傳的圖片存在 `data/finder/<id>/`，刪除篩選時一起刪除；伺服器匯入資料夾裡的原檔不會動。
-- **API**：`POST /api/finder`、`POST /api/finder/{id}/upload?role=ref|neg|pool`、`/import-server`、`/import-project`、`/run`（`tags: true` 同時產生 tag）、`/manual`、`PATCH /api/finder/{id}`（`tag_filter`）、`GET /duplicates?threshold=1–16&scope=all|matches`、`/hash`、`PATCH` 的 `people_mode`（`off` / `crop` / `mask`）、`people_min_side`、`people_recover` 與 `POST /people`（多人圖）、`/download`、`/to-project`，詳見 `/docs`。
+- **API**：`POST /api/finder`、`POST /api/finder/{id}/upload?role=ref|neg|pool`、`/import-server`、`/import-project`、`/import-finder`（`source_id`：重用其他篩選的圖片）、`/run`（`tags: true` 同時產生 tag）、`/manual`、`PATCH /api/finder/{id}`（`tag_filter`）、`GET /duplicates?threshold=1–16&scope=all|matches`、`/hash`、`PATCH` 的 `people_mode`（`off` / `crop` / `mask`）、`people_min_side`、`people_recover` 與 `POST /people`（多人圖）、`/download`、`/to-project`，詳見 `/docs`。
 
 ## 用 VLM 產生 Danbooru 標籤（JoyCaption）
 
@@ -232,6 +233,22 @@ JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danboor
 - 畫師標籤預設不採用（「採用 VLM 判斷的畫師標籤」）；Anima 會自動加上 `@`。
 - VLM 標籤沒有信心分數，門檻只套用在 WD14。動漫圖通常仍以 WD14 為主；VLM 標籤適合 WD14 不認得的新角色或冷門概念。
 - REST `POST /api/quick-tag(/json)` 與 MCP `quick_tag_image` 可帶 `vlm_tags`；專案設定可用 `update_project_settings` 修改。
+
+## Claude / Codex（訂閱帳號）
+
+可以用已登入的 **Claude Code**（`claude`）或 **OpenAI Codex**（`codex`）產生或修正標註，用的是你的訂閱帳號，不需要 API 金鑰。
+
+- **標註**：上方的「✦ AI ▾ → 用 Claude / Codex 標註…」，或選取後的「✦ AI 標註」。選引擎和模型、要產生什麼（標籤和自然語句、只有標籤、只有自然語句，另一種不動）、標籤來源（只用 AI，WD14 只負責分級；或 AI 和 WD14 合併）和範圍。選擇會存進專案設定（「自然語言描述 (VLM)」→「VLM 引擎」），之後加入的圖片和「▶ 標註未完成」都用同一個引擎。用動畫截圖測試，Claude 每張約 4 秒、37–38 個標籤，Codex 約 10 秒、27–29 個，兩者都認對了角色和作品。被取代的內容可以還原。每張約 5–20 秒（同時產生標籤和自然語句會呼叫兩次，一次處理 `TAG_CONCURRENCY` 張），會用到訂閱的額度。
+- **修正**：「✦ AI ▾ → 用 Claude / Codex 修正標註…」，或選取後的「✦ AI 修正」。模型會看每張圖和目前的標籤、自然語句：拿掉錯的標籤（看不到、互相矛盾、別的角色，例如露西亞資料集裡的 `sinon`）、補上明顯漏掉的，並修正自然語句（例如混進去的「Reference tags: …」）。可以選只修標籤、只修自然語句或兩者，也可以加上自己的指示。結果一樣會套用專案的修剪群組、黑名單、觸發詞和數量上限，刻意拿掉的特徵不會被加回去。修正過的圖片卡片會有 ✦，滑上去可以看到模型改了什麼；「✦ AI ▾ → 還原上次 AI 標註 / 修正」可以改回原本的內容。
+- **設定（Docker）**：先在主機上登入（`claude`、`codex`），在 `.env` 加上這兩行（絕對路徑），再重建 app：
+  ```bash
+  CLAUDE_CREDS_DIR=/home/<你>/.claude
+  CODEX_CREDS_DIR=/home/<你>/.codex
+  ```
+  映像檔裡會安裝 Claude Code CLI；Codex 的執行檔用掛進來的 `~/.codex` 裡的。這兩個資料夾以讀寫掛載，才能更新登入權杖；CLI 會以這兩個資料夾擁有者的身分執行，檔案不會變成 root 的。
+- **安全**：Claude 關掉所有工具（`--tools ""`）並用 `--safe-mode`（不載入你設定裡的 hooks、MCP 伺服器、外掛和 CLAUDE.md）；Codex 用唯讀沙箱、關掉內建工具並加上 `--ignore-user-config`。它們只看得到圖片和提示。
+- Claude 和 Codex 可能拒絕描述成人內容，被拒絕的圖片會標成失敗；NSFW 資料集請用 JoyCaption。
+- API：`POST /api/projects/{id}/ai-tag`（`engine`、`model`、`content`、`tag_mode`、`ids`、`only_untagged`）、`POST /api/projects/{id}/refine`（`engine`、`model`、`target`、`instructions`、`ids`）、`POST /bulk` 的 `undo_refine`；`GET /api/system` → `cli` 顯示兩個 CLI 有沒有安裝、登入，以及可選的模型。MCP 工具 `tag_with_claude_or_codex`、`refine_captions`。
 
 ## 釋放 VRAM
 
@@ -335,16 +352,16 @@ claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
 { "mcpServers": { "lora-tag-studio": { "type": "http", "url": "http://localhost:7870/mcp" } } }
 ```
 
-共 27 個工具：
+共 30 個工具：
 
 | 類別 | 工具 |
 |---|---|
 | 底模與快速標註 | `list_profiles`、`get_tagging_guide`、`quick_tag_image` |
 | 專案與匯入 | `list_projects`、`create_project`、`get_project`、`update_project_settings`、`add_images_from_urls`、`list_server_import_folders`、`import_server_folder` |
-| 標註與編輯 | `start_tagging`、`get_job_status`、`list_captions`、`get_image`、`update_image_caption`、`bulk_edit_tags`、`get_tag_stats`、`detect_white_blocks` |
+| 標註與編輯 | `start_tagging`、`get_job_status`、`list_captions`、`get_image`、`update_image_caption`、`bulk_edit_tags`、`get_tag_stats`、`detect_white_blocks`、`tag_with_claude_or_codex`、`refine_captions` |
 | 放大 | `upscale_images`、`restore_upscaled_images` |
 | 匯出 | `export_dataset` |
-| Civitai 訓練 | `get_civitai_training_types`、`prepare_civitai_training`、`get_civitai_preparation`、`submit_civitai_training`、`get_civitai_training`、`list_active_civitai_trainings` |
+| Civitai 訓練 | `get_civitai_training_types`、`prepare_civitai_training`、`get_civitai_preparation`、`submit_civitai_training`、`get_civitai_training`、`list_active_civitai_trainings`、`import_lora_to_a1111` |
 
 ### REST / OpenAPI
 
@@ -389,6 +406,8 @@ curl -OJ "http://localhost:7870/api/projects/<id>/export?format=civitai"
 | `VLM_BASE_URL` / `VLM_MODEL` / `VLM_API_KEY` | Ollama | OpenAI 相容端點設定 |
 | `VLM_TIMEOUT` | `180` | VLM 請求逾時秒數 |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT` | 空 / `claude-opus-5-5` / `low` | `VLM_BACKEND=anthropic` 時使用（已啟用伺服器端 refusal fallback） |
+| `CLAUDE_CREDS_DIR` / `CODEX_CREDS_DIR` | 空 | 主機上已登入的 Claude Code / Codex 資料夾（`/home/<你>/.claude`、`/home/<你>/.codex`），見 [Claude / Codex](#claude--codex訂閱帳號) |
+| `CLAUDE_MODELS` / `CODEX_MODELS` / `CLI_EFFORT` | `sonnet,opus,haiku,fable` / 讀 Codex 的模型清單 / `low` | Claude / Codex 可選的模型和推理強度 |
 | `ALLOW_PRIVATE_URLS` | `0` | 「從網址匯入」是否允許內網位址（預設關閉以避免 SSRF） |
 | `CIVITAI_API_KEY` | 空 | Civitai 雲端訓練用的金鑰（只留在伺服器端） |
 | `A1111_URL` | 空 | A1111 / Forge 的網址（需要 Forge Neo Chino 的 LoRA 匯入 API），例如 `http://host.docker.internal:7860`；設定後訓練紀錄才有「→ A1111」 |
@@ -426,6 +445,8 @@ app/
   tagging/
     wd14.py          WD14 ONNX 推論
     vlm.py           OpenAI 相容 / Claude 自然語言描述
+    cli.py           用已登入的 Claude Code / Codex CLI 看圖寫字
+    refine.py        用 Claude / Codex 修正既有的標籤與自然語句
     postprocess.py   門檻、排序、修剪群組、黑名單、caption 組合
     blocks.py        白色色塊（遮擋用的白色矩形）偵測
 web/                 WebUI（純 HTML/CSS/JS，無需建置）

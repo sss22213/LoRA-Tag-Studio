@@ -417,6 +417,45 @@ def add_from_project(sid: str, role: str, project_id: str, ids: list[str] | None
     return {"added": added, "skipped": skipped}
 
 
+def add_from_finder(sid: str, source_id: str) -> dict[str, Any]:
+    """把另一個篩選的「要篩選的圖片」加進來（同一部作品換角色找時重用）。CCIP 特徵、WD14 tag、找重複的指紋一起帶過來，
+    新的篩選只要算參考圖；分數、多人圖、手動判定和參考圖有關，不帶。NAS 和伺服器資料夾的圖只記路徑；
+    上傳的圖和縮圖用硬連結（刪掉原本的篩選也不影響）。這裡已經有的圖（同內容或同路徑）略過。"""
+    require_session(sid)
+    if source_id == sid:
+        raise BadRequest(t("msg.finder_copy_self"))
+    require_session(source_id)
+    src = db.finder_images(source_id, role="pool")
+    have = db.finder_images(sid, role="pool")
+    sha1s = {i["sha1"] for i in have if i["sha1"]}
+    paths = {i["path"] for i in have}
+    rows, dup, now = [], 0, time.time()
+    for k, img in enumerate(src):
+        if (img["sha1"] and img["sha1"] in sha1s) or img["path"] in paths:
+            dup += 1
+            continue
+        iid, path = db.new_id(), img["path"]
+        if _owned(img):  # 上傳的圖存在原本篩選的資料夾：連結一份過來
+            dest = session_dir(sid) / f"{iid}{Path(img['path']).suffix}"
+            try:
+                _link_or_copy(Path(img["path"]), dest)
+            except OSError:
+                continue  # 原檔不見了：讀不到的圖不帶
+            path = str(dest)
+        if thumb_path(img).exists():  # 縮圖也沿用，不必再讀一次原圖（NAS 上的圖尤其慢）
+            _link_or_copy(thumb_path(img), session_dir(sid) / "thumbs" / f"{iid}.webp")
+        rows.append((img["id"], iid, path, now + k * 1e-6))  # 保持原本的順序
+        if img["sha1"]:
+            sha1s.add(img["sha1"])
+        paths.add(img["path"])
+    added = db.finder_images_copy(source_id, sid, "pool", rows) if rows else 0
+    after_add(sid, "pool", added)
+    # 特徵能直接用的張數（兩個篩選的 CCIP 模型不同時要重算）
+    model, copied = MODELS[require_session(sid)["model"]], {r[0] for r in rows}
+    reused = sum(1 for i in src if i["id"] in copied and i["feature_model"] == model and not i["error"])
+    return {"added": added, "skipped": [], "duplicates": dup, "reused": reused}
+
+
 # ------------------------------------------------------------------ CCIP
 _lock = threading.Lock()
 _sessions: dict[str, Any] = {}

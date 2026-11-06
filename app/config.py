@@ -52,6 +52,16 @@ class Settings:
         self.anthropic_model = _env("ANTHROPIC_MODEL", "claude-opus-5-5")
         self.anthropic_effort = _env("ANTHROPIC_EFFORT", "low")
 
+        # 用已登入的 Claude Code / Codex CLI（訂閱帳號）產生或修正 caption。容器裡把主機的 ~/.claude、~/.codex
+        # 掛到 CLI_HOME 底下（見 docker-compose.yml）；不在容器裡時用目前使用者的 HOME
+        self.cli_home = _env("CLI_HOME")
+        self.claude_bin = _env("CLAUDE_BIN", "claude")
+        self.codex_bin = _env("CODEX_BIN")  # 空 = PATH 或 ~/.codex/packages 裡的版本
+        self.claude_models = [m.strip() for m in _env("CLAUDE_MODELS", "sonnet,opus,haiku,fable").split(",") if m.strip()]
+        self.codex_models = [m.strip() for m in _env("CODEX_MODELS").split(",") if m.strip()]  # 空 = 讀 Codex 的模型清單
+        self.cli_effort = _env("CLI_EFFORT", "low")  # 推理強度：low 比較快，caption 不需要深思
+        self.cli_timeout = _env_int("CLI_TIMEOUT", 300)
+
         # 同時處理幾張圖（VLM 走網路時可調高）
         self.tag_concurrency = max(1, _env_int("TAG_CONCURRENCY", 2))
         self.max_upload_mb = _env_int("MAX_UPLOAD_MB", 2048)

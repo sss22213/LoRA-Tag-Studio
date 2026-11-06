@@ -27,7 +27,7 @@ from .profiles import (
     lora_types_view,
     profile_view,
 )
-from .tagging import vlm
+from .tagging import cli, vlm
 from .tagging.postprocess import PRUNE_GROUPS
 from .tagging.wd14 import loaded_models, wd14_models_view
 
@@ -225,8 +225,30 @@ class TagRequest(BaseModel):
     only_untagged: bool = Field(False, description="Only tag images that are pending or failed")
 
 
+class AiTagRequest(BaseModel):
+    engine: Literal["claude", "codex"] = Field(..., description="Logged-in CLI to use (the user's subscription): "
+                                                                 "claude = Claude Code, codex = OpenAI Codex")
+    model: str = Field("", description="Model of that CLI (GET /api/system → cli.<engine>.models); empty = default")
+    content: Literal["both", "tags", "caption"] = Field("both", description="What to generate; with tags or caption "
+                                                                            "the other one is left as it is")
+    tag_mode: Literal["only", "merge"] = Field("only", description="only = all tags come from the model (WD14 only "
+                                                                   "gives the rating); merge = together with WD14's")
+    ids: list[str] | None = Field(None, description="Image ids; omit for all images")
+    only_untagged: bool = Field(False, description="Only images that are pending or failed")
+
+
+class RefineRequest(BaseModel):
+    engine: Literal["claude", "codex"] = Field(..., description="Logged-in CLI to use (the user's subscription): "
+                                                                 "claude = Claude Code, codex = OpenAI Codex")
+    model: str = Field("", description="Model of that CLI (GET /api/system → cli.<engine>.models); empty = default")
+    ids: list[str] | None = Field(None, description="Image ids; omit for every tagged image in the project")
+    target: Literal["both", "tags", "caption"] = Field("both", description="What to correct: tags, the natural "
+                                                                         "language caption, or both")
+    instructions: str = Field("", max_length=2000, description="Extra instructions, e.g. 'the character is not sinon'")
+
+
 class BulkRequest(BaseModel):
-    action: Literal["add", "remove", "replace", "reapply", "filter", "clear_nl"]
+    action: Literal["add", "remove", "replace", "reapply", "filter", "clear_nl", "undo_refine"]
     ids: list[str] | None = Field(None, description="Image ids; omit for all images in the project")
     tags: list[str] | str | None = Field(None, description="Tags for add/remove (remove supports * wildcards)")
     find: str = Field("", description="Tag to find (replace action)")
@@ -336,6 +358,7 @@ def system_info() -> dict[str, Any]:
         "wd14": {"default_model": settings.wd14_default_model, "models": wd14_models_view(), "loaded": loaded_models(),
                  "available_providers": providers, "device": settings.ort_device},
         "vlm": vlm.status(),
+        "cli": cli.status(),
         "civitai": civitai.info(),
         "a1111": {"configured": a1111.configured(), "subfolder": settings.a1111_lora_subfolder},
         "lora_types": lora_types_view(),
@@ -541,6 +564,29 @@ def tag(pid: str, body: TagRequest | None = None) -> dict[str, Any]:
     return services.start_tagging(pid, body.ids, body.only_untagged)
 
 
+@router.post("/projects/{pid}/ai-tag", operation_id="tag_with_claude_or_codex",
+             summary="Tag images directly with the logged-in Claude Code or Codex CLI (background job)",
+             description="Generates Danbooru tags and / or the natural-language caption. The choice is saved in the "
+                         "project settings (vlm_engine, vlm_cli_model, vlm_tags, use_vlm), so images added later use "
+                         "the same engine. Existing tags and captions that get replaced are kept and can be restored "
+                         "with POST /bulk action=undo_refine. Uses the user's subscription. Poll GET /api/jobs/{job_id}")
+def ai_tag(pid: str, body: AiTagRequest) -> dict[str, Any]:
+    return services.start_ai_tagging(pid, body.engine, body.model, body.content, body.tag_mode, body.ids,
+                                     body.only_untagged)
+
+
+@router.post("/projects/{pid}/refine", operation_id="refine_captions",
+             summary="Correct the tags / captions with the logged-in Claude Code or Codex CLI (background job)",
+             description="The model looks at each image with its current tags and caption, removes wrong tags (not "
+                         "visible, contradicting, another character), adds clearly visible missing ones and fixes the "
+                         "caption. The result goes through the project's prune groups, blacklist, trigger and max_tags, "
+                         "so removed traits are not added back. The previous tags / caption are kept and can be "
+                         "restored with POST /bulk action=undo_refine. Uses the user's subscription; about 5-10 s per "
+                         "image. Poll GET /api/jobs/{job_id}")
+def refine_captions(pid: str, body: RefineRequest) -> dict[str, Any]:
+    return services.start_refine(pid, body.engine, body.ids, body.model, body.target, body.instructions)
+
+
 @router.post("/projects/{pid}/upscale", operation_id="upscale_images",
              summary="Upscale low-resolution images, or only remove JPEG noise (scale=1), with waifu2x "
                      "(background job, poll GET /api/jobs/{id})",
@@ -625,6 +671,22 @@ def finder_import_server(sid: str, body: FinderServerImport) -> dict[str, Any]:
              summary="Add images of a project")
 def finder_import_project(sid: str, body: FinderProjectImport) -> dict[str, Any]:
     return finder.add_from_project(sid, body.role, body.project_id, body.ids)
+
+
+class FinderCopyPool(BaseModel):
+    source_id: str = Field(..., description="Character search whose images to search (pool) are added to this one")
+
+
+@router.post("/finder/{sid}/import-finder", operation_id="copy_character_search_pool",
+             summary="Reuse the images to search (pool) of another character search",
+             description="For searching another character in the same images. CCIP features (when both searches use "
+                         "the same model), WD14 tags and duplicate fingerprints come along, so only the references "
+                         "need processing; scores, group-shot results and manual marks depend on the references and "
+                         "are not copied. SMB / server-folder images keep their path, uploaded images and thumbnails "
+                         "are hard-linked. Images already in this search are skipped (duplicates). Returns added, "
+                         "duplicates and reused (images whose features can be used as they are).")
+def finder_import_finder(sid: str, body: FinderCopyPool) -> dict[str, Any]:
+    return finder.add_from_finder(sid, body.source_id)
 
 
 @router.post("/finder/{sid}/images/delete", operation_id="remove_character_search_images")

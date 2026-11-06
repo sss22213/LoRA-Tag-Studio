@@ -41,10 +41,19 @@ services:
       A1111_URL: ${A1111_URL:-}
       A1111_LORA_SUBFOLDER: ${A1111_LORA_SUBFOLDER:-LoRA-Tag-Studio}
       A1111_API_AUTH: ${A1111_API_AUTH:-}
+      # Claude / Codex CLI（VLM 引擎選 Claude 或 Codex 時）：可選的模型、推理強度
+      CLAUDE_MODELS: ${CLAUDE_MODELS:-sonnet,opus,haiku,fable}
+      CODEX_MODELS: ${CODEX_MODELS:-}
+      CLI_EFFORT: ${CLI_EFFORT:-low}
     volumes:
       - ./data:/data              # 專案、圖片、標註資料庫、匯出 zip
       - ./import:/import:ro       # 伺服器資料夾匯入（把圖片資料夾放這裡）
       - models:/models            # WD14 模型快取
+      # Claude / Codex CLI：把主機「已登入」的 ~/.claude、~/.codex 掛進來（讀寫，更新登入權杖用）。
+      # 在 .env 設 CLAUDE_CREDS_DIR=/home/<你>/.claude、CODEX_CREDS_DIR=/home/<你>/.codex（用 sudo 執行時請用絕對路徑）；
+      # 沒設定就掛空資料夾，這兩個引擎會顯示為不能用
+      - ${CLAUDE_CREDS_DIR:-./docker/cli-empty/claude}:/cli-home/.claude
+      - ${CODEX_CREDS_DIR:-./docker/cli-empty/codex}:/cli-home/.codex
 
   # ---------------------------------------------------------------- 本機 VLM（一般用途）
   ollama:

@@ -67,6 +67,8 @@ BASE_SETTINGS: dict[str, Any] = {
     "nl_position": "before_tags",  # hybrid 模式：自然語句在標籤前或後
     "vlm_tags": "off",  # 用 VLM（JoyCaption 的 Danbooru 模式）產生標籤：off | extra | merge | only
     "vlm_artist_tags": False,  # 是否採用 VLM 判斷的畫師標籤（常猜錯，預設不用）
+    "vlm_engine": "server",  # server = 伺服器設定的 VLM（JoyCaption / Ollama / Claude API）；claude / codex = 已登入的 CLI
+    "vlm_cli_model": "",  # claude / codex 用的模型，空 = 預設（claude：sonnet；codex：清單第一個）
 }
 
 # LoRA 類型 → 建議修剪的特徵群組（文字在 server.lora_types）
@@ -81,6 +83,7 @@ CAPTION_MODES = ("tags", "natural", "hybrid", "trigger_only")
 # VLM 標籤模式：off 只用 WD14；extra 加入 VLM 的角色 / 作品 / 畫師；merge 再加入 VLM 的一般標籤；
 # only 只用 VLM 的標籤（WD14 若開啟只用來判斷分級）
 VLM_TAG_MODES = ("off", "extra", "merge", "only")
+VLM_ENGINES = ("server", "claude", "codex")
 
 # 各架構文字編碼器一次讀取的 token 數（CLIP 75；T5 / Qwen3 512），WebUI 用來提示 caption 是否過長
 FAMILY_TOKEN_LIMITS = {"sd15": 75, "sdxl": 75, "anima": 512, "flux": 512}
@@ -311,6 +314,9 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
         s["caption_mode"] = "tags"
     if s["vlm_tags"] not in VLM_TAG_MODES:
         s["vlm_tags"] = "off"
+    if s["vlm_engine"] not in VLM_ENGINES:
+        s["vlm_engine"] = "server"
+    s["vlm_cli_model"] = str(s["vlm_cli_model"] or "").strip()
     for k in ("general_threshold", "character_threshold"):
         s[k] = min(1.0, max(0.0, float(s[k])))
     s["max_tags"] = max(0, int(s["max_tags"]))

@@ -497,6 +497,7 @@ async function renderProject(pid) {
         <button class="btn" id="btnFolder">${esc(t('ws.upload_folder'))}</button>
         <div class="dropdown"><button class="btn" id="btnMoreImport">${esc(t('ws.more_import'))} ▾</button></div>
         <div class="dropdown split"><button class="btn primary" id="btnTag">▶ ${esc(t('ws.tag_remaining'))}</button><button class="btn primary" id="btnTagMenu">▾</button></div>
+        <div class="dropdown"><button class="btn" id="btnAi" title="${esc(t('ai.button_help'))}">✦ ${esc(t('ai.button'))} ▾</button></div>
         <button class="btn" id="btnExport">⬇ ${esc(t('ws.export'))}</button>
         <button class="btn" id="btnCivitai">☁ ${esc(t('ws.civitai'))}</button>
         <div class="dropdown"><button class="icon-btn" id="btnProjMenu" title="${esc(t('ws.project_menu'))}">⋯</button></div>
@@ -567,6 +568,14 @@ async function renderProject(pid) {
   $('#btnExport').onclick = exportDialog;
   $('#btnCivitai').onclick = () => civitaiDialog();
   updateCivitaiButton();
+  $('#btnAi').onclick = (e) => {
+    const sel = state.selected.size ? [...state.selected] : null;
+    dropdown(e.currentTarget, [
+      { label: t('ai.menu'), help: t('ai.menu_help'), onClick: () => aiTagDialog(sel) },
+      { label: t('refine.menu'), help: t('refine.menu_help'), onClick: () => refineDialog(sel) },
+      { label: t('refine.undo_all'), help: t('refine.undo_help'), onClick: () => undoRefine(sel) },
+    ]);
+  };
   $('#btnProjMenu').onclick = (e) => dropdown(e.currentTarget, [
     { label: t('menu.rename'), onClick: renameProject },
     { label: t('menu.copy_api'), help: t('menu.copy_api_help'), onClick: () => copyText(`curl ${location.origin}/api/projects/${state.project.id}/captions`) },
@@ -640,7 +649,7 @@ function filteredImages() {
 const cardCache = new Map();
 function cardFor(img) {
   const sig = [img.thumb_url, img.status, img.caption, img.rating, img.flag, img.error, img.has_blocks, img.block_tag_applied,
-    img.upscale?.at, state.selected.has(img.id)].join('|');
+    img.upscale?.at, img.refined?.at, state.selected.has(img.id)].join('|');
   const cached = cardCache.get(img.id);
   if (cached && cached.sig === sig) return cached.el;
   const el = h(`<div class="card ${state.selected.has(img.id) ? 'selected' : ''}" data-id="${img.id}" data-rating="${esc(img.rating || '')}">
@@ -648,7 +657,8 @@ function cardFor(img) {
       <div class="sel"><input type="checkbox" ${state.selected.has(img.id) ? 'checked' : ''}></div>
       <div class="tl">${img.has_blocks ? `<span class="badge blk ${img.block_tag_applied ? 'ok' : ''}" title="${esc(img.block_tag_applied
     ? t('blocks.card_applied', { tag: state.project.settings.block_tag }) : t('blocks.card_title'))}">▭${img.block_tag_applied ? '✓' : ''}</span>` : ''}${img.upscale
-    ? `<span class="badge up" title="${esc(upscaledNote(img))}">${upscaledBadge(img)}</span>` : ''}${img.rating && img.rating !== 'general' ? ratingBadge(img.rating) : ''}<span class="st ${img.status}" title="${esc(statusName(img.status))}${img.error ? ': ' + esc(img.error) : ''}"></span></div>
+    ? `<span class="badge up" title="${esc(upscaledNote(img))}">${upscaledBadge(img)}</span>` : ''}${img.refined
+    ? `<span class="badge ai" title="${esc(t(img.refined.kind === 'tag' ? 'ai.card' : 'refine.card', { engine: t(`settings.vlm_engine_${img.refined.engine}`), changes: img.refined.changes || '' }))}">✦</span>` : ''}${img.rating && img.rating !== 'general' ? ratingBadge(img.rating) : ''}<span class="st ${img.status}" title="${esc(statusName(img.status))}${img.error ? ': ' + esc(img.error) : ''}"></span></div>
       ${img.flag ? `<div class="flag" title="${esc(img.flag)}">⚠ ${esc(t('gallery.will_exclude'))}</div>` : ''}
       <div class="cap" title="${esc(img.caption)}">${img.caption ? esc(img.caption) : `<i>${esc(img.original_name)}</i>`}</div>
     </div>`);
@@ -674,10 +684,11 @@ function renderGallery() {
     gal.innerHTML = `<div class="upload-empty">
       <h2>${esc(t('gallery.empty_title'))}</h2>
       <p>${esc(t('gallery.empty_desc'))}</p>
-      <div class="row"><button class="btn primary" id="emptyFiles">${esc(t('gallery.choose_images'))}</button><button class="btn" id="emptyFolder">${esc(t('gallery.choose_folder'))}</button><button class="btn" id="emptyServer">${esc(t('gallery.server_folder'))}</button></div></div>`;
+      <div class="row"><button class="btn primary" id="emptyFiles">${esc(t('gallery.choose_images'))}</button><button class="btn" id="emptyFolder">${esc(t('gallery.choose_folder'))}</button><button class="btn" id="emptyServer">${esc(t('gallery.server_folder'))}</button><button class="btn" id="emptySmb" title="${esc(t('smb.menu_help_project'))}">${esc(t('gallery.smb'))}</button></div></div>`;
     $('#emptyFiles').onclick = () => $('#fileInput').click();
     $('#emptyFolder').onclick = () => $('#folderInput').click();
     $('#emptyServer').onclick = serverImportDialog;
+    $('#emptySmb').onclick = () => smbDialog({ kind: 'project', projectId: state.project.id });
   } else {
     gal.replaceChildren(...list.map(cardFor));
     if (!list.length) gal.append(h(`<div class="upload-empty">${esc(t('gallery.no_match'))}</div>`));
@@ -703,6 +714,9 @@ function renderBulkBar() {
     <button class="btn sm" data-a="remove">－ ${esc(t('bulk.remove'))}</button>
     <button class="btn sm" data-a="replace">⇄ ${esc(t('bulk.replace'))}</button>
     <button class="btn sm" data-a="tag">▶ ${esc(t('bulk.retag'))}</button>
+    <button class="btn sm" data-a="aitag" title="${esc(t('ai.menu_help'))}">✦ ${esc(t('ai.bulk'))}</button>
+    <button class="btn sm" data-a="refine" title="${esc(t('refine.menu_help'))}">✦ ${esc(t('refine.bulk'))}</button>
+    ${[...state.selected].some((id) => state.images.find((i) => i.id === id)?.refined) ? `<button class="btn sm" data-a="unrefine">↺ ${esc(t('refine.undo'))}</button>` : ''}
     <button class="btn sm" data-a="upscale">⤢ ${esc(t('upscale.bulk'))}</button>
     ${[...state.selected].some((id) => state.images.find((i) => i.id === id)?.upscale) ? `<button class="btn sm" data-a="restore">↺ ${esc(t('upscale.restore'))}</button>` : ''}
     <button class="btn sm danger" data-a="delete">${esc(t('common.delete'))}</button>
@@ -724,6 +738,9 @@ function renderBulkBar() {
       }
       if (a === 'replace') replaceDialog('', ids());
       if (a === 'tag') tagSelected();
+      if (a === 'aitag') aiTagDialog(ids());
+      if (a === 'refine') refineDialog(ids());
+      if (a === 'unrefine') undoRefine(ids());
       if (a === 'upscale') upscaleDialog(ids());
       if (a === 'restore') restoreUpscaled(ids().filter((id) => state.images.find((i) => i.id === id)?.upscale));
       if (a === 'delete') {
@@ -1397,6 +1414,8 @@ const SETTINGS_SECTIONS = () => {
       { key: 'vlm_artist_tags', type: 'check' },
     ] },
     { id: 'vlm', fields: [
+      { key: 'vlm_engine', type: 'select', options: ['server', 'claude', 'codex'].map((k) => [k, vlmEngineLabel(k)]) },
+      { key: 'vlm_cli_model', type: 'cli_model' },
       { key: 'use_vlm', type: 'check', helpParams: { status: vlmStatus } },
       { key: 'vlm_detail', type: 'select', options: ['short', 'medium', 'detailed'].map((k) => [k, t(`settings.detail_${k}`)]) },
       { key: 'vlm_nsfw', type: 'check' },
@@ -1441,6 +1460,8 @@ function fieldHTML(f, s) {
       return `<div class="field"><div class="lbl">${label}<b id="s_${f.key}_v">${Number(v).toFixed(2)}</b></div><input type="range" id="s_${f.key}" value="${v}" min="${f.min}" max="${f.max}" step="${f.step}">${help}</div>`;
     case 'check':
       return `<div class="field"><label class="check"><input type="checkbox" id="s_${f.key}" ${v ? 'checked' : ''}> ${label}</label>${help}</div>`;
+    case 'cli_model': // Claude / Codex 的模型，跟著引擎切換
+      return `<div class="field" id="f_${f.key}" ${s.vlm_engine === 'server' ? 'hidden' : ''}><div class="lbl">${label}</div><select id="s_${f.key}">${cliModelOptions(s.vlm_engine, v)}</select>${help}</div>`;
     case 'multi':
       return `<div class="field"><div class="lbl">${label}</div>${f.options.map(([k, l]) => `<label class="check"><input type="checkbox" data-multi="${f.key}" value="${k}" ${v.includes(k) ? 'checked' : ''}> ${esc(l)}</label>`).join('')}${help}</div>`;
     default: return '';
@@ -1470,7 +1491,13 @@ function settingsWarnings(s) {
   const vlmTags = s.vlm_tags && s.vlm_tags !== 'off';
   if (!s.use_wd14 && !vlmUsed && !vlmTags) return [['err', t('settings.warn_nothing')]];
   const out = [];
-  if ((vlmUsed || vlmTags) && state.system.vlm.backend === 'none') out.push(['warn', t('settings.vlm_server_off')]);
+  const engine = s.vlm_engine || 'server';
+  if ((vlmUsed || vlmTags) && engine === 'server' && state.system.vlm.backend === 'none') out.push(['warn', t('settings.vlm_server_off')]);
+  if (engine !== 'server') {
+    const st = state.system.cli?.[engine];
+    if (st && !st.available) out.push(['warn', t(`settings.cli_${st.reason}`, { engine: vlmEngineLabel(engine) })]);
+    if ((vlmUsed || vlmTags) && s.vlm_nsfw) out.push(['info', t('settings.cli_nsfw')]);
+  }
   if (s.use_vlm && !vlmUsed) out.push(['warn', t('settings.warn_vlm_ignored')]);
   if (s.include_rating && !s.use_wd14) out.push(['warn', t('settings.warn_rating_needs_wd14')]);
   if (s.caption_mode === 'natural' && vlmUsed && (s.use_wd14 || vlmTags)) out.push(['info', t('settings.warn_natural_tags_unused')]);
@@ -1490,6 +1517,11 @@ function renderSettings(body) {
     $('#setWarn', body).innerHTML = settingsWarnings(readSettings(body)).map(([k, m]) => `<div class="alert ${k}">${esc(m)}</div>`).join('');
   };
   showWarnings();
+  // 換引擎時更新模型清單（伺服器 VLM 沒有可選的模型）
+  $('#s_vlm_engine', body).onchange = (e) => {
+    $('#f_vlm_cli_model', body).hidden = e.target.value === 'server';
+    $('#s_vlm_cli_model', body).innerHTML = cliModelOptions(e.target.value, '');
+  };
   let dirty = false;
   body.oninput = () => { dirty = true; $('#saveSettings', body).textContent = t('settings.save') + ' •'; showWarnings(); };
 
@@ -1524,6 +1556,133 @@ function renderSettings(body) {
       { label: t('settings.clear_nl'), onClick: () => applyBulk('clear_nl', null) },
     ]);
   };
+}
+
+function vlmEngineLabel(k) {
+  if (k === 'server') return t('settings.vlm_engine_server', { model: state.system.vlm.model || state.system.vlm.backend });
+  const st = state.system.cli?.[k];
+  return t(`settings.vlm_engine_${k}`) + (st && !st.available ? ` — ${t(`settings.cli_${st.reason}_short`)}` : '');
+}
+
+function cliModelOptions(engine, value) {
+  const models = state.system.cli?.[engine]?.models || [];
+  const def = models[0]?.name || '';
+  return [['', t('settings.cli_model_default', { model: def })], ...models.map((m) => [m.name, m.label === m.name ? m.name : `${m.name} · ${m.label}`])]
+    .map(([k, l]) => `<option value="${esc(k)}" ${k === (value || '') ? 'selected' : ''}>${esc(l)}</option>`).join('');
+}
+
+// Claude / Codex 的引擎和模型選擇（AI 標註、AI 修正共用）
+function cliPicker() {
+  const cli = state.system.cli || {}, s = state.project.settings;
+  const first = ['claude', 'codex'].find((e) => cli[e]?.available) || 'claude';
+  let engine = ['claude', 'codex'].includes(s.vlm_engine) && cli[s.vlm_engine]?.available ? s.vlm_engine : first;
+  const html = `<div class="field"><div class="lbl">${esc(t('refine.engine'))}</div><div class="seg">${['claude', 'codex'].map((e) => `<button class="btn sm" data-e="${e}" ${cli[e]?.available ? '' : 'disabled'} title="${esc(cli[e]?.available ? '' : t(`settings.cli_${cli[e]?.reason || 'not_installed'}`, { engine: vlmEngineLabel(e) }))}">${esc(t(`settings.vlm_engine_${e}`))}</button>`).join('')}</div></div>
+      <div class="field"><div class="lbl">${esc(t('settings.f.vlm_cli_model'))}</div><select id="rfModel"></select></div>
+      ${!cli.claude?.available && !cli.codex?.available ? `<div class="alert warn">${esc(t('refine.none_available'))}</div>` : ''}`;
+  const bind = (body) => {
+    const draw = () => {
+      $$('[data-e]', body).forEach((b) => b.classList.toggle('active', b.dataset.e === engine));
+      $('#rfModel', body).innerHTML = cliModelOptions(engine, engine === s.vlm_engine ? s.vlm_cli_model : '');
+    };
+    $$('[data-e]', body).forEach((b) => { b.onclick = () => { engine = b.dataset.e; draw(); }; });
+    draw();
+  };
+  return { html, bind, engine: () => engine, ready: () => !!cli[engine]?.available };
+}
+
+// 直接用已登入的 Claude / Codex CLI 標註（背景工作）；ids = null 時可以選未完成或全部
+async function aiTagDialog(ids = null) {
+  const s = state.project.settings;
+  const scopeOf = (scope) => (ids ? state.images.filter((i) => ids.includes(i.id))
+    : scope === 'pending' ? state.images.filter((i) => ['pending', 'error'].includes(i.status)) : state.images);
+  if (!state.images.length) { toast(t('ai.nothing'), 'warn'); return; }
+  const nlUsed = ['natural', 'hybrid'].includes(s.caption_mode);
+  const contents = nlUsed ? ['both', 'tags', 'caption'] : ['tags'];
+  const content0 = s.caption_mode === 'natural' ? 'caption' : nlUsed ? 'both' : 'tags';
+  const pending = scopeOf('pending').length;
+  const picker = cliPicker();
+  const body = h(`<div class="refine">
+      <p>${esc(t('ai.intro'))}</p>
+      ${picker.html}
+      <div class="field"><div class="lbl">${esc(t('ai.content'))}</div><select id="aiContent">${contents.map((k) => `<option value="${k}" ${k === content0 ? 'selected' : ''}>${esc(t(`ai.content_${k}`))}</option>`).join('')}</select>
+        ${nlUsed ? '' : `<div class="help">${esc(t('ai.no_nl'))}</div>`}</div>
+      <div class="field" id="aiSourceBox"><div class="lbl">${esc(t('ai.tag_source'))}</div><select id="aiSource">${['only', 'merge'].map((k) => `<option value="${k}" ${k === (s.vlm_tags === 'merge' ? 'merge' : 'only') ? 'selected' : ''}>${esc(t(`ai.tag_${k}`))}</option>`).join('')}</select></div>
+      ${ids ? '' : `<div class="field"><div class="lbl">${esc(t('ai.scope'))}</div><select id="aiScope">
+        <option value="pending" ${pending ? 'selected' : ''} ${pending ? '' : 'disabled'}>${esc(t('ai.scope_pending', { n: pending }))}</option>
+        <option value="all" ${pending ? '' : 'selected'}>${esc(t('ai.scope_all', { n: state.images.length }))}</option></select></div>`}
+      <div class="alert info" id="aiInfo"></div></div>`);
+  const m = modal({
+    title: t('ai.title'), body,
+    actions: [
+      { label: t('common.cancel'), onClick: (c) => c() },
+      { label: t('ai.start', { n: 0 }), primary: true, onClick: async (close) => {
+        if (!picker.ready()) return;
+        const scope = ids ? null : $('#aiScope', body).value;
+        const job = await api(`/projects/${state.project.id}/ai-tag`, { method: 'POST', body: {
+          engine: picker.engine(), model: $('#rfModel', body).value, content: $('#aiContent', body).value,
+          tag_mode: $('#aiSource', body).value, ids, only_untagged: scope === 'pending' } });
+        close();
+        state.project = await api(`/projects/${state.project.id}`); // 選擇存進了專案設定
+        renderSide();
+        toast(t('ai.started', { n: job.total }), 'ok');
+        watchJob(job.id);
+      } },
+    ],
+  });
+  const btn = $('.modal-foot .primary', m.el);
+  const draw = () => {
+    const content = $('#aiContent', body).value;
+    $('#aiSourceBox', body).hidden = content === 'caption';
+    const list = scopeOf(ids ? null : $('#aiScope', body).value);
+    const replaced = list.filter((i) => (content !== 'caption' && i.tags.length) || (content !== 'tags' && i.nl_caption)).length;
+    btn.textContent = t('ai.start', { n: list.length }); btn.disabled = !list.length;
+    $('#aiInfo', body).textContent = [replaced ? t('ai.replaced', { n: replaced }) : '', t('ai.saved'), t('ai.cost')].filter(Boolean).join(' ');
+  };
+  picker.bind(body);
+  $('#aiContent', body).onchange = draw;
+  if (!ids) $('#aiScope', body).onchange = draw;
+  draw();
+}
+
+// 用已登入的 Claude / Codex CLI 看圖修正標註（背景工作）；ids = null 時處理所有標註完成的圖片
+async function refineDialog(ids = null) {
+  const pool = state.images.filter((i) => i.status === 'done' && (i.tags.length || i.nl_caption));
+  const n = ids ? pool.filter((i) => ids.includes(i.id)).length : pool.length;
+  if (!n) { toast(t('refine.nothing'), 'warn'); return; }
+  const hasNl = pool.some((i) => i.nl_caption);
+  const picker = cliPicker();
+  const body = h(`<div class="refine">
+      <p>${esc(t('refine.intro'))}</p>
+      ${picker.html}
+      <div class="field"><div class="lbl">${esc(t('refine.target'))}</div><select id="rfTarget">${['both', 'tags', 'caption'].map((k) => `<option value="${k}" ${!hasNl && k === 'tags' ? 'selected' : ''}>${esc(t(`refine.target_${k}`))}</option>`).join('')}</select></div>
+      <div class="field"><div class="lbl">${esc(t('refine.instructions'))}</div><textarea id="rfIns" rows="2" placeholder="${esc(t('refine.instructions_ph'))}"></textarea></div>
+      <div class="alert info">${esc(t(ids ? 'refine.scope_selected' : 'refine.scope_all', { n }))} ${esc(t('refine.cost'))}</div></div>`);
+  picker.bind(body);
+  modal({
+    title: t('refine.title'), body,
+    actions: [
+      { label: t('common.cancel'), onClick: (c) => c() },
+      { label: t('refine.start', { n }), primary: true, onClick: async (close) => {
+        if (!picker.ready()) return;
+        const job = await api(`/projects/${state.project.id}/refine`, { method: 'POST', body: {
+          engine: picker.engine(), model: $('#rfModel', body).value, target: $('#rfTarget', body).value, instructions: $('#rfIns', body).value, ids } });
+        close();
+        toast(t('refine.started', { n: job.total }), 'ok');
+        watchJob(job.id);
+      } },
+    ],
+  });
+}
+
+async function undoRefine(ids) {
+  const n = (ids ? state.images.filter((i) => ids.includes(i.id)) : state.images).filter((i) => i.refined).length;
+  if (!n) { toast(t('refine.undo_nothing'), 'warn'); return; }
+  if (!await confirmBox(t('refine.undo_confirm', { n }))) return;
+  try {
+    const r = await api(`/projects/${state.project.id}/bulk`, { method: 'POST', body: { action: 'undo_refine', ids } });
+    toast(t('refine.undone', { n: r.changed }), 'ok');
+    reloadImages(); refreshEditor();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 async function applyBulk(action, saveFirst) {
@@ -2451,6 +2610,7 @@ async function renderFinder(sid) {
         after: finderImported }) },
       { label: t('smb.menu'), help: t('smb.menu_help_finder'), onClick: () => smbDialog({ kind: 'finder', sessionId: sid, role }) },
       { label: t('finder.src_project'), help: t('finder.src_project_help'), onClick: () => finderProjectPicker(role) },
+      ...(role === 'pool' ? [{ label: t('finder.src_finder'), help: t('finder.src_finder_help'), onClick: () => finderCopyPicker() }] : []),
     ]);
     setupDrop(box, (files) => finderUpload(role, files));
     if ($('[data-dups]', box)) $('[data-dups]', box).onclick = () => finderDupDialog(role, 'all');
@@ -3098,6 +3258,41 @@ async function finderProjectPicker(role) {
     draw();
   };
   load();
+}
+
+// 重用其他篩選的「要篩選的圖片」（同一部作品換角色找）：特徵、tag、指紋一起帶過來，只要再算參考圖
+async function finderCopyPicker() {
+  const sid = fd.s.id;
+  const others = (await api('/finder')).filter((x) => x.id !== sid && x.pool_count);
+  if (!others.length) { toast(t('finder.copy_none'), 'warn'); return; }
+  const modelName = (m) => t(`finder.model_${m}`);
+  const body = h(`<div class="fd-copy">
+      <p>${esc(t('finder.copy_intro'))}</p>
+      <div class="fd-copy-list">${others.map((x, k) => `<label class="fd-copy-item">
+        <input type="radio" name="fdCopy" value="${x.id}" ${k ? '' : 'checked'}>
+        <span class="grow">${esc(x.name)}</span>
+        <span class="muted">${esc(t('finder.copy_count', { n: x.pool_count }))}</span>
+        ${x.model !== fd.s.model ? `<span class="badge warn" title="${esc(t('finder.copy_model_help', { model: modelName(x.model) }))}">${esc(modelName(x.model))}</span>` : ''}</label>`).join('')}</div>
+      <div class="help">${esc(t('finder.copy_help'))}</div></div>`);
+  modal({
+    title: t('finder.copy_title'), body,
+    actions: [
+      { label: t('common.cancel'), onClick: (c) => c() },
+      { label: t('finder.copy_add'), primary: true, onClick: async (close) => {
+        const source = $('input[name="fdCopy"]:checked', body)?.value;
+        if (!source) return;
+        const busy = toast(t('finder.copy_doing'), 'info', 600000);
+        try {
+          const r = await api(`/finder/${sid}/import-finder`, { method: 'POST', body: { source_id: source } });
+          close();
+          const done = !r.added || r.reused === r.added ? 'copy_done_all' : r.reused ? 'copy_done_some' : 'copy_done_none';
+          toast(t(`finder.${done}`, { n: r.added, reused: r.reused }) + (r.duplicates ? ` ${t('finder.copy_dups', { n: r.duplicates })}` : ''),
+            r.added ? 'ok' : 'warn', 8000);
+          await finderReload();
+        } catch (e) { toast(e.message, 'err'); } finally { busy.remove(); }
+      } },
+    ],
+  });
 }
 
 async function finderDownload() {

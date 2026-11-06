@@ -200,13 +200,14 @@ Images on a NAS or a Windows shared folder can be added without going through th
   - Images are only removed from the search; files on SMB, in the server folder or in projects are not deleted. Images that were already searched have fingerprints; the others are read once first (CPU only).
 
 - **Image sources** for references, exclusions and the images to search: images, folders or zip files from your computer (button or drag and drop), an SMB server (referenced, see [SMB servers](#smb-servers-nas--shared-folders)), the server import folder (`./import`, referenced instead of copied), or images of an existing project (hard-linked, so no extra space).
+- **Reusing another search's images**: to find another character in the same images, add the images to search with "＋ Add → From another search". Their CCIP features (when both searches use the same model), WD14 tags and duplicate fingerprints come along, so only the references need processing: copying 25,000 images takes about 5 seconds and gives the same matches as the original search. Scores, group-shot results and manual ✓ ✕ depend on the references and are not copied; images already in the search are skipped, and uploaded images are hard-linked, so deleting the other search does not affect this one.
 - Features are stored, so changing the threshold is instant, and adding images only processes the new ones. Changing the references or exclusions keeps the features but needs a re-run; switching the model recomputes everything.
 - **Accuracy**: tested on the author's anime screenshot datasets, five similar characters from the same series plus one from another series. It identified 99.7% of solo images correctly with only 1–5 references each, and also found about two thirds of the images WD14 could not recognize.
 - **Limitations**: CCIP compares whole images. A small character in a crowded frame, several characters in one image, or images mostly covered by white blocks can be missed or confused. Original or very new characters were not tested.
 - **Speed and VRAM**: about 35 ms per image on an RTX 5090 (mostly image decoding), about 130 ms on CPU. The model is freed when the job ends; generating tags loads WD14 for the run and frees it again if it was not loaded before. The search shares the job queue with tagging and upscaling, so they never run at the same time. Next to "Run" there is the same VRAM menu as in the top bar, and "Free other models' VRAM first" unloads WD14 and waifu2x and puts JoyCaption to sleep before the search starts.
 - **Model**: [deepghs/ccip_onnx](https://huggingface.co/deepghs/ccip_onnx) (OpenRAIL license), downloaded from Hugging Face on first use.
 - Files: uploads live in `data/finder/<id>/`. Deleting a search deletes them; files in the server import folder are never touched.
-- API: `POST /api/finder`, `POST /api/finder/{id}/upload?role=ref|neg|pool`, `/import-server`, `/import-project`, `/run` (`tags: true` also tags the pool), `/manual`, `PATCH /api/finder/{id}` (`tag_filter`), `GET /duplicates?threshold=1–16&scope=all|matches`, `/hash`, `PATCH` with `people_mode` (`off` / `crop` / `mask`), `people_min_side` and `people_recover`, and `POST /people` (group shots), `/download`, `/to-project` (see `/docs`).
+- API: `POST /api/finder`, `POST /api/finder/{id}/upload?role=ref|neg|pool`, `/import-server`, `/import-project`, `/import-finder` (`source_id`: reuse another search's pool), `/run` (`tags: true` also tags the pool), `/manual`, `PATCH /api/finder/{id}` (`tag_filter`), `GET /duplicates?threshold=1–16&scope=all|matches`, `/hash`, `PATCH` with `people_mode` (`off` / `crop` / `mask`), `people_min_side` and `people_recover`, and `POST /people` (group shots), `/download`, `/to-project` (see `/docs`).
 
 ## Danbooru tags from a VLM (JoyCaption)
 
@@ -224,6 +225,22 @@ JoyCaption Beta One has a built-in "Danbooru tag list" mode. Settings → "Danbo
 - Artist tags from the VLM are off by default ("Use artist tags guessed by the VLM"); for Anima the `@` prefix is added automatically.
 - VLM tags have no confidence scores, so thresholds only apply to WD14. For anime images WD14 is usually the better source; VLM tags help with new characters or niche concepts WD14 does not know.
 - REST `POST /api/quick-tag(/json)` and MCP `quick_tag_image` accept `vlm_tags`; project settings can be changed with `update_project_settings`.
+
+## Claude / Codex (your subscription)
+
+Your logged-in **Claude Code** (`claude`) or **OpenAI Codex** (`codex`) can write the captions or correct existing ones, using your subscription instead of an API key.
+
+- **Tagging**: "✦ AI ▾ → Tag with Claude / Codex…" in the top bar, or "✦ AI tag" in the selection bar. Pick the engine and model, what to generate (tags and caption, tags only, or caption only; the other one is left as it is), where the tags come from (AI only, with WD14 giving just the rating, or AI merged with WD14) and which images. The choice is saved in the project settings ("Natural language (VLM)" → "VLM engine"), so images added later and "▶ Tag remaining" use the same engine. In a test on anime screenshots Claude gave 37–38 tags per image in about 4 s and Codex 27–29 in about 10 s, and both named the character and series correctly. Anything replaced can be restored. About 5–20 s per image (tags and caption together take two calls, `TAG_CONCURRENCY` images at a time), counted against your subscription.
+- **Correcting**: "✦ AI ▾ → Correct with Claude / Codex…", or "✦ AI correct" in the selection bar. The model looks at each image with its current tags and caption, removes wrong tags (not visible, contradicting each other, another character such as `sinon` on a Lucia dataset), adds clearly visible missing ones and fixes the caption (for example a leaked "Reference tags: …" list). Choose tags, caption or both, and add your own instructions. The result still goes through the project's prune groups, blacklist, trigger and tag limit, so traits removed on purpose are not added back. Corrected cards show ✦ with the model's note; "✦ AI ▾ → Undo the last AI tagging / correction" restores the previous tags and caption.
+- **Setup (Docker)**: log in on the host first (`claude`, `codex`), then add to `.env` (absolute paths) and rebuild the app:
+  ```bash
+  CLAUDE_CREDS_DIR=/home/<you>/.claude
+  CODEX_CREDS_DIR=/home/<you>/.codex
+  ```
+  The image installs the Claude Code CLI; Codex's executable comes from the mounted `~/.codex`. Both folders are mounted read-write so the login can be refreshed, and the CLIs run as the owner of those folders, so the files stay yours.
+- **Safety**: Claude runs with every tool off (`--tools ""`) and `--safe-mode` (no hooks, MCP servers, plugins or CLAUDE.md from your settings); Codex runs with a read-only sandbox, its built-in tools off and `--ignore-user-config`. They only see the image and the prompt.
+- Claude and Codex may refuse adult content; refused images are marked as failed. Use JoyCaption for NSFW datasets.
+- API: `POST /api/projects/{id}/ai-tag` (`engine`, `model`, `content`, `tag_mode`, `ids`, `only_untagged`), `POST /api/projects/{id}/refine` (`engine`, `model`, `target`, `instructions`, `ids`), `POST /bulk` with `undo_refine`; `GET /api/system` → `cli` shows whether each CLI is installed and logged in, and its models. MCP tools `tag_with_claude_or_codex` and `refine_captions`.
 
 ## Freeing VRAM
 
@@ -327,16 +344,16 @@ claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
 { "mcpServers": { "lora-tag-studio": { "type": "http", "url": "http://localhost:7870/mcp" } } }
 ```
 
-27 tools:
+30 tools:
 
 | Area | Tools |
 |---|---|
 | Base models and quick tagging | `list_profiles`, `get_tagging_guide`, `quick_tag_image` |
 | Projects and import | `list_projects`, `create_project`, `get_project`, `update_project_settings`, `add_images_from_urls`, `list_server_import_folders`, `import_server_folder` |
-| Tagging and editing | `start_tagging`, `get_job_status`, `list_captions`, `get_image`, `update_image_caption`, `bulk_edit_tags`, `get_tag_stats`, `detect_white_blocks` |
+| Tagging and editing | `start_tagging`, `get_job_status`, `list_captions`, `get_image`, `update_image_caption`, `bulk_edit_tags`, `get_tag_stats`, `detect_white_blocks`, `tag_with_claude_or_codex`, `refine_captions` |
 | Upscaling | `upscale_images`, `restore_upscaled_images` |
 | Export | `export_dataset` |
-| Civitai training | `get_civitai_training_types`, `prepare_civitai_training`, `get_civitai_preparation`, `submit_civitai_training`, `get_civitai_training`, `list_active_civitai_trainings` |
+| Civitai training | `get_civitai_training_types`, `prepare_civitai_training`, `get_civitai_preparation`, `submit_civitai_training`, `get_civitai_training`, `list_active_civitai_trainings`, `import_lora_to_a1111` |
 
 ### REST / OpenAPI
 
@@ -381,6 +398,8 @@ When `API_KEY` is set, every `/api` and `/mcp` request needs `Authorization: Bea
 | `VLM_BASE_URL` / `VLM_MODEL` / `VLM_API_KEY` | Ollama | OpenAI-compatible endpoint |
 | `VLM_TIMEOUT` | `180` | VLM request timeout in seconds |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` / `ANTHROPIC_EFFORT` | –, `claude-opus-5-5`, `low` | Used with `VLM_BACKEND=anthropic` (server-side refusal fallback enabled) |
+| `CLAUDE_CREDS_DIR` / `CODEX_CREDS_DIR` | – | Host folders of your logged-in Claude Code / Codex (`/home/<you>/.claude`, `/home/<you>/.codex`), see [Claude / Codex](#claude--codex-your-subscription) |
+| `CLAUDE_MODELS` / `CODEX_MODELS` / `CLI_EFFORT` | `sonnet,opus,haiku,fable` / from Codex's model list / `low` | Models offered for Claude / Codex and their reasoning effort |
 | `ALLOW_PRIVATE_URLS` | `0` | Allow private network addresses in "Import from URL" (off to prevent SSRF) |
 | `CIVITAI_API_KEY` | empty | Key for Civitai cloud training (kept on the server) |
 | `A1111_URL` | empty | A1111 / Forge address (needs Forge Neo Chino's LoRA import API), e.g. `http://host.docker.internal:7860`; enables "→ A1111" in the training history |
@@ -420,6 +439,8 @@ app/
   tagging/
     wd14.py          WD14 ONNX inference
     vlm.py           OpenAI-compatible / Claude descriptions
+    cli.py           Logged-in Claude Code / Codex CLIs as image describers
+    refine.py        Correcting existing tags and captions with Claude / Codex
     postprocess.py   Thresholds, ordering, pruning groups, blacklist, caption assembly
     blocks.py        Detection of white masking blocks
 web/                 Web UI (plain HTML / CSS / JS, no build step)

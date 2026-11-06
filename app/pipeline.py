@@ -38,8 +38,9 @@ def config_problem(s: dict[str, Any]) -> str | None:
     return t("msg.nothing_to_generate")
 
 
-def tag_pil(im: Image.Image, s: dict[str, Any], prev: dict[str, Any] | None = None) -> dict[str, Any]:
-    """對 PIL 圖片執行標註，回傳要寫回的欄位。"""
+def tag_pil(im: Image.Image, s: dict[str, Any], prev: dict[str, Any] | None = None,
+            only: str | None = None) -> dict[str, Any]:
+    """對 PIL 圖片執行標註，回傳要寫回的欄位。only：tags = 自然語句不動；caption = 已有的標籤不動。"""
     prev = prev or {}
     raw = prev.get("raw")
     tags = list(prev.get("tags") or [])
@@ -47,14 +48,14 @@ def tag_pil(im: Image.Image, s: dict[str, Any], prev: dict[str, Any] | None = No
     errors: list[str] = []
 
     fresh = False  # 有新的 WD14 / VLM 結果才重組標籤，否則保留原本的（例如匯入的 .txt）
-    if s.get("use_wd14", True):
+    if s.get("use_wd14", True) and not (only == "caption" and tags):
         raw = get_tagger(s.get("wd14_model") or None).predict(im)
         fresh = True
 
-    if needs_vlm_tags(s):
+    if needs_vlm_tags(s) and only != "caption":
         # VLM 標籤存進 raw["vlm"]，之後「重新套用」可以不必再呼叫 VLM
         try:
-            raw = {**(raw or {}), "vlm": vlm.tag_image(im)}
+            raw = {**(raw or {}), "vlm": vlm.tag_image(im, s)}
             fresh = True
         except vlm.VLMError as e:
             errors.append(str(e))
@@ -65,7 +66,7 @@ def tag_pil(im: Image.Image, s: dict[str, Any], prev: dict[str, Any] | None = No
     if fresh:
         tags = select_tags(raw or {}, s)
 
-    if needs_vlm(s):
+    if needs_vlm(s) and only != "tags":
         try:
             nl = vlm.caption_image(im, s, hint_tags=tags or None)
         except vlm.VLMError as e:
