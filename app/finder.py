@@ -1034,9 +1034,10 @@ def _dup_pairs(sid: str, role: str, ids: list[str]) -> dict[str, Any]:
         return c
 
 
-def duplicates(sid: str, role: str = "pool", threshold: float = DUP_DEFAULT, scope: str = "all") -> dict[str, Any]:
+def duplicates(sid: str, role: str = "pool", threshold: float = DUP_DEFAULT, scope: str = "all",
+               ids: list[str] | None = None) -> dict[str, Any]:
     """找出幾乎相同的圖片分組。每組第一張是建議保留的，其他的都和它在門檻以內（平均差異，0–255）。
-    scope = matches：只在目前符合的結果裡找。"""
+    scope = matches：只在目前符合的結果裡找。指定 ids 時只在這些圖片裡找（匯入專案前檢查用）。"""
     s = require_session(sid)
     if role not in ROLES:
         raise BadRequest(t("msg.finder_bad_role", roles=", ".join(ROLES)))
@@ -1048,7 +1049,10 @@ def duplicates(sid: str, role: str = "pool", threshold: float = DUP_DEFAULT, sco
 
     imgs = db.finder_dup_rows(sid, role)
     matched = {i["id"] for i in matches(s)} if role == "pool" else set()
-    if scope == "matches":
+    if ids is not None:
+        want = set(ids)
+        imgs = [i for i in imgs if i["id"] in want]
+    elif scope == "matches":
         imgs = [i for i in imgs if i["id"] in matched]
     missing = sum(1 for i in imgs if not i["phash"] and not i["error"])
     have = [i for i in imgs if i["phash"] and i["has_sig"]]
@@ -1063,9 +1067,11 @@ def duplicates(sid: str, role: str = "pool", threshold: float = DUP_DEFAULT, sco
     present[list(by_k)] = True
     sel = (c["d"] <= threshold) & present[c["a"]] & present[c["b"]]
     near: dict[int, list[int]] = {}
-    for x, y in zip(c["a"][sel].tolist(), c["b"][sel].tolist()):
+    dist: dict[tuple[int, int], float] = {}
+    for x, y, d in zip(c["a"][sel].tolist(), c["b"][sel].tolist(), c["d"][sel].tolist()):
         near.setdefault(x, []).append(y)
         near.setdefault(y, []).append(x)
+        dist[(x, y)] = dist[(y, x)] = d
     # 依保留順序分組：最該留的當代表，只收和代表本身夠像的（不會一路串成整段鏡頭）
     taken: set[int] = set()
     for img in sorted(have, key=lambda i: _keep_rank(i, matched)):
@@ -1076,7 +1082,9 @@ def duplicates(sid: str, role: str = "pool", threshold: float = DUP_DEFAULT, sco
         if not members:
             continue
         taken.update([k, *members])
-        out["groups"].append({"keep": img["id"], "ids": [img["id"], *(by_k[j]["id"] for j in members)]})
+        # diffs：和保留的那張的平均差異（0 = 小圖完全一樣，通常是同一個檔案的副本）
+        out["groups"].append({"keep": img["id"], "ids": [img["id"], *(by_k[j]["id"] for j in members)],
+                              "diffs": {by_k[j]["id"]: round(dist[(k, j)], 2) for j in members}})
         out["removable"] += len(members)
         for j in (k, *members):  # 視窗要顯示的檔名與尺寸（不必再抓整個篩選）
             i = by_k[j]
@@ -1140,8 +1148,41 @@ def download(sid: str, ids: list[str] | None = None) -> tuple[Path, int]:
     return out, count
 
 
-def to_project(sid: str, ids: list[str] | None, project_id: str) -> dict[str, Any]:
-    """把選取的圖片（沒指定 = 目前符合的）匯入專案。"""
+def _export_sha1(img: dict[str, Any], s: dict[str, Any]) -> str | None:
+    """匯入時存進專案的內容的 sha1（和專案比對是不是同一張圖用）。讀不到回傳 None。"""
+    if processed_mode(img, s) is None and img.get("sha1"):
+        return img["sha1"]  # 上傳的原檔：加入時已經算過
+    try:
+        return hashlib.sha1(_export_bytes(img, s)).hexdigest()
+    except (OSError, BadRequest) as e:
+        log.warning("比對重複時讀不到 %s：%s", img["path"], e)
+        return None
+
+
+def import_check(sid: str, ids: list[str] | None, project_id: str | None = None,
+                 threshold: float = DUP_DEFAULT) -> dict[str, Any]:
+    """匯入專案前檢查重複：existing = 目標專案裡已經有一模一樣的圖片；similar = 這批圖片之間幾乎相同的分組
+    （同 duplicates）。讓使用者自己決定哪些要匯入。"""
+    s = require_session(sid)
+    imgs = _selected(sid, ids)
+    existing: list[dict[str, Any]] = []
+    if project_id:
+        if db.get_project(project_id) is None:
+            raise NotFound(t("msg.project_not_found", pid=project_id))
+        with ThreadPoolExecutor(WORKERS) as pool:  # NAS 上的圖主要在等網路
+            for img, sha1 in zip(imgs, pool.map(lambda i: _export_sha1(i, s), imgs)):
+                hit = db.find_by_sha(project_id, sha1) if sha1 else None
+                if hit:
+                    existing.append({"id": img["id"], "name": img["original_name"], "rel_path": img["rel_path"],
+                                     "width": img["width"], "height": img["height"],
+                                     "project_image_id": hit["id"], "project_name": hit["original_name"]})
+    similar = duplicates(sid, "pool", threshold, ids=[i["id"] for i in imgs])
+    return {"total": len(imgs), "existing": existing, "similar": similar,
+            "people": {i["id"]: m for i in imgs if (m := processed_mode(i, s))}}
+
+
+def to_project(sid: str, ids: list[str] | None, project_id: str, allow_duplicates: bool = False) -> dict[str, Any]:
+    """把選取的圖片（沒指定 = 目前符合的）匯入專案。allow_duplicates：專案裡已經有一樣的圖片也匯入。"""
     p = db.get_project(project_id)
     if p is None:
         raise NotFound(t("msg.project_not_found", pid=project_id))
@@ -1156,6 +1197,7 @@ def to_project(sid: str, ids: list[str] | None, project_id: str) -> dict[str, An
         return read
 
     entries = [(name, reader(img)) for img, name in zip(imgs, _unique_names([_export_name(i, s) for i in imgs]))]
-    result = storage.import_entries(project_id, entries, trigger=p["settings"].get("trigger", ""))
+    result = storage.import_entries(project_id, entries, trigger=p["settings"].get("trigger", ""),
+                                    allow_duplicates=allow_duplicates)
     result.pop("added_ids", None)
     return result

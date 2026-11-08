@@ -278,6 +278,11 @@ async function vramMenu(anchor) {
   items.push(ccip.length ? { info: t('vram.ccip_loaded', { n: ccip.length, device: ccipDevice }), cls: 'ok' } : { info: t('vram.ccip_unloaded') });
   if (ccip.length) items.push({ label: t('vram.ccip_release'), help: t(g.busy ? 'vram.busy' : 'vram.ccip_release_help'), disabled: g.busy,
     onClick: () => vramAction('release_ccip') });
+  if (g.forge?.configured) {  // Forge 是別的服務：訓練前不會自動卸載，要用時在這裡手動按
+    items.push('-');
+    items.push(g.forge.available ? { label: t('vram.forge_unload'), help: t('vram.forge_unload_help'), onClick: () => vramAction('unload_forge') }
+      : { info: t('vram.forge_offline'), cls: 'warn' });
+  }
   items.push('-');
   const v = g.vlm;
   if (v.backend !== 'openai') items.push({ info: t('vram.vlm_not_local') });
@@ -345,6 +350,7 @@ async function route() {
       return;
     }
     if (parts[0] === 'finder') return parts[1] ? await renderFinder(parts[1]) : await renderFinderList();
+    if (parts[0] === 'train') return parts[1] ? await renderTrain(parts[1]) : await renderTrainList();
     if (parts[0] === 'guide') return await renderGuide(parts[1]);
     if (parts[0] === 'api') return renderApi();
     return await renderProjects();
@@ -500,6 +506,7 @@ async function renderProject(pid) {
         <div class="dropdown"><button class="btn" id="btnAi" title="${esc(t('ai.button_help'))}">✦ ${esc(t('ai.button'))} ▾</button></div>
         <button class="btn" id="btnExport">⬇ ${esc(t('ws.export'))}</button>
         <button class="btn" id="btnCivitai">☁ ${esc(t('ws.civitai'))}</button>
+        <button class="btn" id="btnLocalTrain">⚙ ${esc(t('ws.local_train'))}</button>
         <div class="dropdown"><button class="icon-btn" id="btnProjMenu" title="${esc(t('ws.project_menu'))}">⋯</button></div>
       </div>
     </div>
@@ -567,6 +574,7 @@ async function renderProject(pid) {
   ]);
   $('#btnExport').onclick = exportDialog;
   $('#btnCivitai').onclick = () => civitaiDialog();
+  $('#btnLocalTrain').onclick = () => localTrainDialog().catch((e) => toast(e.message, 'err', 8000));
   updateCivitaiButton();
   $('#btnAi').onclick = (e) => {
     const sel = state.selected.size ? [...state.selected] : null;
@@ -2253,6 +2261,10 @@ async function civitaiDialog({ focusRuns = false } = {}) {
       lines.push(`<div class="alert warn">${esc(t('civitai.truncated', { n: p.truncated,
         avg: Math.max(1, Math.round((p.truncated_tags || 0) / p.truncated)) }))}</div>`);
     }
+    if (p.copies?.length) {
+      lines.push(`<div class="alert info">${esc(t('civitai.copies', { n: p.copies.length }))}<ul class="cv-blocked">${
+        p.copies.slice(0, 20).map((d) => `<li><b>${esc(d.file)}</b> = ${esc(d.same_as)}</li>`).join('')}</ul></div>`);
+    }
     if (p.duplicates?.length) {
       lines.push(`<div class="alert warn">${esc(t('civitai.duplicates', { n: p.duplicates.length }))}<ul class="cv-blocked">${
         p.duplicates.slice(0, 20).map((d) => `<li><b>${esc(d.file)}</b> = ${esc(d.same_as)}</li>`).join('')}</ul></div>`);
@@ -2453,6 +2465,524 @@ async function civitaiDialog({ focusRuns = false } = {}) {
     }],
   });
   pollRuns();
+}
+
+/* ================================================================ 本機訓練（AI Toolkit） */
+// 訓練專案 = 資料來源（標註專案或伺服器資料夾）+ 上次的設定 + 訓練紀錄。AI Toolkit 只在背景跑訓練，畫面都在這裡；
+// 表單比照 Civitai（共用 civitai.* 的文字），標註專案的「本機訓練」也用同一個表單
+const TRAIN_ACTIVE = ['preparing', 'queued', 'running', 'stopping'];
+const trainModelOf = (info, id) => info.models.find((m) => m.id === id);
+const trainDot = (st) => (st === 'succeeded' ? 'ok' : ['failed', 'canceled'].includes(st) ? 'err' : 'warn');
+const trainStatusBadge = (st) => `<span class="badge"><span class="dot ${trainDot(st)}"></span>${esc(t(`train.st_${st}`))}</span>`;
+// AI Toolkit 回報的階段（英文）→ 畫面文字；不認得的照原文顯示
+const TRAIN_PHASES = [[/^Loading (model|components)/, 'ph_loading'], [/^Loading dataset/, 'ph_dataset'], [/^Training/, 'ph_training'],
+  [/^Saving/, 'ph_saving'], [/^Generating images/, 'ph_sampling'], [/^Caching/, 'ph_caching'], [/^Starting/, 'ph_loading'],
+  [/^Job queued/, 'st_queued'], [/^Stopping/, 'st_stopping']];
+const trainPhase = (info) => { const hit = TRAIN_PHASES.find(([re]) => re.test(info || '')); return hit ? t(`train.${hit[1]}`) : info || ''; };
+
+/** AI Toolkit 沒啟動時的說明。 */
+function trainSetupHTML(info) {
+  if (info.online) return '';
+  return `<div class="alert err" style="margin-bottom:12px"><b>${esc(t(info.configured ? 'train.offline' : 'train.not_configured'))}</b>
+    ${info.error ? `<div class="muted" style="margin-top:4px">${esc(info.error)}</div>` : ''}
+    <div style="margin-top:6px">${th('train.setup_html')}</div></div>`;
+}
+
+/** GPU 用量與手動卸載 Forge（Forge 是別的服務，不會自動卸載）。 */
+async function trainGpuBar(box) {
+  let g;
+  try { g = await api('/gpu'); } catch { box.innerHTML = ''; return; }
+  const f = g.forge || {};
+  const high = g.memory && g.memory.used_mb > 6144;
+  box.innerHTML = `<div class="alert ${high ? 'warn' : 'info'} tr-gpu">
+    <span class="grow">${g.memory ? `${esc(t('vram.memory', { used: gb(g.memory.used_mb), total: gb(g.memory.total_mb) }))} ` : ''}${esc(t(high ? 'train.gpu_high' : 'train.gpu_note'))}</span>
+    ${f.configured ? `<button class="btn sm" id="trForge" ${f.available ? '' : 'disabled'} title="${esc(f.available ? t('vram.forge_unload_help') : t('vram.forge_offline'))}">${esc(t('vram.forge_unload'))}</button>` : ''}
+  </div>`;
+  const b = $('#trForge', box);
+  if (b) b.onclick = async () => { b.disabled = true; await vramAction('unload_forge'); trainGpuBar(box); };
+}
+
+/** 訓練設定表單。回傳 { el, read, fill, setRuns }。 */
+function trainForm(info, proj) {
+  const ds = proj.dataset;
+  const saved = proj.settings || {};
+  const num = (id, label, attrs = '', f = '') => `<div class="field"${f ? ` data-f="${f}"` : ''}><div class="lbl" id="${id}Lbl">${esc(label)}</div>
+    <input type="number" id="${id}" ${attrs}></div>`;
+  const sel = (id, label, opts, f = '') => `<div class="field"${f ? ` data-f="${f}"` : ''}><div class="lbl">${esc(label)}</div><select id="${id}">${
+    opts.map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select></div>`;
+  const chk = (id, label, f = '') => `<label class="check"${f ? ` data-f="${f}"` : ''}><input type="checkbox" id="${id}"> ${esc(label)}</label>`;
+  const sec = (label) => `<div class="cv-sec">${esc(label)}</div>`;
+  const el = h(`<div>
+    <div class="row" style="align-items:flex-start">
+      <div class="field grow"><div class="lbl">${esc(t('train.model'))}</div><select id="trModel">${info.models.map((m) =>
+    `<option value="${esc(m.id)}">${esc(m.label)}</option>`).join('')}</select></div>
+      <div class="field" style="flex:2" data-f="base_model"><div class="lbl">${esc(t('train.base_file'))}</div><select id="trBase"></select>
+        <div class="help">${esc(t('train.base_file_help'))}</div></div>
+    </div>
+    <div id="trNotes"></div>
+    ${sec(t('civitai.sec_length'))}
+    <div class="cv-grid">
+      ${num('trSteps', t('civitai.steps'), 'min="1" max="100000" step="100"')}
+      ${num('trEpochs', t('civitai.epochs'), 'min="1" max="100"')}
+      ${num('trBatch', '', 'min="1" max="4"')}
+    </div>
+    <div id="trViews" style="margin:6px 0 4px"></div>
+    ${sec(t('civitai.sec_lr'))}
+    <div class="cv-grid">
+      ${num('trLr', t('civitai.lr'), 'min="0" max="1" step="any"')}
+      ${sel('trSched', t('civitai.lr_scheduler'), info.lr_schedulers)}
+      ${sel('trOpt', t('civitai.optimizer'), info.optimizers)}
+      ${num('trSnr', t('civitai.min_snr'), 'min="0" max="20"', 'min_snr_gamma')}
+      ${num('trTeLr', t('civitai.te_lr'), 'min="0" max="1" step="any"', 'text_encoder_lr')}
+    </div>
+    ${chk('trTe', t('civitai.train_te'), 'train_text_encoder')}
+    ${sec(t('civitai.sec_network'))}
+    <div class="cv-grid">
+      ${num('trDim', t('civitai.dim'), 'min="1" max="256"')}
+      ${num('trAlpha', t('civitai.alpha'), 'min="1" max="256"')}
+    </div>
+    ${sec(t('civitai.sec_data'))}
+    <div class="cv-grid">
+      ${num('trNoise', t('civitai.noise_offset'), 'min="0" max="1" step="any"')}
+      ${num('trKeep', t('civitai.keep_tokens'), 'min="0" max="10"')}
+    </div>
+    <div class="field"><div class="lbl">${esc(t('civitai.trigger_word'))}</div><input type="text" id="trTrigger">
+      <div class="help">${esc(t('train.trigger_help'))}</div></div>
+    ${chk('trShuffle', t('civitai.shuffle'))}
+    ${chk('trFlip', t('civitai.flip'))}
+    ${sec(t('civitai.sec_continue'))}
+    <div class="field"><div class="lbl">${esc(t('civitai.continue_from'))}</div><select id="trContinue"></select></div>
+    ${sec(t('civitai.sec_samples'))}
+    <div class="field"><div class="lbl">${esc(t('civitai.samples'))}</div><textarea id="trSamples" rows="3"></textarea></div>
+    <div class="field"><div class="lbl">${esc(t('civitai.sample_negative'))}</div><textarea id="trNeg" rows="2"></textarea></div>
+    <div class="cv-grid">
+      ${num('trCfg', t('civitai.sample_cfg'), 'min="0" max="30" step="any"')}
+      ${num('trStrength', t('civitai.sample_strength'), 'min="0" max="2" step="0.05"')}
+    </div>
+    ${sec(t('train.sec_local'))}
+    <div class="field"><div class="lbl">${esc(t('train.resolutions'))}</div><div class="tr-res">${info.resolutions.map((r) =>
+    `<label class="check"><input type="checkbox" data-res="${r}"> ${r}</label>`).join('')}</div><div class="help">${esc(t('train.resolutions_help'))}</div></div>
+    <div class="cv-grid">${num('trMax', t('train.max_side'), 'min="512" max="4096" step="64" value="2048"')}</div>
+    ${chk('trCacheLat', t('train.cache_latents'))}
+    ${chk('trCacheText', t('train.cache_text'))}
+    ${proj.source === 'project' ? `<label class="check"><input type="checkbox" id="trDone" checked> ${esc(t('train.only_done'))}</label>` : ''}
+    ${ds.pending ? `<div class="alert warn" style="margin-top:8px">${esc(t('export.pending_warn', { n: ds.pending }))}</div>` : ''}
+    ${proj.source === 'project' && ds.available && !ds.trigger ? `<div class="alert warn" style="margin-top:8px">${esc(t('export.no_trigger'))}</div>` : ''}
+    ${proj.source === 'folder' && ds.available && ds.captions < ds.images ? `<div class="alert warn" style="margin-top:8px">${esc(t('train.no_captions', { n: ds.images - ds.captions }))}</div>` : ''}
+    <div id="trGpu" style="margin-top:12px"></div>
+  </div>`);
+  const setv = (id, v) => { $(id, el).value = v ?? ''; };
+  const val = (id) => $(id, el).value.trim();
+  const intOf = (id) => (val(id) === '' ? null : parseInt(val(id), 10));
+  const floatOf = (id) => (val(id) === '' ? null : parseFloat(val(id)));
+  const checked = (id) => !!$(id, el)?.checked;
+  const current = () => trainModelOf(info, $('#trModel', el).value);
+  const syncDisabled = () => {
+    $('#trTeLr', el).disabled = !checked('#trTe');
+    $('#trKeep', el).disabled = !checked('#trShuffle');
+    // 文字編碼每次都會變時不能快取
+    const te = current().fields.includes('train_text_encoder') && checked('#trTe');
+    $('#trCacheText', el).disabled = te || checked('#trShuffle');
+    if ($('#trCacheText', el).disabled) $('#trCacheText', el).checked = false;
+  };
+  // 每張圖大約被看到幾次（和 Civitai 表單相同的算法）
+  const updateViews = () => {
+    const n = $('#trDone', el) && checked('#trDone') && ds.done ? ds.done : ds.images;
+    const steps = intOf('#trSteps');
+    const batch = intOf('#trBatch') || 1;
+    const box = $('#trViews', el);
+    if (!n || !steps) { box.innerHTML = ''; return; }
+    const views = (steps * batch) / n;
+    const suggest = Math.ceil((n * 10) / batch / 100) * 100;
+    const low = views < 8 && suggest > steps;
+    box.innerHTML = `<div class="alert ${low ? 'warn' : 'info'}">${esc(t('civitai.views', { steps, batch, n, views: views.toFixed(1) }))}
+      ${low ? `<div style="margin-top:4px">${esc(t('civitai.views_low', { suggest, target: 10 }))}
+        <button class="btn sm" id="trApplySuggest" style="margin-left:6px">${esc(t('civitai.apply_suggest', { steps: suggest }))}</button></div>` : ''}</div>`;
+    if (low) $('#trApplySuggest', box).onclick = () => { $('#trSteps', el).value = suggest; updateViews(); };
+  };
+  // 選了底模就填入它的預設值，並只顯示它有的參數
+  const applyModel = (id) => {
+    const tp = trainModelOf(info, id);
+    const d = tp.defaults;
+    $$('[data-f]', el).forEach((x) => { x.hidden = !tp.fields.includes(x.dataset.f); });
+    setv('#trSteps', d.steps); setv('#trEpochs', d.epochs); setv('#trBatch', d.batch_size);
+    $('#trBatch', el).max = tp.max_batch;
+    $('#trBatchLbl', el).textContent = t('civitai.batch_size', { max: tp.max_batch });
+    setv('#trLr', d.lr); setv('#trSched', d.lr_scheduler); setv('#trOpt', d.optimizer);
+    setv('#trDim', d.network_dim); setv('#trAlpha', d.network_alpha); setv('#trNoise', d.noise_offset);
+    $('#trFlip', el).checked = d.flip_augmentation;
+    if (tp.fields.includes('min_snr_gamma')) setv('#trSnr', d.min_snr_gamma);
+    if (tp.fields.includes('train_text_encoder')) { $('#trTe', el).checked = d.train_text_encoder; setv('#trTeLr', d.text_encoder_lr); }
+    setv('#trCfg', d.sample_cfg); setv('#trStrength', d.sample_strength);
+    $$('[data-res]', el).forEach((x) => { x.checked = d.resolutions.includes(+x.dataset.res); });
+    const files = (info.base_models[tp.family] || []);
+    $('#trBase', el).innerHTML = `<option value="">${esc(tp.default_file ? t('train.base_default', { name: tp.default_file }) : t('train.base_repo', { name: tp.repo || '' }))}</option>${
+      files.filter((f) => f.name !== tp.default_file).map((f) => `<option value="${esc(f.name)}">${esc(f.name)}</option>`).join('')}`;
+    const notes = [];
+    if (!tp.available) notes.push(['err', t('train.base_needed', { name: tp.default_file })]);
+    else if (tp.repo && !(tp.default_file && files.some((f) => f.name === tp.default_file))) notes.push(['info', t('train.download_note', { name: tp.repo })]);
+    if (tp.family === 'anima') notes.push(['info', t('civitai.anima_lr_hint')]);
+    $('#trNotes', el).innerHTML = notes.map(([k, m]) => `<div class="alert ${k}" style="margin-bottom:8px">${esc(m)}</div>`).join('');
+    syncDisabled();
+    updateViews();
+  };
+  // 跟底模無關的欄位只填一次（切換底模不會蓋掉使用者改過的內容）
+  $('#trShuffle', el).checked = !!ds.hints?.shuffle_caption;
+  setv('#trKeep', ds.hints?.keep_tokens ?? 0);
+  setv('#trTrigger', ds.trigger || '');
+  setv('#trNeg', ds.negative || '');
+  $('#trCacheLat', el).checked = true;
+  $('#trTe', el).onchange = syncDisabled;
+  $('#trShuffle', el).onchange = syncDisabled;
+  $('#trModel', el).onchange = (e) => applyModel(e.target.value);
+  $('#trSteps', el).oninput = updateViews;
+  $('#trBatch', el).oninput = updateViews;
+  if ($('#trDone', el)) $('#trDone', el).onchange = updateViews;
+  $('#trModel', el).value = saved.model && trainModelOf(info, saved.model) ? saved.model : info.models[0].id;
+  applyModel($('#trModel', el).value);
+  trainGpuBar($('#trGpu', el));
+
+  const fill = (r) => {
+    if (r.model && trainModelOf(info, r.model)) { $('#trModel', el).value = r.model; applyModel(r.model); }
+    const put = (id, v) => { if (v != null) setv(id, v); };
+    const tick = (id, v) => { if (v != null && $(id, el)) $(id, el).checked = !!v; };
+    put('#trBase', r.base_model); put('#trSteps', r.steps); put('#trEpochs', r.epochs); put('#trBatch', r.batch_size);
+    put('#trLr', r.lr); put('#trSched', r.lr_scheduler); put('#trOpt', r.optimizer);
+    put('#trDim', r.network_dim); put('#trAlpha', r.network_alpha); put('#trNoise', r.noise_offset);
+    put('#trSnr', r.min_snr_gamma); put('#trTeLr', r.text_encoder_lr); put('#trTrigger', r.trigger_word);
+    put('#trKeep', r.keep_tokens); put('#trNeg', r.sample_negative); put('#trCfg', r.sample_cfg);
+    put('#trStrength', r.sample_strength); put('#trMax', r.max_side);
+    if (r.sample_prompts) setv('#trSamples', r.sample_prompts.join('\n'));
+    if (r.resolutions) $$('[data-res]', el).forEach((x) => { x.checked = r.resolutions.includes(+x.dataset.res); });
+    tick('#trFlip', r.flip_augmentation); tick('#trShuffle', r.shuffle_tokens); tick('#trTe', r.train_text_encoder);
+    tick('#trCacheLat', r.cache_latents); tick('#trCacheText', r.cache_text); tick('#trDone', r.only_done);
+    syncDisabled();
+    updateViews();
+  };
+  const read = () => {
+    const tp = current();
+    const req = {
+      model: tp.id, steps: intOf('#trSteps'), epochs: intOf('#trEpochs'), batch_size: intOf('#trBatch'), lr: floatOf('#trLr'),
+      lr_scheduler: val('#trSched'), optimizer: val('#trOpt'), network_dim: intOf('#trDim'), network_alpha: intOf('#trAlpha'),
+      noise_offset: floatOf('#trNoise'), flip_augmentation: checked('#trFlip'), shuffle_tokens: checked('#trShuffle'),
+      keep_tokens: intOf('#trKeep'), trigger_word: val('#trTrigger'), continue_from: val('#trContinue'),
+      sample_prompts: val('#trSamples') ? val('#trSamples').split('\n').map((x) => x.trim()).filter(Boolean).slice(0, 5) : null,
+      sample_negative: val('#trNeg'), sample_cfg: floatOf('#trCfg'), sample_strength: floatOf('#trStrength'),
+      resolutions: $$('[data-res]', el).filter((x) => x.checked).map((x) => +x.dataset.res), max_side: intOf('#trMax') || 2048,
+      cache_latents: checked('#trCacheLat'), cache_text: checked('#trCacheText'), only_done: $('#trDone', el) ? checked('#trDone') : true,
+    };
+    if (tp.fields.includes('base_model')) req.base_model = val('#trBase');
+    if (tp.fields.includes('min_snr_gamma')) req.min_snr_gamma = intOf('#trSnr');
+    if (tp.fields.includes('train_text_encoder')) { req.train_text_encoder = checked('#trTe'); req.text_encoder_lr = floatOf('#trTeLr'); }
+    return req;
+  };
+  // 接續訓練：這個訓練專案裡已經存好的 epoch
+  const setRuns = (runs) => {
+    const box = $('#trContinue', el);
+    const keep = box.value;
+    box.innerHTML = `<option value="">${esc(t('train.continue_none'))}</option>${runs.flatMap((r) => r.epochs.filter((e) => e.available).map((e) =>
+      `<option value="${esc(r.id)}:${e.epoch}">${esc(new Date(r.created_at * 1000).toLocaleString(i18n.lang))} · ${esc(r.model_label)} · ${esc(t('civitai.epoch', { n: e.epoch }))}</option>`)).join('')}`;
+    box.value = keep;
+  };
+  setRuns(proj.runs || []);
+  if (saved.steps) fill(saved);
+  return { el, read, fill, setRuns };
+}
+
+function trainProgressHTML(run) {
+  const pr = run.progress;
+  if (!pr) return '';
+  const parts = [];
+  if (pr.info) parts.push(trainPhase(pr.info));
+  if (pr.epochs_total) parts.push(t('civitai.prog_epochs', { done: pr.epochs_done, total: pr.epochs_total, left: pr.epochs_total - pr.epochs_done }));
+  if (pr.step != null && pr.total_steps) parts.push(t('civitai.prog_steps', { step: pr.step, total: pr.total_steps, left: pr.total_steps - pr.step }));
+  if (pr.seconds_per_step) parts.push(t('civitai.prog_speed', { sps: pr.seconds_per_step.toFixed(2) }));
+  const remain = pr.remaining_seconds != null
+    ? t('civitai.prog_remaining', { time: fmtDuration(pr.remaining_seconds), at: fmtClock(Date.now() + pr.remaining_seconds * 1000) }) : '';
+  return `<div class="cv-prog">
+    <div class="cv-prog-top"><b>${pr.percent != null ? `${Math.floor(pr.percent)}%` : ''}</b><span class="muted">${esc(remain)}</span></div>
+    <div class="progress"><i style="width:${pr.percent ?? 0}%"></i></div>
+    ${parts.length ? `<div class="muted cv-prog-detail">${parts.map(esc).join(' · ')}</div>` : ''}
+  </div>`;
+}
+
+function trainRunHTML(run) {
+  // 已經按了停止、AI Toolkit 還沒停下來：再按一次會直接標記為停止
+  const st = TRAIN_ACTIVE.includes(run.status) && run.summary?.stop_requested_at ? 'stopping' : run.status;
+  const pm = run.params || {};
+  const imported = new Map((run.a1111 || []).map((x) => [x.epoch, x]));
+  const a1111On = state.system.a1111?.configured;
+  const epochs = (run.epochs || []).map((e) => `<div class="cv-epoch">
+      ${e.available ? `<a class="btn sm" href="${esc(e.url)}" download>⬇ ${esc(t('civitai.epoch', { n: e.epoch }))}</a>` : `<span class="muted">${esc(t('civitai.epoch', { n: e.epoch }))}</span>`}
+      ${e.available && a1111On ? `<button class="btn sm" data-a1111="${e.epoch}" title="${esc(t('train.a1111_help', { folder: state.system.a1111.subfolder }))}">${imported.has(e.epoch) ? '✓' : '→'} A1111</button>` : ''}
+      ${imported.has(e.epoch) ? `<span class="badge ok" title="${esc(imported.get(e.epoch).relative_path)}">${esc(t('civitai.a1111_in', { name: imported.get(e.epoch).name }))}</span>` : ''}
+      ${e.samples.map((u) => `<a href="${esc(u)}" target="_blank" rel="noopener"><img src="${esc(u)}" alt="" loading="lazy"></a>`).join('')}
+    </div>`).join('');
+  return `<div class="cv-run" data-rid="${esc(run.id)}">
+    <div class="cv-run-head">${trainStatusBadge(st)}
+      <span class="muted">${esc(new Date(run.created_at * 1000).toLocaleString(i18n.lang))} · ${esc(run.model_label)}${run.image_count ? ` · ${esc(t('civitai.images', { n: run.image_count }))}` : ''}</span>
+      <span class="spacer"></span>
+      <button class="btn sm" data-retrain>${esc(t('civitai.retrain'))}</button>
+      ${TRAIN_ACTIVE.includes(st) ? `<button class="btn sm danger" data-stop>${esc(t('train.stop'))}</button>` : `<button class="btn sm" data-del>${esc(t('common.delete'))}</button>`}</div>
+    <div class="muted cv-params">${esc(t('civitai.run_params', { steps: pm.steps ?? '–', epochs: pm.epochs ?? '–', lr: pm.lr ?? '–', dim: pm.network_dim ?? '–', alpha: pm.network_alpha ?? '–', optimizer: pm.optimizer ?? '–' }))}</div>
+    ${run.offline ? `<div class="alert warn">${esc(run.offline)}</div>` : ''}
+    ${trainProgressHTML(run)}
+    ${run.error ? `<div class="alert err">${esc(run.error)}</div>` : ''}
+    ${run.summary?.excluded?.length ? `<div class="alert warn">${esc(t('civitai.excluded', { n: run.summary.excluded.length }))}</div>` : ''}
+    ${epochs ? `<div class="cv-epochs">${epochs}</div>` : ''}
+    ${run.job_id ? `<details class="tr-more" data-loss><summary>${esc(t('train.loss'))}</summary><div class="tr-chart"></div></details>
+    <details class="tr-more" data-log><summary>${esc(t('train.log'))}</summary><pre class="tr-log"></pre></details>` : ''}
+  </div>`;
+}
+
+/** loss 曲線：單一序列，滑鼠 / 手指移到圖上顯示該步的數值。 */
+function trainLossChart(box, { steps, values }) {
+  if (values.length < 2) { box.innerHTML = `<div class="muted">${esc(t('train.loss_empty'))}</div>`; return; }
+  const W = Math.max(260, box.clientWidth), H = 150, L = 46, R = 12, T = 8, B = 22;
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const pad = (hi - lo) * 0.08 || hi * 0.1 || 1;
+  const y0 = Math.max(0, lo - pad), y1 = hi + pad;
+  const s0 = steps[0], s1 = steps[steps.length - 1];
+  const x = (s) => L + ((s - s0) / (s1 - s0 || 1)) * (W - L - R);
+  const y = (v) => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
+  const line = values.map((v, i) => `${i ? 'L' : 'M'}${x(steps[i]).toFixed(1)} ${y(v).toFixed(1)}`).join('');
+  const ticks = [y0, (y0 + y1) / 2, y1];
+  box.innerHTML = `<svg width="${W}" height="${H}" role="img" aria-label="${esc(t('train.loss'))}">
+    ${ticks.map((v) => `<line class="tr-grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="tr-tick" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v.toFixed(3)}</text>`).join('')}
+    <text class="tr-tick" x="${L}" y="${H - 6}">${s0}</text><text class="tr-tick" x="${W - R}" y="${H - 6}" text-anchor="end">${s1}</text>
+    <path class="tr-line" d="${line}"/><line class="tr-cross" y1="${T}" y2="${H - B}" style="display:none"/><circle class="tr-dot" r="4" style="display:none"/>
+  </svg><div class="tr-tip" hidden></div>
+  <div class="muted tr-sum">${esc(t('train.loss_summary', { first: values[0].toFixed(3), last: values[values.length - 1].toFixed(3), min: lo.toFixed(3) }))}</div>`;
+  const svg = $('svg', box), cross = $('.tr-cross', box), dot = $('.tr-dot', box), tip = $('.tr-tip', box);
+  const show = (on) => { cross.style.display = dot.style.display = on ? '' : 'none'; tip.hidden = !on; }; // SVG 元素沒有 hidden 屬性
+  svg.onpointermove = (e) => {
+    const px = e.clientX - svg.getBoundingClientRect().left;
+    let i = 0;
+    steps.forEach((s, k) => { if (Math.abs(x(s) - px) < Math.abs(x(steps[i]) - px)) i = k; });
+    const cx = x(steps[i]), cy = y(values[i]);
+    show(true);
+    cross.setAttribute('x1', cx); cross.setAttribute('x2', cx);
+    dot.setAttribute('cx', cx); dot.setAttribute('cy', cy);
+    tip.textContent = t('train.loss_tip', { step: steps[i], loss: values[i].toFixed(4) });
+    tip.style.left = `${Math.min(cx + 10, W - tip.offsetWidth - 2)}px`;
+    tip.style.top = `${Math.max(0, cy - 30)}px`;
+  };
+  svg.onpointerleave = () => show(false);
+}
+
+/** 訓練紀錄：有變動的才重畫，展開中的 loss / 紀錄檔不會被收起來。 */
+function paintTrainRuns(box, runs, { onChange, onRetrain }) {
+  box.classList.toggle('muted', !runs.length);
+  if (!runs.length) { box.textContent = t('train.no_runs'); return; }
+  if (!$('.cv-run', box)) box.textContent = '';
+  const openLoss = new Set($$('[data-loss][open]', box).map((d) => d.closest('.cv-run').dataset.rid));
+  const openLog = new Set($$('[data-log][open]', box).map((d) => d.closest('.cv-run').dataset.rid));
+  const ids = new Set(runs.map((r) => r.id));
+  $$('.cv-run', box).forEach((n) => { if (!ids.has(n.dataset.rid)) n.remove(); });
+  runs.forEach((run, i) => {
+    const sig = JSON.stringify([run.status, run.progress, run.error, run.offline, run.epochs, run.a1111, run.summary?.stop_requested_at]);
+    let node = $(`.cv-run[data-rid="${run.id}"]`, box);
+    if (node && node.dataset.sig === sig) return;
+    const fresh = h(trainRunHTML(run));
+    fresh.dataset.sig = sig;
+    if (node) node.replaceWith(fresh); else box.insertBefore(fresh, box.children[i] || null);
+    node = fresh;
+    const loss = $('[data-loss]', node), logBox = $('[data-log]', node);
+    const loadLoss = () => { if (loss.open) api(`/train/runs/${run.id}/loss`).then((d) => trainLossChart($('.tr-chart', loss), d)).catch(() => {}); };
+    const loadLog = () => { if (logBox.open) api(`/train/runs/${run.id}/log`).then((d) => { const p = $('.tr-log', logBox); p.textContent = d; p.scrollTop = p.scrollHeight; }).catch(() => {}); };
+    if (loss) { loss.ontoggle = loadLoss; loss.open = openLoss.has(run.id); }
+    if (logBox) { logBox.ontoggle = loadLog; logBox.open = openLog.has(run.id); }
+    const stopBtn = $('[data-stop]', node);
+    if (stopBtn) stopBtn.onclick = async () => {
+      if (!await confirmBox(t('train.stop_confirm'), { danger: true })) return;
+      try { await api(`/train/runs/${run.id}/stop`, { method: 'POST' }); } catch (e) { toast(e.message, 'err'); }
+      onChange();
+    };
+    const delBtn = $('[data-del]', node);
+    if (delBtn) delBtn.onclick = async () => {
+      if (!await confirmBox(t('train.delete_confirm'), { danger: true })) return;
+      try { await api(`/train/runs/${run.id}`, { method: 'DELETE' }); } catch (e) { toast(e.message, 'err'); }
+      onChange();
+    };
+    $('[data-retrain]', node).onclick = () => onRetrain(run);
+    $$('[data-a1111]', node).forEach((b) => { b.onclick = async () => { if (await trainToA1111(run.id, +b.dataset.a1111, b)) onChange(); }; });
+  });
+}
+
+/** 把一個 epoch 傳給 A1111 / Forge。同名但內容不同時問要不要覆蓋。 */
+async function trainToA1111(rid, epoch, btn) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = t('civitai.a1111_importing');
+  const send = (overwrite) => api(`/train/runs/${rid}/a1111`, { method: 'POST', body: { epoch, overwrite } });
+  try {
+    let r;
+    try {
+      r = await send(false);
+    } catch (e) {
+      if (e.status !== 409) throw e;
+      if (!await confirmBox(`${e.message} ${t('civitai.a1111_overwrite')}`, { ok: t('civitai.a1111_overwrite_ok'), danger: true })) return false;
+      r = await send(true);
+    }
+    toast(t(r.status === 'exists' ? 'civitai.a1111_exists' : 'civitai.a1111_done', { path: r.relative_path, prompt: r.prompt }), 'ok', 10000);
+    return true;
+  } catch (e) {
+    toast(e.message, 'err', 10000);
+    return false;
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+async function renderTrainList() {
+  const view = $('#view');
+  view.innerHTML = `<section class="page">
+    <div class="page-head"><h1>${esc(t('train.title'))}</h1><span class="spacer"></span><button class="btn primary" id="newTrain">＋ ${esc(t('train.new'))}</button></div>
+    <p class="muted" style="margin-top:0">${esc(t('train.intro'))}</p>
+    <div id="trSetup"></div><div id="trActive"></div>
+    <div id="trWrap"><div class="empty">${esc(t('common.loading'))}</div></div></section>`;
+  $('#newTrain').onclick = newTrainDialog;
+  const [info, list] = await Promise.all([api('/aitoolkit'), api('/train/projects')]);
+  $('#trSetup').innerHTML = trainSetupHTML(info);
+  const wrap = $('#trWrap');
+  if (!list.length) { wrap.innerHTML = `<div class="empty">${esc(t('train.empty'))}</div>`; } else {
+    wrap.innerHTML = '<div class="proj-grid"></div>';
+    for (const p of list) {
+      const d = p.dataset, last = p.last_run;
+      const src = p.source === 'folder' ? t('train.src_folder', { path: p.folder || '/' }) : d.project_name ? t('train.src_project', { name: d.project_name }) : d.error || '';
+      $('.proj-grid', wrap).append(h(`<a class="proj-card" href="#/train/${p.id}">
+        <div class="cover" ${d.cover_id ? `style="background-image:url('/api/images/${d.cover_id}/thumb')"` : ''}>${d.cover_id ? '' : '🧪'}</div>
+        <div class="meta"><h3>${esc(p.name)}</h3><div class="sub">${esc(src)}</div>
+          <div class="row" style="font-size:12.5px">${last ? trainStatusBadge(last.status) : ''}
+            <span class="muted grow" style="text-align:right">${esc(t('train.card_runs', { n: p.run_count, images: d.images }))}</span></div>
+          ${last?.progress?.percent != null ? `<div class="progress"><i style="width:${last.progress.percent}%"></i></div>` : ''}
+        </div></a>`));
+    }
+  }
+  const active = await api('/train/active').catch(() => []);
+  if ($('#trActive')) {
+    $('#trActive').innerHTML = active.length ? `<div class="cv-active"><h2>${esc(t('train.active_title'))}</h2>${active.map((r) => `<a class="cv-run cv-active-item" href="#/train/${esc(r.train_project_id)}">
+      <div class="cv-run-head">${trainStatusBadge(r.status)}<b>${esc(r.project_name)}</b><span class="muted">${esc(r.model_label)}</span></div>${trainProgressHTML(r)}</a>`).join('')}</div>` : '';
+    if (active.length) state.civitaiTimer = setTimeout(() => { if ($('#trWrap')) renderTrainList(); }, 8000);
+  }
+}
+
+async function newTrainDialog() {
+  const [info, projects, dirs] = await Promise.all([api('/aitoolkit'), api('/projects'), api('/import-dirs').catch(() => [])]);
+  const folders = dirs.filter((d) => d.images > 0);
+  const body = h(`<div>
+    <div class="field"><div class="lbl">${esc(t('train.source'))}</div><div class="choice-grid">
+      <label class="choice"><input type="radio" name="trSrc" value="project" checked> <b>${esc(t('train.source_project'))}</b><small class="muted">${esc(t('train.source_project_help'))}</small></label>
+      <label class="choice"><input type="radio" name="trSrc" value="folder"> <b>${esc(t('train.source_folder'))}</b><small class="muted">${esc(t('train.source_folder_help'))}</small></label>
+    </div></div>
+    <div class="field" id="trSrcProject"><div class="lbl">${esc(t('train.source_project'))}</div><select id="trPid">${projects.map((p) =>
+    `<option value="${esc(p.id)}">${esc(p.name)}（${esc(t('civitai.images', { n: p.image_count }))}）</option>`).join('')}</select></div>
+    <div class="field" id="trSrcFolder" hidden><div class="lbl">${esc(t('train.source_folder'))}</div>${folders.length ? `<select id="trFolder">${folders.map((d) =>
+    `<option value="${esc(d.path)}">${esc(d.path || '/')}（${esc(t('civitai.images', { n: d.images }))}）</option>`).join('')}</select>` : `<div class="alert warn">${esc(t('train.no_folders'))}</div>`}</div>
+    <div class="field"><div class="lbl">${esc(t('train.name'))}</div><input type="text" id="trName" placeholder="${esc(t('train.name_ph'))}"></div>
+    <div class="field"><div class="lbl">${esc(t('train.model'))}</div><select id="trNewModel"><option value="">${esc(t('train.model_auto'))}</option>${info.models.map((m) =>
+    `<option value="${esc(m.id)}">${esc(m.label)}</option>`).join('')}</select></div>
+  </div>`);
+  $$('[name=trSrc]', body).forEach((r) => {
+    r.onchange = () => { $('#trSrcProject', body).hidden = r.value !== 'project'; $('#trSrcFolder', body).hidden = r.value !== 'folder'; };
+  });
+  modal({
+    title: t('train.new'), body, size: 'mid',
+    actions: [{ label: t('common.cancel'), onClick: (c) => c() }, {
+      label: t('common.create'), primary: true, onClick: async (c) => {
+        const source = $('[name=trSrc]:checked', body).value;
+        try {
+          const p = await api('/train/projects', { method: 'POST', body: { source, name: $('#trName', body).value.trim(),
+            project_id: source === 'project' ? $('#trPid', body).value : null, folder: source === 'folder' ? $('#trFolder', body)?.value ?? null : null,
+            model: $('#trNewModel', body).value || null } });
+          c(); location.hash = `#/train/${p.id}`;
+        } catch (e) { toast(e.message, 'err', 8000); }
+      },
+    }],
+  });
+}
+
+async function renderTrain(id) {
+  const view = $('#view');
+  view.innerHTML = `<section class="page"><div class="empty">${esc(t('common.loading'))}</div></section>`;
+  const [proj, info] = await Promise.all([api(`/train/projects/${id}`), api('/aitoolkit')]);
+  const d = proj.dataset;
+  const src = proj.source === 'folder' ? t('train.src_folder', { path: proj.folder || '/' }) : d.project_name ? t('train.src_project', { name: d.project_name }) : '';
+  view.innerHTML = `<section class="page">
+    <div class="page-head"><a href="#/train" class="btn ghost" title="${esc(t('ws.back'))}">←</a><h1 id="trTitle">${esc(proj.name)}</h1><span class="spacer"></span>
+      <button class="btn" id="trRename">${esc(t('train.rename'))}</button><button class="btn danger" id="trDelete">${esc(t('common.delete'))}</button></div>
+    <p class="muted" style="margin-top:0">${esc(src)}${d.available ? ` · ${esc(t('civitai.images', { n: d.images }))}` : ''}${proj.project_id ? ` · <a href="#/p/${esc(proj.project_id)}">${esc(t('train.open_project'))}</a>` : ''}</p>
+    ${d.available ? '' : `<div class="alert err" style="margin-bottom:12px">${esc(d.error || '')}</div>`}
+    ${trainSetupHTML(info)}
+    <div class="tr-layout">
+      <div class="tr-panel" id="trFormBox"><h2>${esc(t('train.settings'))}</h2></div>
+      <div class="tr-panel"><h2>${esc(t('civitai.runs'))}</h2><div id="trRuns" class="muted"></div></div>
+    </div></section>`;
+  const form = trainForm(info, proj);
+  const start = h(`<button class="btn primary" id="trStart" ${info.online && d.available ? '' : 'disabled'} style="margin-top:12px">▶ ${esc(t('train.start'))}</button>`);
+  $('#trFormBox').append(form.el, start);
+  const hooks = {
+    onChange: () => poll(),
+    onRetrain: (run) => {
+      form.fill(run.params);
+      $('#trModel').scrollIntoView({ block: 'center' });
+      toast(t('civitai.retrain_filled', { when: new Date(run.created_at * 1000).toLocaleString(i18n.lang), button: t('train.start') }), 'ok', 8000);
+    },
+  };
+  async function poll() {
+    clearTimeout(state.civitaiTimer);
+    const box = $('#trRuns');
+    if (!box) return;
+    let runs = [];
+    try { runs = (await api(`/train/projects/${id}`)).runs; } catch { return; }
+    if (!$('#trRuns')) return;
+    paintTrainRuns(box, runs, hooks);
+    form.setRuns(runs);
+    if (runs.some((r) => TRAIN_ACTIVE.includes(r.status))) state.civitaiTimer = setTimeout(poll, 4000);
+  }
+  start.onclick = async () => {
+    start.disabled = true;
+    try {
+      await api(`/train/projects/${id}/runs`, { method: 'POST', body: form.read() });
+      toast(t('train.started'), 'ok');
+      await poll();
+      trainGpuBar($('#trGpu'));
+    } catch (e) { toast(e.message, 'err', 10000); }
+    start.disabled = false;
+  };
+  $('#trRename').onclick = async () => {
+    const name = await promptBox(t('train.rename'), t('train.name'), proj.name);
+    if (!name) return;
+    try { await api(`/train/projects/${id}`, { method: 'PATCH', body: { name } }); proj.name = name; $('#trTitle').textContent = name; } catch (e) { toast(e.message, 'err'); }
+  };
+  $('#trDelete').onclick = async () => {
+    if (!await confirmBox(t('train.delete_project_confirm', { name: proj.name }), { danger: true })) return;
+    try { await api(`/train/projects/${id}`, { method: 'DELETE' }); location.hash = '#/train'; } catch (e) { toast(e.message, 'err', 8000); }
+  };
+  paintTrainRuns($('#trRuns'), proj.runs, hooks);
+  if (proj.runs.some((r) => TRAIN_ACTIVE.includes(r.status))) state.civitaiTimer = setTimeout(poll, 4000);
+}
+
+/** 標註專案的「本機訓練」：用同一個表單送出，送出後到訓練頁看進度。 */
+async function localTrainDialog() {
+  const [made, info] = await Promise.all([api(`/projects/${state.project.id}/train-project`, { method: 'POST' }), api('/aitoolkit')]);
+  const proj = await api(`/train/projects/${made.id}`);
+  const form = trainForm(info, proj);
+  const body = h('<div></div>');
+  body.innerHTML = trainSetupHTML(info);
+  body.append(form.el);
+  modal({
+    title: t('train.dialog_title'), body, size: 'mid',
+    actions: [{ label: t('common.close'), onClick: (c) => c() }, { label: t('train.open_page'), onClick: (c) => { c(); location.hash = `#/train/${proj.id}`; } }, {
+      label: `▶ ${t('train.start')}`, primary: true, onClick: async (c) => {
+        if (!info.online) { toast(t('train.offline'), 'err', 8000); return; }
+        try {
+          await api(`/train/projects/${proj.id}/runs`, { method: 'POST', body: form.read() });
+          toast(t('train.started'), 'ok');
+          c(); location.hash = `#/train/${proj.id}`;
+        } catch (e) { toast(e.message, 'err', 10000); }
+      },
+    }],
+  });
 }
 
 /* ================================================================ 角色篩選（CCIP） */
@@ -3304,9 +3834,19 @@ async function finderDownload() {
   } catch (e) { toast(e.message, 'err'); } finally { busy.remove(); }
 }
 
+// 匯入專案：選目的地，並列出重複的圖片讓使用者自己決定要不要匯入
+// （專案裡已經有一模一樣的：預設略過；這批之間相似的：預設全部匯入）
 async function finderToProjectDialog() {
   const projects = await api('/projects');
   const lt = state.system.lora_types;
+  const sid = fd.s.id, ids = [...fd.sel];
+  const PAGE = 60;
+  let chk = null, existing = [], seq = 0, timer = null, shown = 0, thr = +store.get('finderImportDupThr', 6);
+  // ready：這個目的地檢查完了，畫面上選什麼就匯入什麼（一模一樣的也照選擇）；
+  // 檢查失敗時照舊：專案裡或這批裡已經有一樣的都略過
+  let ready = false, checking = false;
+  const keepExisting = new Set(); // 專案裡已經有、仍然要匯入的
+  const drop = new Set(); // 相似分組裡不匯入的
   const body = h(`<div>
     <label class="check"><input type="radio" name="fdDest" value="new" checked> ${esc(t('finder.dest_new'))}</label>
     <div id="fdNewWrap" class="fd-dest">
@@ -3319,24 +3859,153 @@ async function finderToProjectDialog() {
     </div>
     ${projects.length ? `<label class="check"><input type="radio" name="fdDest" value="old"> ${esc(t('finder.dest_existing'))}</label>
     <div id="fdOldWrap" class="fd-dest" hidden><select id="fdpProj">${projects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>` : ''}
-    <div class="help">${esc(t('finder.to_project_help'))}</div></div>`);
-  $$('input[name=fdDest]', body).forEach((r) => { r.onchange = () => { $('#fdNewWrap', body).hidden = r.value !== 'new' || !r.checked; if ($('#fdOldWrap', body)) $('#fdOldWrap', body).hidden = r.value !== 'old' || !r.checked; }; });
-  modal({
-    title: t('finder.to_project', { n: fd.sel.size }), body, size: 'mid',
+    <div class="help">${esc(t('finder.to_project_help'))}</div>
+    <div class="fd-imp" id="fdImp"></div></div>`);
+  const box = $('#fdImp', body);
+  const dest = () => ($('input[name=fdDest]:checked', body).value === 'new' ? null : $('#fdpProj', body).value);
+  const m = modal({
+    title: t('finder.to_project', { n: ids.length }), body, size: 'mid',
     actions: [
       { label: t('common.cancel'), onClick: (c) => c() },
       { label: t('common.import'), primary: true, onClick: async (close) => {
-        const isNew = $('input[name=fdDest]:checked', body).value === 'new';
-        const payload = { ids: [...fd.sel], ...(isNew
-          ? { new_project: { name: $('#fdpName', body).value, profile: $('#fdpProfile', body).value, lora_type: $('#fdpType', body).value, trigger: $('#fdpTrigger', body).value } }
-          : { project_id: $('#fdpProj', body).value }) };
-        const r = await api(`/finder/${fd.s.id}/to-project`, { method: 'POST', body: payload });
+        const pid = dest();
+        const send = finalIds();
+        if (!send.length) return;
+        const payload = { ids: send, allow_duplicates: ready, ...(pid
+          ? { project_id: pid }
+          : { new_project: { name: $('#fdpName', body).value, profile: $('#fdpProfile', body).value, lora_type: $('#fdpType', body).value, trigger: $('#fdpTrigger', body).value } }) };
+        const r = await api(`/finder/${sid}/to-project`, { method: 'POST', body: payload });
         close();
-        const go = await confirmBox(t('finder.imported', { n: r.added, name: r.project.name, skipped: r.skipped.length }), { ok: t('finder.go_project') });
+        let msg = t('finder.imported', { n: r.added, name: r.project.name });
+        if (ids.length > send.length) msg += ` ${t('finder.imported_left_out', { n: ids.length - send.length })}`;
+        if (r.skipped.length) msg += ` ${t('finder.imported_skipped', { n: r.skipped.length })}`;
+        const go = await confirmBox(msg, { ok: t('finder.go_project') });
         if (go) location.hash = `#/p/${r.project.id}`;
       } },
     ],
   });
+  const btn = $('.modal-foot .primary', m.el);
+  const open = () => document.body.contains(m.el);
+  // 目前的檢查結果只對同一個目的地有效：換目的地前送出的就照舊（重複的略過）
+  const existingSet = () => new Set(existing.map((x) => x.id));
+  function finalIds() {
+    const ex = existingSet();
+    return ids.filter((id) => !drop.has(id) && (!ex.has(id) || keepExisting.has(id)));
+  }
+  const count = () => { const n = finalIds().length; btn.textContent = t('finder.imp_button', { n }); btn.disabled = !n || checking; };
+  const identical = (g, id) => { // 小圖完全一樣、尺寸也一樣：通常是同一個檔案的副本
+    const a = chk.similar.items[id] || {}, b = chk.similar.items[g.keep] || {};
+    return id !== g.keep && g.diffs?.[id] === 0 && a.width === b.width && a.height === b.height;
+  };
+  const thumb = (id) => `/api/finder/images/${id}/thumb${chk?.people?.[id] ? `?people=${chk.people[id]}` : ''}`;
+  const imgHTML = (id, info, extra = '') => `<div class="fd-dup-img" data-id="${id}" title="${esc(info.rel_path || info.name || '')}${info.width ? ` · ${info.width}×${info.height}` : ''}">
+      <img loading="lazy" src="${thumb(id)}" alt=""><span class="badge"></span><button class="fd-zoom" data-zoom title="${esc(t('finder.preview'))}">⤢</button>
+      <div class="fd-dup-meta">${info.width ? `${info.width}×${info.height}` : ''}${extra}</div></div>`;
+  const paint = () => { // 縮圖上的「匯入／不匯入」
+    const ex = existingSet();
+    $$('.fd-dup-img', box).forEach((x) => {
+      const id = x.dataset.id, inExisting = x.closest('[data-sec=existing]');
+      const on = !drop.has(id) && (!ex.has(id) || keepExisting.has(id));
+      x.classList.toggle('keep', on); x.classList.toggle('drop', !on);
+      $('.badge', x).className = `badge ${on ? 'ok' : 'warn'}`;
+      $('.badge', x).textContent = t(on ? 'finder.imp_in' : inExisting ? 'finder.imp_skip' : 'finder.imp_out');
+    });
+    count();
+  };
+  const groupHTML = (g, gi) => `<div class="fd-dup-group" data-g="${gi}"><div class="muted">${esc(t('finder.dup_group', { i: gi + 1, n: g.ids.length }))}</div>
+      <div class="fd-dup-imgs">${g.ids.map((id) => imgHTML(id, chk.similar.items[id] || {}, id === g.keep ? ` · <b>${esc(t('finder.imp_suggest'))}</b>`
+        : identical(g, id) ? ` · <b>${esc(t('finder.imp_identical'))}</b>` : '')).join('')}</div></div>`;
+  const more = () => {
+    const sim = chk.similar, list = $('.fd-dup-list', box), end = Math.min(sim.groups.length, shown + PAGE);
+    list.insertAdjacentHTML('beforeend', sim.groups.slice(shown, end).map((g, k) => groupHTML(g, shown + k)).join(''));
+    shown = end;
+    const b = $('#fdImpMore', box);
+    b.hidden = shown >= sim.groups.length; b.textContent = t('finder.dup_more', { n: sim.groups.length - shown });
+    paint();
+  };
+  const draw = () => {
+    const sim = chk.similar, pid = dest();
+    const nIdent = sim.groups.reduce((a, g) => a + g.ids.filter((id) => identical(g, id)).length, 0);
+    shown = 0;
+    const exHTML = !pid ? '' : `<div class="fd-imp-sec" data-sec="existing">
+        <div class="fd-imp-head"><b>${esc(t('finder.imp_existing_title', { n: existing.length }))}</b>
+          ${existing.length ? `<span class="fd-imp-acts"><button class="btn sm" data-ex="in">${esc(t('finder.imp_all_in'))}</button><button class="btn sm" data-ex="out">${esc(t('finder.imp_all_out'))}</button></span>` : ''}</div>
+        ${existing.length ? `<div class="help">${esc(t('finder.imp_existing_help'))}</div>
+          <div class="fd-dup-imgs fd-imp-wrap">${existing.map((x) => imgHTML(x.id, x)).join('')}</div>`
+          : `<div class="muted">${esc(t('finder.imp_existing_none'))}</div>`}</div>`;
+    const simHTML = `<div class="fd-imp-sec" data-sec="similar">
+        <div class="fd-imp-head"><b>${esc(t('finder.imp_similar_title', { groups: sim.groups.length, n: sim.groups.reduce((a, g) => a + g.ids.length, 0) }))}</b>
+          ${sim.groups.length ? `<span class="fd-imp-acts">${nIdent ? `<button class="btn sm" data-sim="identical" title="${esc(t('finder.imp_skip_identical_help'))}">${esc(t('finder.imp_skip_identical', { n: nIdent }))}</button>` : ''}<button class="btn sm" data-sim="one">${esc(t('finder.imp_keep_one'))}</button><button class="btn sm" data-sim="all">${esc(t('finder.imp_all_in'))}</button></span>` : ''}</div>
+        <div class="row fd-dup-opts"><label class="fd-thr" title="${esc(t('finder.dup_threshold_help'))}">${esc(t('finder.dup_threshold'))}
+          <input type="range" id="fdImpThr" min="1" max="16" step="0.5" value="${thr}"><b>${thr.toFixed(1)}</b></label>
+          <span class="muted">${esc(t(`finder.dup_band_${fdDupBand(thr)}`))}</span></div>
+        ${sim.missing ? `<div class="alert info">${esc(t('finder.imp_similar_missing', { n: sim.missing }))}</div>` : ''}
+        ${sim.groups.length ? `<div class="help">${esc(t('finder.imp_similar_help'))}</div><div class="fd-dup-list"></div>
+          <div class="row" style="justify-content:center;margin-top:8px"><button class="btn sm" id="fdImpMore"></button></div>`
+          : `<div class="muted">${esc(t('finder.imp_similar_none'))}</div>`}</div>`;
+    box.innerHTML = exHTML + simHTML;
+    if (sim.groups.length) { $('#fdImpMore', box).onclick = more; more(); }
+    const thrIn = $('#fdImpThr', box);
+    thrIn.oninput = () => {
+      thr = +thrIn.value; thrIn.nextElementSibling.textContent = thr.toFixed(1);
+      thrIn.parentElement.nextElementSibling.textContent = t(`finder.dup_band_${fdDupBand(thr)}`);
+      clearTimeout(timer); timer = setTimeout(() => { store.set('finderImportDupThr', thr); load(false); }, 300);
+    };
+    paint();
+  };
+  // withExisting：換目的地時重新比對專案（要讀每張圖）；只改門檻時沿用上次的結果
+  const load = async (withExisting = true) => {
+    const my = ++seq, pid = dest();
+    checking = true;
+    if (withExisting) { existing = []; keepExisting.clear(); chk = null; ready = false; box.innerHTML = `<div class="fd-dup-wait"><span>${esc(t('finder.imp_checking'))}</span></div>`; }
+    else box.classList.add('loading');
+    count();
+    drop.clear();
+    try {
+      const r = await api(`/finder/${sid}/to-project/check`, { method: 'POST', body: { ids, threshold: thr, ...(withExisting && pid ? { project_id: pid } : {}) } });
+      if (!open() || my !== seq) return;
+      if (withExisting) existing = r.existing;
+      chk = r; ready = true; checking = false; box.classList.remove('loading'); draw();
+    } catch (e) {
+      if (my !== seq) return;
+      checking = false; ready = false; chk = null; existing = []; keepExisting.clear(); drop.clear();
+      box.classList.remove('loading');
+      box.innerHTML = `<div class="alert err">${esc(t('finder.imp_check_failed', { error: e.message }))}</div>`;
+      count();
+    }
+  };
+  box.onclick = (e) => {
+    if (!chk) return;
+    const exBtn = e.target.closest('[data-ex]'), simBtn = e.target.closest('[data-sim]');
+    if (exBtn) { keepExisting.clear(); if (exBtn.dataset.ex === 'in') existing.forEach((x) => keepExisting.add(x.id)); paint(); return; }
+    if (simBtn) {
+      drop.clear();
+      if (simBtn.dataset.sim === 'one') chk.similar.groups.forEach((g) => g.ids.forEach((id) => { if (id !== g.keep) drop.add(id); }));
+      if (simBtn.dataset.sim === 'identical') chk.similar.groups.forEach((g) => g.ids.forEach((id) => { if (identical(g, id)) drop.add(id); }));
+      paint(); return;
+    }
+    const img = e.target.closest('.fd-dup-img');
+    if (!img) return;
+    const id = img.dataset.id;
+    if (e.target.closest('[data-zoom]')) {
+      const info = chk.similar.items[id] || existing.find((x) => x.id === id) || {};
+      const q = chk.people?.[id] ? `?people=${chk.people[id]}` : '';
+      modal({ title: info.name ? `${info.name}${info.width ? `（${info.width}×${info.height}）` : ''}` : '', size: 'wide', body: `<div class="fd-preview"><img src="/api/finder/images/${id}/file${q}" alt=""></div>` });
+      return;
+    }
+    if (img.closest('[data-sec=existing]')) { if (keepExisting.has(id)) keepExisting.delete(id); else { keepExisting.add(id); drop.delete(id); } }
+    else if (drop.has(id)) drop.delete(id);
+    else drop.add(id);
+    paint();
+  };
+  $$('input[name=fdDest]', body).forEach((r) => { r.onchange = () => {
+    $('#fdNewWrap', body).hidden = r.value !== 'new' || !r.checked;
+    if ($('#fdOldWrap', body)) $('#fdOldWrap', body).hidden = r.value !== 'old' || !r.checked;
+    load();
+  }; });
+  if ($('#fdpProj', body)) $('#fdpProj', body).onchange = () => load();
+  count();
+  load();
 }
 
 /* ================================================================ 底模指南 */

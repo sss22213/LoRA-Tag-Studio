@@ -12,7 +12,7 @@ from typing import Any, Callable
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import civitai, db, exporter, jobs, services, storage
+from . import aitoolkit, civitai, db, exporter, jobs, services, storage
 from .pipeline import quick_tag
 from .i18n import use_lang
 from .profiles import PROFILES, guide_markdown, list_profiles as _list_profiles
@@ -33,6 +33,8 @@ Typical workflow:
    get_civitai_training_types (parameter fields differ per type) → prepare_civitai_training → poll
    get_civitai_preparation until status is "ready" → tell the user the estimated
    Buzz cost and ask for confirmation → only then submit_civitai_training → poll get_civitai_training.
+9. Optional local training on this machine's GPU (AI Toolkit, free): get_local_training_info →
+   get_training_project_for_tag_project → start_local_training → poll get_local_training.
 For a single image without a project use quick_tag_image.
 """
 
@@ -338,6 +340,45 @@ def submit_civitai_training(prep_id: str) -> dict[str, Any]:
     """Start a prepared Civitai training run. This SPENDS the user's Buzz: only call it after telling the user the
     estimated cost from get_civitai_preparation and receiving their explicit confirmation."""
     return civitai.submit(prep_id)
+
+
+@_tool
+def get_local_training_info() -> dict[str, Any]:
+    """Local training on this machine (AI Toolkit): whether the service is online, the base models (sd15, sdxl,
+    illustrious, noobai, anima) with their defaults, and the checkpoint files that can be used as base_model."""
+    return aitoolkit.info()
+
+
+@_tool
+def get_training_project_for_tag_project(project_id: str) -> dict[str, Any]:
+    """The training project of a tag project, created when there is none yet. Its id goes to start_local_training."""
+    return aitoolkit.project_for(project_id)
+
+
+@_tool
+def start_local_training(training_project_id: str, model: str = "", base_model: str = "", steps: int | None = None,
+                         epochs: int | None = None, batch_size: int | None = None, lr: float | None = None,
+                         network_dim: int | None = None, network_alpha: int | None = None,
+                         sample_prompts: list[str] | None = None, only_done: bool = True) -> dict[str, Any]:
+    """Train a LoRA on this machine's GPU with AI Toolkit: free, but the GPU is busy until it finishes. Runs in the
+    background: poll get_local_training(id). Empty values use the base model's defaults (get_local_training_info).
+    Forge keeps its VRAM: ask the user before calling unload, it is another service."""
+    params = {"model": model or None, "base_model": base_model, "steps": steps, "epochs": epochs, "batch_size": batch_size,
+              "lr": lr, "network_dim": network_dim, "network_alpha": network_alpha, "sample_prompts": sample_prompts,
+              "only_done": only_done, "max_side": 2048, "cache_latents": True}
+    return aitoolkit.start_run(training_project_id, params)
+
+
+@_tool
+def get_local_training(run_id: str) -> dict[str, Any]:
+    """Status of a local training run: progress (percent, step, remaining_seconds), epochs with LoRA and sample URLs."""
+    return aitoolkit.get_run(run_id)
+
+
+@_tool
+def stop_local_training(run_id: str) -> dict[str, Any]:
+    """Stop a local training run. Epochs already saved stay available."""
+    return aitoolkit.stop_run(run_id)
 
 
 @_tool

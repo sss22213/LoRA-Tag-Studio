@@ -353,6 +353,28 @@ th { color: var(--muted); font-weight: 600; }
 a.cv-active-item { display: block; color: inherit; text-decoration: none; }
 a.cv-active-item:hover { border-color: var(--accent); }
 .cv-blocked { margin: 6px 0 0 18px; font-size: 12.5px; }
+/* 本機訓練 */
+.tr-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.tr-panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; min-width: 0; }
+.tr-panel h2 { font-size: 15px; margin: 0 0 12px; }
+.tr-res { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.tr-gpu { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.tr-more { margin-top: 8px; font-size: 13px; }
+.tr-more summary { cursor: pointer; color: var(--muted); }
+.tr-chart { position: relative; margin-top: 8px; }
+.tr-chart svg { display: block; max-width: 100%; touch-action: pan-y; }
+.tr-grid { stroke: var(--border); stroke-width: 1; }
+.tr-tick { fill: var(--faint); font-size: 11px; }
+.tr-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.tr-cross { stroke: var(--faint); stroke-width: 1; }
+.tr-dot { fill: var(--accent); stroke: var(--panel); stroke-width: 2; }
+.tr-tip { position: absolute; padding: 3px 7px; border-radius: 6px; background: var(--panel-3); color: var(--text); font-size: 12px; pointer-events: none; white-space: nowrap; }
+.tr-sum { font-size: 12px; margin-top: 4px; }
+.tr-log { max-height: 260px; overflow: auto; margin: 8px 0 0; padding: 8px; background: var(--panel-2); border-radius: 6px; font-size: 11.5px; white-space: pre-wrap; word-break: break-all; }
+@media (max-width: 980px) {
+  .tr-layout { grid-template-columns: minmax(0, 1fr); }
+  .tr-layout > :last-child { order: -1; }
+}
 
 /* waifu2x 放大 */
 .badge.up { background: rgba(78, 168, 247, .15); color: var(--info); }
@@ -498,6 +520,19 @@ a.cv-active-item:hover { border-color: var(--accent); }
 .fd-dup-img .fd-zoom { top: 4px; right: 4px; }
 .fd-dup-meta { font-size: 11.5px; padding: 3px 6px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 640px) { .fd-dup-list { grid-template-columns: 1fr; } .fd-dup-img { flex-basis: 120px; } .fd-tagrow input { width: 100%; } }
+/* 匯入專案：重複的圖片要不要匯入 */
+.fd-imp { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+.fd-imp.loading { opacity: .5; pointer-events: none; transition: opacity .15s; }
+.fd-imp:empty { display: none; }
+.fd-imp-sec { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 10px; }
+.fd-imp-sec .help { margin: 0; }
+.fd-imp-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.fd-imp-acts { display: inline-flex; gap: 6px; margin-left: auto; }
+.fd-imp-wrap { flex-wrap: wrap; overflow: visible; }
+.fd-imp .fd-dup-list { grid-template-columns: 1fr; }
+.fd-imp .fd-dup-img { flex-basis: 132px; }
+.fd-imp .fd-dup-img.drop { border-color: var(--warn); }
+@media (max-width: 640px) { .fd-imp .fd-dup-img { flex-basis: 110px; } .fd-dup-opts .fd-thr input { width: 140px; } }
 .fd-tools .fd-zoom { position: static; }
 .fd-mark { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font-weight: 700; }
 .fd-mark.ex:hover { color: var(--err); border-color: var(--err); }

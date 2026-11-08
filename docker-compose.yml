@@ -4,6 +4,7 @@ name: lora-tag-studio
 #   CPU                     docker compose up -d --build
 #   + Ollama VLM            docker compose --profile vlm up -d --build
 #   + JoyCaption (NSFW VLM) docker compose --profile joycaption up -d --build   （需 NVIDIA GPU）
+#   + 本機訓練（AI Toolkit） docker compose --profile aitoolkit up -d --build    （需 NVIDIA GPU，.env 要設 AI_TOOLKIT_AUTH）
 #   GPU 加速 WD14 / Ollama   加上 -f docker-compose.yml -f docker-compose.gpu.yml
 #   也可以在 .env 設定 COMPOSE_FILE / COMPOSE_PROFILES，之後只需 docker compose up -d
 
@@ -45,6 +46,10 @@ services:
       CLAUDE_MODELS: ${CLAUDE_MODELS:-sonnet,opus,haiku,fable}
       CODEX_MODELS: ${CODEX_MODELS:-}
       CLI_EFFORT: ${CLI_EFFORT:-low}
+      # 本機訓練（AI Toolkit）：沒開 aitoolkit profile 時訓練頁會顯示服務沒啟動
+      AITOOLKIT_URL: ${AITOOLKIT_URL:-http://aitoolkit:8675}
+      AI_TOOLKIT_AUTH: ${AI_TOOLKIT_AUTH:-}
+      AITOOLKIT_GPU: ${AITOOLKIT_GPU:-0}
     volumes:
       - ./data:/data              # 專案、圖片、標註資料庫、匯出 zip
       - ./import:/import:ro       # 伺服器資料夾匯入（把圖片資料夾放這裡）
@@ -54,6 +59,31 @@ services:
       # 沒設定就掛空資料夾，這兩個引擎會顯示為不能用
       - ${CLAUDE_CREDS_DIR:-./docker/cli-empty/claude}:/cli-home/.claude
       - ${CODEX_CREDS_DIR:-./docker/cli-empty/codex}:/cli-home/.codex
+      # 本機訓練的底模（Forge 的 Stable-diffusion 資料夾）。兩個容器要掛在相同路徑
+      - ${AITOOLKIT_BASE_MODELS_DIR:-./data/aitoolkit/base-models}:/base-models:ro
+
+  # ---------------------------------------------------------------- 本機訓練（AI Toolkit）
+  # LoRA 訓練的引擎。畫面在 LoRA Tag Studio 的「訓練」頁，由 app 透過內部網路呼叫，所以不開對外的 port。
+  # 版本固定：工作設定的格式隨版本變動，升級時要測過再改這裡。GPU 用 CDI（原因見 docker-compose.gpu.yml）
+  aitoolkit:
+    image: ostris/aitoolkit:0.13.41
+    profiles: ["aitoolkit"]
+    restart: unless-stopped
+    shm_size: "8gb"
+    command: ["/bin/bash", "/aitoolkit-start.sh"]
+    environment:
+      AI_TOOLKIT_AUTH: ${AI_TOOLKIT_AUTH:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      NODE_ENV: production
+    devices:
+      - nvidia.com/gpu=all
+    volumes:
+      - ./docker/aitoolkit-start.sh:/aitoolkit-start.sh:ro
+      - ./data/aitoolkit/datasets:/app/ai-toolkit/datasets    # 送訓練的資料集快照
+      - ./data/aitoolkit/output:/app/ai-toolkit/output        # LoRA、範例圖
+      - ./data/aitoolkit/state:/app/ai-toolkit/state          # 工作資料庫
+      - ./data/aitoolkit/hf-cache:/root/.cache/huggingface    # 下載的底模（SDXL、Anima）
+      - ${AITOOLKIT_BASE_MODELS_DIR:-./data/aitoolkit/base-models}:/base-models:ro
 
   # ---------------------------------------------------------------- 本機 VLM（一般用途）
   ollama:

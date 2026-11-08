@@ -76,6 +76,12 @@ class Settings:
         self.a1111_url = _env("A1111_URL").rstrip("/")
         self.a1111_lora_subfolder = _env("A1111_LORA_SUBFOLDER", "LoRA-Tag-Studio")
         self.a1111_api_auth = _env("A1111_API_AUTH")  # 帳號:密碼（Forge 有開 --api-auth 時）
+        # 本機訓練（AI Toolkit）：compose 的 aitoolkit profile 啟動的服務，只有 app 連得到；沒設定網址就顯示還沒啟用
+        self.aitoolkit_url = _env("AITOOLKIT_URL").rstrip("/")
+        self.aitoolkit_auth = _env("AI_TOOLKIT_AUTH")
+        self.aitoolkit_gpu = _env("AITOOLKIT_GPU", "0")
+        # 底模資料夾（Forge 的 Stable-diffusion）。app 和 AI Toolkit 容器都掛在這個路徑，檔案路徑才能直接交給它
+        self.aitoolkit_base_models = Path(_env("AITOOLKIT_BASE_MODELS_DIR", "/base-models"))
 
     @property
     def projects_dir(self) -> Path:
@@ -84,6 +90,11 @@ class Settings:
     @property
     def finder_dir(self) -> Path:
         return self.data_dir / "finder"
+
+    @property
+    def aitoolkit_dir(self) -> Path:
+        """和 AI Toolkit 容器共用：datasets（送訓練的快照）、output（LoRA、範例圖）。"""
+        return self.data_dir / "aitoolkit"
 
     @property
     def exports_dir(self) -> Path:

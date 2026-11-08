@@ -11,6 +11,7 @@ A self-hosted tool that turns a folder of images into a LoRA training dataset. I
 - **waifu2x upscaling and denoising**: images whose short side is too small are upscaled before training, so the LoRA does not learn blur, and JPEG noise can be removed without changing the size. Originals are kept and can be restored.
 - **Character finder**: pick one character out of a pile of images by comparing them with a few reference images (CCIP), then download the picks or import them into a project.
 - **Civitai cloud training**: upload images and captions, get a Buzz estimate, start training after you confirm, follow the progress, and download the LoRA of every epoch (Civitai Orchestration API).
+- **Local training**: train SD 1.5, SDXL, Illustrious XL, NoobAI-XL and Anima LoRAs on your own GPU with AI Toolkit, with the same settings as Civitai and no Buzz
 - **Usable by other LLMs**: a REST API (its OpenAPI spec works as a tool server) and an MCP server (Claude Desktop, Claude Code, Cursor, Open WebUI).
 - **Five languages**: the web UI, error messages, tagging guides and exported READMEs are available in English, 繁體中文, 日本語, 한국어 and 简体中文. The UI follows the browser language and can be switched in the top-right corner.
 
@@ -324,6 +325,55 @@ Train on Civitai's GPUs through the [Orchestration API](https://developer.civita
 
 **API / MCP**: `GET /api/civitai` lists every type's `fields`, `defaults` and `max_batch`; sending a parameter the type does not support returns an error. MCP flow: `get_civitai_training_types` → `prepare_civitai_training` (takes `training_type`, `priority`, `force_upload` and the parameters above) → `get_civitai_preparation` (the estimate) → `submit_civitai_training` only after the user confirms the cost → `get_civitai_training`.
 
+## Local training (AI Toolkit)
+
+Train LoRAs on this machine's GPU: no Buzz, no cloud queue, and the images never leave it. The engine is [AI Toolkit](https://github.com/ostris/ai-toolkit), running as a separate Docker service. Its own web page is not exposed; everything is done on the Training page here.
+
+**Base models**
+
+| Base model | Default | Source |
+|---|---|---|
+| SD 1.5 | `v1-5-pruned-emaonly.safetensors` | Checkpoint folder, or Hugging Face when it is not there |
+| SDXL | `stable-diffusion-xl-base-1.0` | Downloaded from Hugging Face on the first run |
+| Illustrious XL | `illustriousXL_v01.safetensors` | Checkpoint folder |
+| NoobAI-XL | `noobaiXLNAIXL_earlyAccessVersion.safetensors` | Checkpoint folder |
+| Anima | `Anima-Base-v1.0-Diffusers` | Downloaded from Hugging Face on the first run (about 5.7 GB) |
+
+The SD family can use another model of the same family from the checkpoint folder (for example `waiIllustriousSDXL_v170`). The list is sorted out with Forge's `.civitai.info` files, or by file size when a model has none.
+
+**Setup** (NVIDIA GPU, driver 580 or newer): add these lines to `.env` and start with `--profile aitoolkit`:
+
+```
+AI_TOOLKIT_AUTH=<make up a password>
+AITOOLKIT_BASE_MODELS_DIR=/path/to/forge/models/Stable-diffusion
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile aitoolkit up -d --build
+```
+
+- The `aitoolkit` container refuses to start without `AI_TOOLKIT_AUTH`. The password is only used between LoRA Tag Studio and AI Toolkit; you never type it.
+- The image version is pinned (`ostris/aitoolkit:0.13.41`): the job format changes between versions, so test an upgrade before changing `docker-compose.yml`.
+- Files live in `data/aitoolkit/`: `datasets` (snapshots), `output` (LoRAs, samples), `state` (job database), `hf-cache` (downloaded base models). The container runs as root, so deleting them by hand needs sudo; Delete on the Training page works without it.
+
+**How to use it**
+
+1. Training in the top menu → New training project, then pick the dataset: a tag project, or images with same-name `.txt` files in the server import folder. "⚙ Train locally" in a tag project sends it directly.
+2. The settings match the Civitai form (steps, epochs, learning rate, optimizer, dim / alpha, samples…), plus training resolutions and caching. One dataset can be trained many times on different base models.
+3. Start training: the dataset is copied into a snapshot (later tag edits do not affect a running job), the VRAM LoRA Tag Studio holds is freed (WD14, waifu2x, JoyCaption goes to sleep) and the job joins AI Toolkit's queue. One GPU runs one job at a time.
+4. Each run shows progress, time left, the LoRA and samples of every epoch, the loss curve and the log. You can stop it (saved epochs stay), run it again with the same settings, or continue from an earlier epoch.
+
+**Forge**
+- "→ A1111" on a run sends the LoRA to Forge (`POST /sdapi/v1/lora/upload`), with the trigger word and base model type, like Civitai runs.
+- Forge's VRAM is never freed automatically. Use "Unload Forge's model" in the VRAM menu or on the Training page; it loads again on the next generation.
+
+**Differences from Civitai**
+- There is no 1024-character caption limit, so captions are not cut and results can differ slightly.
+- Images with minor features and sexual content are still excluded, for server folders too.
+- The LoRA format is the same as Civitai's (same key names and shapes).
+
+**API / MCP**: `GET /api/aitoolkit`, `/api/train/projects`, `POST /api/train/projects/{id}/runs`, `GET /api/train/runs/{id}` (`/stop`, `/loss`, `/log`, `/a1111`); MCP tools `get_local_training_info`, `get_training_project_for_tag_project`, `start_local_training`, `get_local_training`, `stop_local_training`.
+
 ---
 
 ## Using it from other LLMs
@@ -401,6 +451,9 @@ When `API_KEY` is set, every `/api` and `/mcp` request needs `Authorization: Bea
 | `CLAUDE_CREDS_DIR` / `CODEX_CREDS_DIR` | – | Host folders of your logged-in Claude Code / Codex (`/home/<you>/.claude`, `/home/<you>/.codex`), see [Claude / Codex](#claude--codex-your-subscription) |
 | `CLAUDE_MODELS` / `CODEX_MODELS` / `CLI_EFFORT` | `sonnet,opus,haiku,fable` / from Codex's model list / `low` | Models offered for Claude / Codex and their reasoning effort |
 | `ALLOW_PRIVATE_URLS` | `0` | Allow private network addresses in "Import from URL" (off to prevent SSRF) |
+| `AI_TOOLKIT_AUTH` | empty | Local training: password between LoRA Tag Studio and AI Toolkit, required with the `aitoolkit` profile |
+| `AITOOLKIT_BASE_MODELS_DIR` | `./data/aitoolkit/base-models` | Checkpoint folder for local training (Forge's `models/Stable-diffusion`) |
+| `AITOOLKIT_GPU` | `0` | GPU used for local training |
 | `CIVITAI_API_KEY` | empty | Key for Civitai cloud training (kept on the server) |
 | `A1111_URL` | empty | A1111 / Forge address (needs Forge Neo Chino's LoRA import API), e.g. `http://host.docker.internal:7860`; enables "→ A1111" in the training history |
 | `A1111_LORA_SUBFOLDER` | `LoRA-Tag-Studio` | Sub folder of the Lora folder to import into (empty = the Lora folder itself) |
@@ -429,6 +482,7 @@ app/
   services.py        Logic shared by the API and MCP
   exporter.py        Civitai / kohya / jsonl export
   civitai.py         Civitai cloud training (Orchestration API)
+  aitoolkit.py       Local training (AI Toolkit)
   a1111.py           Import trained LoRAs into A1111 / Forge
   upscale.py         waifu2x upscaling: model download, tiled inference, backup / restore
   finder.py          Character finder: CCIP features, scoring, tag filter, duplicates, image sources, download / import

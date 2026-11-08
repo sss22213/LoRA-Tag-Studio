@@ -1,5 +1,6 @@
-"""把 Civitai 訓練好的 LoRA 匯入 A1111 / Forge。
+"""把訓練好的 LoRA 匯入 A1111 / Forge，以及手動卸載 Forge 的模型（把 VRAM 讓給本機訓練）。
 
+本機訓練的 LoRA 用 POST /sdapi/v1/lora/upload 把檔案傳過去。Civitai 的
 用 Forge Neo Chino 的 LoRA 匯入 API（POST /sdapi/v1/lora/import）：把 Civitai 的簽名下載網址交給 Forge，
 由 Forge 自己下載（不經過這裡），並寫好卡片資訊（觸發詞、底模類型）與預覽圖，不必重開 Forge。
 A1111_URL 沒設定時不顯示這個功能。
@@ -8,6 +9,7 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -105,9 +107,18 @@ def import_epoch(workflow_id: str, epoch: int, overwrite: bool = False) -> dict[
         "preview_url": preview,
         "overwrite": overwrite,
     }
+    result = _post_lora(lambda c: c.post("/sdapi/v1/lora/import", json=body), body["filename"])
+    db.a1111_import_put(workflow_id, epoch, result.get("name") or body["filename"], result.get("relative_path") or "",
+                        result.get("prompt") or "")
+    _status_cache["value"] = None
+    return {**result, "epoch": epoch, "workflow_id": workflow_id}
+
+
+def _post_lora(send: Any, filename: str) -> dict[str, Any]:
+    """呼叫匯入 / 上傳 API，錯誤轉成看得懂的訊息。"""
     try:
-        with _client(900) as c:  # Forge 要先把整個 LoRA 從 Civitai 下載下來（SDXL 約 50–200 MB）
-            r = c.post("/sdapi/v1/lora/import", json=body)
+        with _client(900) as c:  # Forge 要收完整個 LoRA（SDXL 約 50–200 MB）
+            r = send(c)
     except httpx.HTTPError as e:
         raise A1111Error(t("msg.a1111_unreachable", url=settings.a1111_url, error=e)) from e
     detail = ""
@@ -118,11 +129,39 @@ def import_epoch(workflow_id: str, epoch: int, overwrite: bool = False) -> dict[
     if r.status_code == 404:
         raise A1111Error(t("msg.a1111_no_api"))
     if r.status_code == 409:
-        raise A1111Conflict(t("msg.a1111_conflict", name=body["filename"]))
+        raise A1111Conflict(t("msg.a1111_conflict", name=filename))
     if r.status_code != 200:
         raise A1111Error(t("msg.a1111_failed", error=f"HTTP {r.status_code} {detail}".strip()))
-    result = r.json()
-    db.a1111_import_put(workflow_id, epoch, result.get("name") or body["filename"], result.get("relative_path") or "",
-                        result.get("prompt") or "")
+    return r.json()
+
+
+def import_local(run: dict[str, Any], path: Path, epoch: int, trigger: str, name: str, sd_version: str,
+                 overwrite: bool = False) -> dict[str, Any]:
+    """把本機訓練的一個 epoch 傳給 Forge（Forge 不一定連得到 LTS，所以是傳檔案，不是給網址）。"""
+    if not configured():
+        raise A1111Error(t("msg.a1111_not_configured"))
+    filename = f"{_slug(trigger or name)}_{run['id']}_e{epoch:02d}"
+    p = run["params"]
+    notes = ", ".join(f"{k}={p[k]}" for k in ("steps", "epochs", "lr", "network_dim", "network_alpha", "optimizer") if p.get(k) is not None)
+    data = {"filename": filename, "subfolder": settings.a1111_lora_subfolder, "activation_text": trigger,
+            "sd_version": sd_version, "notes": notes, "overwrite": str(overwrite).lower(),
+            "description": t("msg.a1111_description_local", project=name, epoch=epoch, total=p.get("epochs") or epoch)}
+    with path.open("rb") as f:
+        result = _post_lora(lambda c: c.post("/sdapi/v1/lora/upload", data=data,
+                                             files={"file": (path.name, f, "application/octet-stream")}), filename)
+    db.a1111_import_put(run["id"], epoch, result.get("name") or filename, result.get("relative_path") or "", result.get("prompt") or "")
     _status_cache["value"] = None
-    return {**result, "epoch": epoch, "workflow_id": workflow_id}
+    return {**result, "epoch": epoch, "run_id": run["id"]}
+
+
+def unload() -> None:
+    """把 Forge 目前的模型移出 VRAM（下次生圖時它會自己載回來）。"""
+    if not configured():
+        raise A1111Error(t("msg.a1111_not_configured"))
+    try:
+        with _client(120) as c:
+            r = c.post("/sdapi/v1/unload-checkpoint")
+    except httpx.HTTPError as e:
+        raise A1111Error(t("msg.a1111_unreachable", url=settings.a1111_url, error=e)) from e
+    if r.status_code != 200:
+        raise A1111Error(t("msg.a1111_failed", error=f"HTTP {r.status_code}"))

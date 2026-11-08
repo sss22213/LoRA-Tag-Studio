@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS images (
     updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_images_project ON images(project_id, created_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_images_sha ON images(project_id, sha1);
+-- 不設唯一：匯入時可以選擇把專案裡已經有的同一張圖再加一份（加重那張圖）。以前的唯一索引 idx_images_sha 啟動時移除
+CREATE INDEX IF NOT EXISTS idx_images_sha1 ON images(project_id, sha1);
 -- 已上傳到 Civitai 的圖片（key = sha1:格式:長邊），重送訓練時不必再上傳
 CREATE TABLE IF NOT EXISTS civitai_blobs (
     key TEXT PRIMARY KEY,
@@ -69,6 +70,33 @@ CREATE TABLE IF NOT EXISTS a1111_imports (
     created_at REAL NOT NULL,
     PRIMARY KEY (workflow_id, epoch)
 );
+-- 本機訓練（AI Toolkit）：訓練專案 = 一份資料來源（標註專案或伺服器資料夾）+ 上次用的設定
+CREATE TABLE IF NOT EXISTS train_projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    source TEXT NOT NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+    folder TEXT,
+    settings TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+-- 每次訓練。job_id = AI Toolkit 的工作，NULL 表示還在準備資料
+CREATE TABLE IF NOT EXISTS train_runs (
+    id TEXT PRIMARY KEY,
+    train_project_id TEXT NOT NULL REFERENCES train_projects(id) ON DELETE CASCADE,
+    job_id TEXT,
+    job_name TEXT NOT NULL UNIQUE,
+    model TEXT NOT NULL,
+    image_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    params TEXT NOT NULL DEFAULT '{}',
+    summary TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_train_runs_project ON train_runs(train_project_id, created_at);
 -- 角色篩選（CCIP）：和專案分開，每個篩選有參考圖、排除參考圖與要篩選的圖片
 CREATE TABLE IF NOT EXISTS finder_sessions (
     id TEXT PRIMARY KEY,
@@ -164,7 +192,9 @@ def connect() -> sqlite3.Connection:
                 for name, kind in cols:
                     if name not in have:
                         _conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
-            # 服務重啟時，未完成的工作已不存在
+            _conn.execute("DROP INDEX IF EXISTS idx_images_sha")  # 舊版的唯一索引（同一個專案不能有一樣的圖）
+            # 服務重啟時，未完成的工作已不存在（訓練是 AI Toolkit 在跑，只有還在準備資料的會中斷）
+            _conn.execute("UPDATE train_runs SET status='failed', error='interrupted' WHERE status='preparing'")
             _conn.execute(f"UPDATE images SET status={_RESTORED_STATUS} WHERE status IN ('queued','processing')")
         return _conn
 
@@ -584,6 +614,88 @@ def smb_delete(cid: str) -> None:
 def smb_finder_refs(cid: str) -> int:
     """角色篩選裡有幾張圖片是從這個連線加入的（只記路徑，刪掉連線就讀不到）。"""
     return _q("SELECT COUNT(*) FROM finder_images WHERE path LIKE ?", (f"smb://{cid}/%",))[0][0]
+
+
+# ------------------------------------------------------------------ 本機訓練
+def _train_project(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    d["settings"] = json.loads(d["settings"])
+    return d
+
+
+def train_project_add(pid: str, name: str, source: str, project_id: str | None, folder: str | None,
+                      settings_: dict[str, Any]) -> None:
+    now = time.time()
+    _x("INSERT INTO train_projects (id, name, source, project_id, folder, settings, created_at, updated_at) "
+       "VALUES (?,?,?,?,?,?,?,?)", (pid, name, source, project_id, folder, json.dumps(settings_, ensure_ascii=False), now, now))
+
+
+def train_project_get(pid: str) -> dict[str, Any] | None:
+    rows = _q("SELECT * FROM train_projects WHERE id=?", (pid,))
+    return _train_project(rows[0]) if rows else None
+
+
+def train_project_for(project_id: str) -> dict[str, Any] | None:
+    """這個標註專案最近用的訓練專案。"""
+    rows = _q("SELECT * FROM train_projects WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (project_id,))
+    return _train_project(rows[0]) if rows else None
+
+
+def train_projects() -> list[dict[str, Any]]:
+    return [_train_project(r) for r in _q("SELECT * FROM train_projects ORDER BY updated_at DESC")]
+
+
+def train_project_update(pid: str, name: str | None = None, settings_: dict[str, Any] | None = None) -> None:
+    if name is not None:
+        _x("UPDATE train_projects SET name=?, updated_at=? WHERE id=?", (name, time.time(), pid))
+    if settings_ is not None:
+        _x("UPDATE train_projects SET settings=?, updated_at=? WHERE id=?",
+           (json.dumps(settings_, ensure_ascii=False), time.time(), pid))
+
+
+def train_project_delete(pid: str) -> None:
+    _x("DELETE FROM train_projects WHERE id=?", (pid,))
+
+
+def _train_run(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    d["params"] = json.loads(d["params"])
+    d["summary"] = json.loads(d["summary"])
+    return d
+
+
+def train_run_add(rid: str, train_project_id: str, job_name: str, model: str, params: dict[str, Any]) -> None:
+    now = time.time()
+    _x("INSERT INTO train_runs (id, train_project_id, job_name, model, status, params, created_at, updated_at) "
+       "VALUES (?,?,?,?,'preparing',?,?,?)", (rid, train_project_id, job_name, model, json.dumps(params, ensure_ascii=False), now, now))
+
+
+def train_run_get(rid: str) -> dict[str, Any] | None:
+    rows = _q("SELECT * FROM train_runs WHERE id=?", (rid,))
+    return _train_run(rows[0]) if rows else None
+
+
+def train_runs(train_project_id: str) -> list[dict[str, Any]]:
+    return [_train_run(r) for r in _q("SELECT * FROM train_runs WHERE train_project_id=? ORDER BY created_at DESC",
+                                      (train_project_id,))]
+
+
+def train_runs_with_status(statuses: Iterable[str]) -> list[dict[str, Any]]:
+    marks = ",".join("?" * len(list(statuses)))
+    return [_train_run(r) for r in _q(f"SELECT * FROM train_runs WHERE status IN ({marks}) ORDER BY created_at", tuple(statuses))]
+
+
+def train_run_update(rid: str, **fields: Any) -> None:
+    """fields：job_id、image_count、status、summary、error。"""
+    if "summary" in fields:
+        fields["summary"] = json.dumps(fields["summary"], ensure_ascii=False)
+    cols = ", ".join(f"{k}=?" for k in fields)
+    _x(f"UPDATE train_runs SET {cols}, updated_at=? WHERE id=?", (*fields.values(), time.time(), rid))
+
+
+def train_run_delete(rid: str) -> None:
+    _x("DELETE FROM train_runs WHERE id=?", (rid,))
+    _x("DELETE FROM a1111_imports WHERE workflow_id=?", (rid,))
 
 
 # ------------------------------------------------------------------ app 設定

@@ -11,6 +11,7 @@
 - **waifu2x 放大與降噪**：短邊太小的圖先放大再訓練，LoRA 才不會學到模糊；也可以只去掉 JPEG 雜訊、不改尺寸。原圖會保留，可以還原。
 - **角色篩選**：給幾張參考圖，用 CCIP 從一堆圖片挑出某個角色，挑好的圖可以下載或匯入專案。
 - **直接送到 Civitai 雲端訓練**：上傳圖片與 caption、試算 Buzz、確認後開始訓練、查看進度，並下載每個 epoch 的 LoRA（Civitai Orchestration API）。
+- **本機訓練**：用自己的 GPU 訓練 SD 1.5、SDXL、Illustrious XL、NoobAI-XL、Anima 的 LoRA（AI Toolkit），設定和 Civitai 相同，不花 Buzz
 - **給其他 LLM 使用**：REST API（OpenAPI 規格可直接當 tool server）＋ MCP 伺服器（Claude Desktop / Claude Code / Cursor / Open WebUI）。
 - **多國語言**：WebUI、錯誤訊息、標註指南與匯出的 README 支援繁體中文、English、日本語、한국어、简体中文，依瀏覽器語言自動切換，右上角可手動選擇。
 
@@ -332,6 +333,55 @@ JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danboor
 
 **API / MCP**：`GET /api/civitai` 列出每個類型的 `fields`、`defaults`、`max_batch`；送出該類型沒有的參數會回錯誤。MCP 流程：`get_civitai_training_types` → `prepare_civitai_training`（可帶 `training_type`、`priority`、`force_upload` 與上表的參數）→ `get_civitai_preparation`（取得試算費用）→ 使用者確認費用後才 `submit_civitai_training` → `get_civitai_training`。
 
+## 本機訓練（AI Toolkit）
+
+用這台電腦的 GPU 訓練 LoRA：不花 Buzz、不用排隊，圖片也不必上傳。訓練引擎是 [AI Toolkit](https://github.com/ostris/ai-toolkit)，以獨立的 Docker 服務執行，它的網頁不對外開放，全部操作都在這裡的「訓練」頁。
+
+**支援的底模**
+
+| 底模 | 預設 | 來源 |
+|---|---|---|
+| SD 1.5 | `v1-5-pruned-emaonly.safetensors` | 底模資料夾；沒有時從 Hugging Face 下載 |
+| SDXL | `stable-diffusion-xl-base-1.0` | 第一次訓練時從 Hugging Face 下載 |
+| Illustrious XL | `illustriousXL_v01.safetensors` | 底模資料夾 |
+| NoobAI-XL | `noobaiXLNAIXL_earlyAccessVersion.safetensors` | 底模資料夾 |
+| Anima | `Anima-Base-v1.0-Diffusers` | 第一次訓練時從 Hugging Face 下載（約 5.7 GB） |
+
+SD 系列可以改選底模資料夾裡同系列的其他模型（例如 `waiIllustriousSDXL_v170`）。清單依 Forge 的 `.civitai.info` 分類，沒有這個檔案時看檔案大小。
+
+**設定**（需要 NVIDIA GPU、驅動 580 以上）：在 `.env` 加上下面幾行，再加上 `--profile aitoolkit` 啟動：
+
+```
+AI_TOOLKIT_AUTH=<自己取一串密碼>
+AITOOLKIT_BASE_MODELS_DIR=/path/to/forge/models/Stable-diffusion
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile aitoolkit up -d --build
+```
+
+- 沒設定 `AI_TOOLKIT_AUTH` 時 `aitoolkit` 容器不會啟動。這個密碼是 LoRA Tag Studio 和 AI Toolkit 之間用的，不用記。
+- 映像版本固定（`ostris/aitoolkit:0.13.41`）：工作設定的格式隨版本變動，升級時要測過再改 `docker-compose.yml`。
+- 檔案都在 `data/aitoolkit/`：`datasets`（資料集快照）、`output`（LoRA、範例圖）、`state`（工作資料庫）、`hf-cache`（下載的底模）。容器以 root 執行，要手動刪除這些檔案需要 sudo；用訓練頁的「刪除」則沒問題。
+
+**使用方式**
+
+1. 上方選單「訓練」→「新增訓練專案」，選資料來源：標註專案，或伺服器匯入資料夾裡的圖片加同名 `.txt`。在標註專案按「⚙ 本機訓練」也可以直接送出。
+2. 設定和 Civitai 表單相同（步數、Epochs、學習率、優化器、dim / alpha、範例圖…），另外多了訓練解析度和快取。同一份資料可以用不同底模訓練多次。
+3. 「開始訓練」：資料集複製成快照（之後改標籤不影響進行中的訓練）、釋放 LoRA Tag Studio 占用的 VRAM（WD14、waifu2x、讓 JoyCaption 休眠），然後排進 AI Toolkit 的佇列。一張 GPU 一次跑一個，其他的排隊。
+4. 訓練紀錄顯示進度、剩餘時間、每個 epoch 的 LoRA 和範例圖、loss 曲線和紀錄檔，可以停止（已存好的 epoch 會留下）、用相同設定重跑，或從之前的 epoch 接續訓練。
+
+**Forge**
+- 訓練紀錄的「→ A1111」把 LoRA 傳給 Forge（`POST /sdapi/v1/lora/upload`），和 Civitai 訓練一樣會寫好觸發詞和底模類型。
+- Forge 的 VRAM 不會自動釋放。需要時用右上角 VRAM 選單或訓練頁的「卸載 Forge 的模型」，下次生圖時它會自己載回來。
+
+**和 Civitai 的差別**
+- 沒有 1024 字的 caption 限制，caption 不會被截斷，所以結果可能略有差異。
+- 「未成年特徵 + 性內容」的圖片一樣會排除，伺服器資料夾來源也適用。
+- LoRA 的格式和 Civitai 訓練的相同（key 名稱與形狀一致）。
+
+**API / MCP**：`GET /api/aitoolkit`、`/api/train/projects`、`POST /api/train/projects/{id}/runs`、`GET /api/train/runs/{id}`（`/stop`、`/loss`、`/log`、`/a1111`）；MCP 工具 `get_local_training_info`、`get_training_project_for_tag_project`、`start_local_training`、`get_local_training`、`stop_local_training`。
+
 ---
 
 ## 給其他 LLM 使用
@@ -409,6 +459,9 @@ curl -OJ "http://localhost:7870/api/projects/<id>/export?format=civitai"
 | `CLAUDE_CREDS_DIR` / `CODEX_CREDS_DIR` | 空 | 主機上已登入的 Claude Code / Codex 資料夾（`/home/<你>/.claude`、`/home/<你>/.codex`），見 [Claude / Codex](#claude--codex訂閱帳號) |
 | `CLAUDE_MODELS` / `CODEX_MODELS` / `CLI_EFFORT` | `sonnet,opus,haiku,fable` / 讀 Codex 的模型清單 / `low` | Claude / Codex 可選的模型和推理強度 |
 | `ALLOW_PRIVATE_URLS` | `0` | 「從網址匯入」是否允許內網位址（預設關閉以避免 SSRF） |
+| `AI_TOOLKIT_AUTH` | 空 | 本機訓練：LoRA Tag Studio 和 AI Toolkit 之間的密碼，開 `aitoolkit` profile 時必填 |
+| `AITOOLKIT_BASE_MODELS_DIR` | `./data/aitoolkit/base-models` | 本機訓練的底模資料夾（Forge 的 `models/Stable-diffusion`） |
+| `AITOOLKIT_GPU` | `0` | 本機訓練用哪張 GPU |
 | `CIVITAI_API_KEY` | 空 | Civitai 雲端訓練用的金鑰（只留在伺服器端） |
 | `A1111_URL` | 空 | A1111 / Forge 的網址（需要 Forge Neo Chino 的 LoRA 匯入 API），例如 `http://host.docker.internal:7860`；設定後訓練紀錄才有「→ A1111」 |
 | `A1111_LORA_SUBFOLDER` | `LoRA-Tag-Studio` | 匯入到 Lora 資料夾裡的哪個子資料夾（空白 = Lora 資料夾本身） |
@@ -435,6 +488,7 @@ app/
   services.py        API / MCP 共用邏輯
   exporter.py        Civitai / kohya / jsonl 匯出
   civitai.py         送到 Civitai 雲端訓練（Orchestration API）
+  aitoolkit.py       本機訓練（AI Toolkit）
   a1111.py           訓練好的 LoRA 匯入 A1111 / Forge
   upscale.py         waifu2x 放大：模型下載、切塊推論、原圖備份 / 還原
   finder.py          角色篩選：CCIP 特徵、比對分數、tag 篩選、找重複、圖片來源、下載 / 匯入專案

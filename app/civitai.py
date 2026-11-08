@@ -755,7 +755,8 @@ class Prep:
     done: int = 0
     reused: int = 0
     blocked: list[dict[str, str]] = field(default_factory=list)
-    duplicates: list[dict[str, str]] = field(default_factory=list)
+    copies: list[dict[str, str]] = field(default_factory=list)  # 內容相同、各自上傳一份的圖
+    duplicates: list[dict[str, str]] = field(default_factory=list)  # 內容相同、只能上傳一次的圖
     excluded: int = 0
     truncated: int = 0
     truncated_tags: int = 0  # 為了放進 1024 字拿掉的標籤總數
@@ -820,14 +821,29 @@ def prepare(project_id: str, params: dict[str, Any]) -> Prep:
     return prep
 
 
-def _upload_one(img: dict[str, Any], max_side: int, use_cache: bool = True) -> tuple[str | None, str | None, bool]:
+def _copy_mark(k: int) -> Any:
+    """內容相同的第 k + 1 份：改一個像素（每份改不同的位置），看不出差別，但 Civitai 會當成不同的圖。
+    blob id 是依內容產生的，一模一樣的圖會拿到同一個 blob，而同一個 blob 不能在資料集裡出現兩次。"""
+    def edit(im: Any) -> Any:
+        im = im.copy()
+        x, y = im.width - 1 - (k - 1) % im.width, im.height - 1 - (k - 1) // im.width % im.height
+        px = im.getpixel((x, y))
+        shift = lambda v: v - 32 if v >= 128 else v + 32  # noqa: E731  JPEG 95 量化抹不掉的差距
+        im.putpixel((x, y), tuple(shift(v) for v in px) if isinstance(px, tuple) else shift(px))
+        return im
+    return edit
+
+
+def _upload_one(img: dict[str, Any], max_side: int, use_cache: bool = True,
+                copy: int = 0) -> tuple[str | None, str | None, bool]:
+    """copy > 0：內容相同的第 copy + 1 份，上傳稍微不同的版本（見 _copy_mark）。"""
     # blob 屬於上傳它的帳號，快取的 key 要包含金鑰指紋，換帳號就會重新上傳
     account = hashlib.sha256(settings.civitai_api_key.encode()).hexdigest()[:12]
-    key = f"{account}:{img['sha1']}:{UPLOAD_FORMAT[0]}:{max_side}"
+    key = f"{account}:{img['sha1']}:{UPLOAD_FORMAT[0]}:{max_side}" + (f":copy{copy}" if copy else "")
     cached = db.civitai_blob_get(key) if use_cache else None
     if cached:
         return cached, None, True
-    data, _ = convert_image(img, UPLOAD_FORMAT[0], max_side)
+    data, _ = convert_image(img, UPLOAD_FORMAT[0], max_side, edit=_copy_mark(copy) if copy else None)
     blob_id, blocked = upload_blob(data, UPLOAD_FORMAT[1])
     if blob_id:
         db.civitai_blob_put(key, blob_id)
@@ -847,7 +863,7 @@ def _run_prepare(prep: Prep, project: dict[str, Any], s: dict[str, Any], images:
                     raise
                 log.info("Civitai 不認得快取的 blob，重新上傳：%s", e)
                 prep.done = prep.reused = 0
-                prep.blocked, prep.duplicates, prep.truncated, prep.truncated_tags = [], [], 0, 0
+                prep.blocked, prep.copies, prep.duplicates, prep.truncated, prep.truncated_tags = [], [], [], 0, 0
                 _prepare_body(prep, project, s, images, params, use_cache=False)
             prep.status = "ready"
         except (CivitaiError, ValueError, KeyError, OSError) as e:
@@ -862,31 +878,59 @@ def _prepare_body(prep: Prep, project: dict[str, Any], s: dict[str, Any], images
                   params: dict[str, Any], use_cache: bool) -> None:
     """上傳圖片（可用快取）、組出 workflow，並用 whatif 試算費用。"""
     prep.status = "uploading"
+    prep.total = len(images)
     max_side = int(params.get("max_side") or 2048)
-    results: dict[str, tuple[str | None, str | None, bool]] = {}
-    with ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
-        futures = {pool.submit(_upload_one, img, max_side, use_cache): img["id"] for img in images}
-        try:
-            # 傳完幾張就算幾張：一張特別慢時，進度不會停在它前面
-            for fut in as_completed(futures):
-                results[futures[fut]] = fut.result()
-                prep.done += 1
-                prep.reused += 1 if results[futures[fut]][2] else 0
-        except BaseException:
-            for fut in futures:  # 有一張失敗就不必等其他的傳完；已經傳好的會留在快取，下次沿用
-                fut.cancel()
-            raise
+
+    def upload_all(jobs: list[tuple[dict[str, Any], int]]) -> dict[str, tuple[str | None, str | None, bool]]:
+        out: dict[str, tuple[str | None, str | None, bool]] = {}
+        with ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+            futures = {pool.submit(_upload_one, img, max_side, use_cache, copy): img["id"] for img, copy in jobs}
+            try:
+                # 傳完幾張就算幾張：一張特別慢時，進度不會停在它前面
+                for fut in as_completed(futures):
+                    out[futures[fut]] = fut.result()
+                    prep.done += 1
+                    prep.reused += 1 if out[futures[fut]][2] else 0
+            except BaseException:
+                for fut in futures:  # 有一張失敗就不必等其他的傳完；已經傳好的會留在快取，下次沿用
+                    fut.cancel()
+                raise
+        return out
+
+    results = upload_all([(img, 0) for img in images])
+    # 像素完全相同的圖（同一張圖存了兩次、只有 metadata 不同、匯入時選擇多放一份）轉成 JPEG 後是同一個 blob，
+    # 同一個 blob 不能出現兩次：第 2 份起各自上傳一個改了一個像素的版本，每一份都算進訓練
+    first: dict[str, str] = {}  # blob → 第一張的檔名
+    copy_of: dict[str, tuple[str, int]] = {}  # 圖片 id → (第一張的 blob, 第幾份)
+    copies_of_blob: dict[str, int] = {}
+    for img in images:
+        blob_id, blocked, _ = results[img["id"]]
+        if blocked or not blob_id:
+            continue
+        if blob_id in first:
+            copies_of_blob[blob_id] = copies_of_blob.get(blob_id, 0) + 1
+            copy_of[img["id"]] = (blob_id, copies_of_blob[blob_id])
+        else:
+            first[blob_id] = img["original_name"]
+    variants: dict[str, tuple[str | None, str | None, bool]] = {}
+    if copy_of:
+        prep.total += len(copy_of)
+        by_id = {img["id"]: img for img in images}
+        variants = upload_all([(by_id[i], n) for i, (_, n) in copy_of.items()])
     items, kept, seen = [], [], {}
     for img in images:  # 依資料集順序（順序會影響 Civitai 的重複任務判斷）
         blob_id, blocked, _ = results[img["id"]]
         if blocked:
             prep.blocked.append({"file": img["original_name"], "reason": blocked})
             continue
-        # 像素完全相同的圖（例如同一張圖存了兩次、只有 metadata 不同）轉成 JPEG 後是同一個 blob，
-        # Civitai 不接受同一個 blob 出現兩次：只留第一張
-        if blob_id in seen:
-            prep.duplicates.append({"file": img["original_name"], "same_as": seen[blob_id]})
-            continue
+        if img["id"] in copy_of:
+            orig = first[copy_of[img["id"]][0]]
+            v_id = variants[img["id"]][0]
+            if not v_id or v_id in seen:  # 還是被當成同一張（或改過的版本被擋下）：只上傳一次
+                prep.duplicates.append({"file": img["original_name"], "same_as": orig})
+                continue
+            prep.copies.append({"file": img["original_name"], "same_as": orig})
+            blob_id = v_id
         seen[blob_id] = img["original_name"]
         caption, cut = _fit_caption(img, s)
         if len(caption_for(img, s)) > MAX_CAPTION:

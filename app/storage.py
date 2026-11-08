@@ -86,11 +86,11 @@ def make_thumb(im: Image.Image, dest: Path) -> None:
 
 def save_image_bytes(
     pid: str, data: bytes, original_name: str, rel_path: str = "", caption_text: str | None = None,
-    trigger: str = "",
+    trigger: str = "", allow_duplicate: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """儲存一張圖片。回傳 (圖片紀錄, 略過原因)。"""
+    """儲存一張圖片。回傳 (圖片紀錄, 略過原因)。allow_duplicate：專案裡已經有一樣的圖片也存。"""
     sha1 = hashlib.sha1(data).hexdigest()
-    if db.find_by_sha(pid, sha1):
+    if not allow_duplicate and db.find_by_sha(pid, sha1):
         return None, t("msg.duplicate_image")
     try:
         im = Image.open(io.BytesIO(data))
@@ -179,7 +179,8 @@ def pair_files(entries: Iterable[Entry]) -> Iterator[tuple[str, Callable[[], byt
         yield path, read, captions.get(stem_key(path))
 
 
-def import_entries(pid: str, entries: Iterable[Entry], trigger: str = "") -> dict[str, Any]:
+def import_entries(pid: str, entries: Iterable[Entry], trigger: str = "",
+                   allow_duplicates: bool = False) -> dict[str, Any]:
     added, skipped = [], []
     for path, read, caption in pair_files(entries):
         try:
@@ -188,7 +189,7 @@ def import_entries(pid: str, entries: Iterable[Entry], trigger: str = "") -> dic
             skipped.append({"file": path, "reason": t("msg.read_failed", error=e)})
             continue
         rec, reason = save_image_bytes(pid, data, PurePosixPath(path).name, rel_path=path,
-                                       caption_text=caption, trigger=trigger)
+                                       caption_text=caption, trigger=trigger, allow_duplicate=allow_duplicates)
         if rec:
             added.append(rec["id"])
         else:

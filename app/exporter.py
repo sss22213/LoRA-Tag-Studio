@@ -8,7 +8,7 @@ import time
 import unicodedata
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image
 
@@ -33,10 +33,12 @@ def slugify(text: str, fallback: str = "") -> str:
     return t[:80] or fallback
 
 
-def convert_image(img: dict[str, Any], image_format: str, max_side: int) -> tuple[bytes, str]:
+def convert_image(img: dict[str, Any], image_format: str, max_side: int,
+                  edit: Callable[[Image.Image], Image.Image] | None = None) -> tuple[bytes, str]:
+    """edit：存檔前再改一下圖（縮小、轉色彩模式之後）。"""
     src = storage.image_path(img)
     target = IMAGE_FORMATS.get(image_format)
-    if target is None and not max_side:
+    if target is None and not max_side and edit is None:
         return src.read_bytes(), src.suffix.lower()
     im = Image.open(src)
     im.load()
@@ -48,6 +50,8 @@ def convert_image(img: dict[str, Any], image_format: str, max_side: int) -> tupl
         bg = Image.new("RGB", im.size, (255, 255, 255))
         bg.paste(rgba, mask=rgba.split()[3])
         im = bg
+    if edit is not None:
+        im = edit(im)
     buf = io.BytesIO()
     im.save(buf, format=fmt, **({"quality": 95} if fmt in ("JPEG", "WEBP") else {}))
     return buf.getvalue(), ext

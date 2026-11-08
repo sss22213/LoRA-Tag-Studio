@@ -14,7 +14,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
-from . import a1111, civitai, exporter, finder, i18n, jobs, services, smb, storage
+from . import a1111, aitoolkit, civitai, exporter, finder, i18n, jobs, services, smb, storage
 from .config import settings
 from .i18n import t, tr
 from .pipeline import quick_tag
@@ -163,6 +163,17 @@ class FinderHash(BaseModel):
 class FinderToProject(FinderSelection):
     project_id: str | None = Field(None, description="Existing project to import into")
     new_project: ProjectCreate | None = Field(None, description="Or create a new project with these settings")
+    allow_duplicates: bool = Field(False, description="Also import images that are byte-identical to one already in "
+                                                      "the project, as an extra copy. Default false: skip them. To "
+                                                      "choose per image, run /to-project/check first and leave the "
+                                                      "unwanted ids out")
+
+
+class FinderImportCheck(FinderSelection):
+    project_id: str | None = Field(None, description="Target project; omit for a new project (then only similar "
+                                                     "images within the selection are checked)")
+    threshold: float = Field(finder.DUP_DEFAULT, gt=0, le=finder.DUP_MAX,
+                             description="Similarity threshold for the similar groups, as in GET /duplicates")
 
 
 class SmbConnectionIn(BaseModel):
@@ -408,7 +419,9 @@ def gpu_settings(body: GpuSettings) -> dict[str, Any]:
                          "the weights to system RAM, level 2 drops them; either way the VRAM is freed and it wakes "
                          "automatically before the next VLM call. Releasing is refused while a "
                          "tagging or upscaling job is queued or running. vLLM must run with --enable-sleep-mode and "
-                         "VLLM_SERVER_DEV_MODE=1 (the bundled joycaption service does).")
+                         "VLLM_SERVER_DEV_MODE=1 (the bundled joycaption service does). "
+                         "unload_forge moves the checkpoint of A1111 / Forge out of VRAM (for local training); it "
+                         "loads again on the next generation.")
 def gpu_action(action: str, body: GpuActionRequest | None = None) -> dict[str, Any]:
     return services.gpu_action(action, body.model if body else None)
 
@@ -755,6 +768,17 @@ def finder_download(sid: str, body: FinderSelection | None = None) -> dict[str, 
     return {"download_url": services.absolute_url(f"/api/exports/{path.name}"), "file": path.name, "count": count}
 
 
+@router.post("/finder/{sid}/to-project/check", operation_id="check_character_search_import_duplicates",
+             summary="Before importing: which selected images are already in the project, and which are similar",
+             description="existing = selected images byte-identical to an image already in project_id (skipped by "
+                         "default; import them anyway with allow_duplicates). similar = groups of nearly identical "
+                         "images within the selection (same format as GET /duplicates; the first id is the suggested "
+                         "one to keep). people = ids exported as processed group shots (crop or mask). Leave unwanted "
+                         "ids out of the ids sent to /to-project.")
+def finder_import_check(sid: str, body: FinderImportCheck) -> dict[str, Any]:
+    return finder.import_check(sid, body.ids, body.project_id, body.threshold)
+
+
 @router.post("/finder/{sid}/to-project", operation_id="import_character_search_results_to_project",
              summary="Import the selected images (default: the current matches) into a new or existing project")
 def finder_to_project(sid: str, body: FinderToProject) -> dict[str, Any]:
@@ -767,7 +791,7 @@ def finder_to_project(sid: str, body: FinderToProject) -> dict[str, Any]:
                                       **(np_.settings or {}))["id"]
     else:
         raise HTTPException(400, t("msg.finder_need_project"))
-    result = finder.to_project(sid, body.ids, pid)
+    result = finder.to_project(sid, body.ids, pid, allow_duplicates=body.allow_duplicates)
     return {"project": services.project_out(services.require_project(pid)), **result}
 
 
@@ -1046,3 +1070,148 @@ def civitai_run(workflow_id: str) -> dict[str, Any]:
 @router.post("/civitai/runs/{workflow_id}/cancel", operation_id="cancel_civitai_training_run")
 def civitai_cancel(workflow_id: str) -> dict[str, Any]:
     return civitai.cancel_workflow(workflow_id)
+
+
+# ------------------------------------------------------------------ 本機訓練（AI Toolkit）
+class TrainProjectCreate(BaseModel):
+    name: str = Field("", max_length=120, description="Empty = the name of the tag project or folder")
+    source: Literal[aitoolkit.SOURCES] = Field("project", description=(  # type: ignore[valid-type]
+        "project: a tag project (project_id); folder: a folder of images with same-name .txt captions inside the "
+        "server import folder (folder, see GET /import-dirs)"))
+    project_id: str | None = None
+    folder: str | None = None
+    model: str | None = Field(None, description="Base model id from GET /aitoolkit. Empty = from the tag project's base model")
+
+
+class TrainProjectUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+
+
+class LocalTrainRequest(BaseModel):
+    """Same settings as the Civitai trainer. Omitted (null) values use the base model's defaults from GET /aitoolkit."""
+    model: str | None = Field(None, description="Base model id from GET /aitoolkit: sd15, sdxl, illustrious, noobai, anima")
+    base_model: str = Field("", description="SD family only. A .safetensors file name from base_models in GET /aitoolkit. "
+                                            "Empty = the model's default")
+    steps: int | None = Field(None, ge=1, le=100000)
+    epochs: int | None = Field(None, ge=1, le=100, description="Saved checkpoints with sample images; steps are split evenly")
+    batch_size: int | None = Field(None, ge=1, le=4)
+    lr: float | None = Field(None, gt=0, le=1)
+    lr_scheduler: Literal[civitai.LR_SCHEDULERS] | None = None  # type: ignore[valid-type]
+    optimizer: Literal[civitai.OPTIMIZERS] | None = None  # type: ignore[valid-type]
+    network_dim: int | None = Field(None, ge=1, le=256)
+    network_alpha: int | None = Field(None, ge=1, le=256)
+    noise_offset: float | None = Field(None, ge=0, le=1)
+    flip_augmentation: bool | None = None
+    shuffle_tokens: bool | None = Field(None, description="Shuffle caption tags")
+    keep_tokens: int | None = Field(None, ge=0, le=10, description="Tags kept at the front when shuffling")
+    trigger_word: str | None = Field(None, description="Added to captions that do not have it yet")
+    min_snr_gamma: int | None = Field(None, ge=0, le=20, description="SD family only")
+    train_text_encoder: bool | None = Field(None, description="SD family only")
+    text_encoder_lr: float | None = Field(None, gt=0, le=1, description="SD family only; used when train_text_encoder")
+    continue_from: str = Field("", description="Continue from an earlier run of this training project: <run id>:<epoch>")
+    resolutions: list[int] | None = Field(None, description="Training resolutions (bucket sizes)")
+    cache_latents: bool = Field(True, description="Cache image latents to disk (faster, more disk)")
+    cache_text: bool = Field(False, description="Cache text embeddings (faster). Ignored with shuffle_tokens or train_text_encoder")
+    max_side: int = Field(2048, ge=512, le=4096, description="Images larger than this long side are downscaled in the snapshot")
+    only_done: bool = Field(True, description="Tag projects: only images whose tagging is finished")
+    sample_prompts: list[str] | None = Field(None, max_length=5, description="Preview prompts (default: dataset captions)")
+    sample_negative: str | None = Field(None, description="Negative prompt for previews (default: the base model's)")
+    sample_cfg: float | None = Field(None, ge=0, le=30)
+    sample_strength: float | None = Field(None, ge=0, le=2)
+
+
+@router.get("/aitoolkit", operation_id="get_local_training_info",
+            summary="Local training (AI Toolkit): whether the service is online, base models, defaults, checkpoints")
+def aitoolkit_info() -> dict[str, Any]:
+    return aitoolkit.info()
+
+
+@router.get("/train/projects", operation_id="list_training_projects", summary="List local training projects")
+def train_projects() -> list[dict[str, Any]]:
+    return aitoolkit.list_projects()
+
+
+@router.post("/train/projects", operation_id="create_training_project", summary="Create a local training project")
+def train_project_create(body: TrainProjectCreate) -> dict[str, Any]:
+    return aitoolkit.create_project(body.name, body.source, body.project_id, body.folder, body.model)
+
+
+@router.post("/projects/{pid}/train-project", operation_id="get_training_project_for_tag_project",
+             summary="The training project of a tag project (created when there is none yet)")
+def train_project_for(pid: str) -> dict[str, Any]:
+    return aitoolkit.project_for(pid)
+
+
+@router.get("/train/projects/{tid}", operation_id="get_training_project", summary="Training project with its dataset and runs")
+def train_project(tid: str) -> dict[str, Any]:
+    return aitoolkit.get_project(tid)
+
+
+@router.patch("/train/projects/{tid}", operation_id="rename_training_project", summary="Rename a training project")
+def train_project_rename(tid: str, body: TrainProjectUpdate) -> dict[str, Any]:
+    return aitoolkit.rename_project(tid, body.name)
+
+
+@router.delete("/train/projects/{tid}", operation_id="delete_training_project",
+               summary="Delete a training project with its runs, snapshots and LoRA files (refused while a run is active)")
+def train_project_delete(tid: str) -> dict[str, bool]:
+    aitoolkit.delete_project(tid)
+    return {"ok": True}
+
+
+@router.post("/train/projects/{tid}/runs", operation_id="start_local_training",
+             summary="Start a local training run",
+             description="Copies the dataset into a snapshot in the background, frees the VRAM LoRA Tag Studio holds "
+                         "(not Forge's: unload it with POST /gpu/unload_forge) and queues the job in AI Toolkit.")
+def train_run_start(tid: str, body: LocalTrainRequest) -> dict[str, Any]:
+    return aitoolkit.start_run(tid, body.model_dump())
+
+
+@router.get("/train/active", operation_id="list_active_local_trainings", summary="Local training runs in progress")
+def train_active() -> list[dict[str, Any]]:
+    return aitoolkit.active_runs()
+
+
+@router.get("/train/runs/{rid}", operation_id="get_local_training", summary="Local training run: status, progress, epochs")
+def train_run(rid: str) -> dict[str, Any]:
+    return aitoolkit.get_run(rid)
+
+
+@router.post("/train/runs/{rid}/stop", operation_id="stop_local_training", summary="Stop a local training run")
+def train_run_stop(rid: str) -> dict[str, Any]:
+    return aitoolkit.stop_run(rid)
+
+
+@router.delete("/train/runs/{rid}", operation_id="delete_local_training",
+               summary="Delete a finished run with its snapshot and LoRA files")
+def train_run_delete(rid: str) -> dict[str, bool]:
+    aitoolkit.delete_run(rid)
+    return {"ok": True}
+
+
+@router.get("/train/runs/{rid}/loss", operation_id="get_local_training_loss", summary="Loss curve (up to 300 averaged points)")
+def train_run_loss(rid: str) -> dict[str, Any]:
+    return aitoolkit.loss(rid)
+
+
+@router.get("/train/runs/{rid}/log", operation_id="get_local_training_log", summary="End of the training log",
+            response_class=PlainTextResponse)
+def train_run_log(rid: str) -> str:
+    return aitoolkit.log_tail(rid)
+
+
+@router.get("/train/runs/{rid}/files/{path:path}", operation_id="get_local_training_file", summary="A LoRA or sample image of a run")
+def train_run_file(rid: str, path: str) -> FileResponse:
+    f = aitoolkit.run_file(rid, path)
+    return FileResponse(f, filename=f.name if f.suffix == ".safetensors" else None)
+
+
+@router.post("/train/runs/{rid}/a1111", operation_id="import_local_lora_to_a1111",
+             summary="Send one epoch of a local training run to A1111 / Forge's Lora folder",
+             description="Uploads the .safetensors (needs Forge Neo Chino's POST /sdapi/v1/lora/upload). HTTP 409 = a "
+                         "different file with the same name exists; retry with overwrite=true.")
+def train_run_to_a1111(rid: str, body: A1111Import) -> dict[str, Any]:
+    try:
+        return aitoolkit.to_forge(rid, body.epoch, body.overwrite)
+    except a1111.A1111Conflict as e:
+        raise HTTPException(409, str(e)) from e
