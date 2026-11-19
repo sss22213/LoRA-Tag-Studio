@@ -265,7 +265,7 @@ JoyCaption Beta One 內建「Danbooru tag list」模式。設定面板「Danboor
 - Ollama 閒置 `OLLAMA_KEEP_ALIVE`（預設 10 分鐘）後會自己卸載模型，這裡不能讓它休眠。
 - 有 `nvidia-smi` 時，選單也會顯示整張 GPU 的 VRAM 用量（含其他程式）。
 - **CCIP**（角色篩選）：只在辨識時載入，結束時自動釋放。
-- API：`GET /api/gpu`、`POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip}`、`PATCH /api/gpu`（`vlm_sleep_level`：1 或 2）。
+- API：`GET /api/gpu`、`POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip|unload_forge}`（`unload_forge` 把 Forge 的模型移出 VRAM，需要 `A1111_URL`）、`PATCH /api/gpu`（`vlm_sleep_level`：1 或 2）。
 
 ## 送到 Civitai 雲端訓練
 
@@ -402,7 +402,7 @@ claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
 { "mcpServers": { "lora-tag-studio": { "type": "http", "url": "http://localhost:7870/mcp" } } }
 ```
 
-共 30 個工具：
+共 35 個工具：
 
 | 類別 | 工具 |
 |---|---|
@@ -412,6 +412,7 @@ claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
 | 放大 | `upscale_images`、`restore_upscaled_images` |
 | 匯出 | `export_dataset` |
 | Civitai 訓練 | `get_civitai_training_types`、`prepare_civitai_training`、`get_civitai_preparation`、`submit_civitai_training`、`get_civitai_training`、`list_active_civitai_trainings`、`import_lora_to_a1111` |
+| 本機訓練 | `get_local_training_info`、`get_training_project_for_tag_project`、`start_local_training`、`get_local_training`、`stop_local_training` |
 
 ### REST / OpenAPI
 
@@ -459,6 +460,8 @@ curl -OJ "http://localhost:7870/api/projects/<id>/export?format=civitai"
 | `CLAUDE_CREDS_DIR` / `CODEX_CREDS_DIR` | 空 | 主機上已登入的 Claude Code / Codex 資料夾（`/home/<你>/.claude`、`/home/<你>/.codex`），見 [Claude / Codex](#claude--codex訂閱帳號) |
 | `CLAUDE_MODELS` / `CODEX_MODELS` / `CLI_EFFORT` | `sonnet,opus,haiku,fable` / 讀 Codex 的模型清單 / `low` | Claude / Codex 可選的模型和推理強度 |
 | `ALLOW_PRIVATE_URLS` | `0` | 「從網址匯入」是否允許內網位址（預設關閉以避免 SSRF） |
+| `MAX_UPLOAD_MB` | `2048` | 單一上傳檔案的大小上限（MB，zip 也算一個檔案；一次上傳幾個檔案都可以；`0` = 不限制） |
+| `AITOOLKIT_URL` | Docker Compose 為 `http://aitoolkit:8675`，其他為空 | 本機訓練：AI Toolkit 服務的網址。不用 Docker 時一定要設（例如 `http://localhost:8675`），否則訓練頁一直顯示還沒設定 |
 | `AI_TOOLKIT_AUTH` | 空 | 本機訓練：LoRA Tag Studio 和 AI Toolkit 之間的密碼，開 `aitoolkit` profile 時必填 |
 | `AITOOLKIT_BASE_MODELS_DIR` | `./data/aitoolkit/base-models` | 本機訓練的底模資料夾（Forge 的 `models/Stable-diffusion`） |
 | `AITOOLKIT_GPU` | `0` | 本機訓練用哪張 GPU |

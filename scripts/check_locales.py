@@ -109,6 +109,15 @@ def js_array(src: str, name: str) -> list[str]:
     return re.findall(r"'([^']+)'", m.group(1))
 
 
+def js_object_values(src: str, name: str) -> list[str]:
+    """`const NAME = { a: 'x.y', … };` 的字串值。"""
+    m = re.search(rf"const {name} = \{{(.*?)\}};", src, re.S)
+    if not m:
+        err(f"app.js: 找不到 {name}")
+        return []
+    return re.findall(r":\s*'([^']+)'", m.group(1))
+
+
 def check_ui_keys(ui: dict[str, Any]) -> None:
     js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
@@ -125,6 +134,8 @@ def check_ui_keys(ui: dict[str, Any]) -> None:
     keys |= {f"rating.{k}" for k in js_array(js, "RATINGS")}
     keys |= {f"status.{k}" for k in js_array(js, "STATUSES")}
     keys |= {f"api.tools.{k}" for k in js_array(js, "MCP_TOOLS")}
+    keys |= set(js_object_values(js, "FIELD_LABELS"))  # 422 錯誤的欄位名稱
+    keys |= {f"valid.{k}" for k in js_object_values(js, "VALID_TYPES")}
     keys |= {f"projects.step{n}_{p}" for n in range(1, 5) for p in ("title", "desc")}
     keys |= {f"family.{k}" for k in re.findall(r'"family":\s*"(\w+)"', (ROOT / "app" / "profiles.py").read_text())}
 

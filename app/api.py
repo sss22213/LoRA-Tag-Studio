@@ -7,7 +7,7 @@ import io
 import mimetypes
 import os
 import zipfile
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -411,7 +411,7 @@ def gpu_settings(body: GpuSettings) -> dict[str, Any]:
 
 @router.post("/gpu/{action}", operation_id="manage_vram",
              summary="Free or load VRAM: release_wd14 | load_wd14 | sleep_vlm | wake_vlm | release_waifu2x | "
-                     "release_ccip",
+                     "release_ccip | unload_forge",
              description="release_wd14 unloads the WD14 models (reloaded automatically on the next tagging). "
                          "release_waifu2x unloads the upscaling models (also done automatically after each "
                          "upscaling job). "
@@ -454,10 +454,23 @@ def list_projects() -> list[dict[str, Any]]:
     return [services.project_out(p) for p in db.list_projects()]
 
 
+_PROJECT_FIELDS = ("profile", "lora_type", "trigger", "class_word")
+
+
+def _create_project(body: ProjectCreate) -> dict[str, Any]:
+    """settings 裡和欄位同名的鍵（trigger、profile…）不能再當成關鍵字參數傳（會變成 500）：
+    有填欄位時用欄位的值，沒填時才用 settings 裡的。"""
+    extra = dict(body.settings or {})
+    extra.pop("name", None)
+    named = {k: extra.pop(k) for k in _PROJECT_FIELDS if k in extra}
+    args = {k: named[k] if k not in body.model_fields_set and isinstance(named.get(k), str) else getattr(body, k)
+            for k in _PROJECT_FIELDS}
+    return services.create_project(body.name, **args, **extra)
+
+
 @router.post("/projects", operation_id="create_project", status_code=201)
 def create_project(body: ProjectCreate) -> dict[str, Any]:
-    return services.create_project(body.name, body.profile, body.lora_type, body.trigger, body.class_word,
-                                   **(body.settings or {}))
+    return _create_project(body)
 
 
 @router.get("/projects/{pid}", operation_id="get_project")
@@ -477,6 +490,24 @@ def delete_project(pid: str) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------ images
+def _check_upload_size(files: list[UploadFile]) -> None:
+    """MAX_UPLOAD_MB：單一檔案（含 zip）的大小上限，一次上傳幾個檔案都可以（0 = 不限制）。"""
+    limit = settings.max_upload_mb * 1024 * 1024
+    if limit <= 0:
+        return
+    for f in files:
+        if (f.size or 0) > limit:
+            raise HTTPException(413, t("msg.upload_too_large", name=f.filename or "", mb=settings.max_upload_mb))
+
+
+def _upload_entry(name: str, f: UploadFile) -> storage.Entry:
+    """上傳的檔案等到儲存時才從暫存檔讀出來，不必一次把整批圖片讀進記憶體。"""
+    def read() -> bytes:
+        f.file.seek(0)
+        return f.file.read()
+    return name, read
+
+
 @router.get("/projects/{pid}/images", operation_id="list_images",
             summary="List images with tags, natural caption and the final training caption")
 def list_images(pid: str, status: str | None = Query(None, description="pending/queued/processing/done/error"),
@@ -489,6 +520,7 @@ def list_images(pid: str, status: str | None = Query(None, description="pending/
 async def upload(pid: str, files: list[UploadFile] = File(...),
                  paths: list[str] | None = Form(None, description="Relative paths (same order as files)")) -> dict[str, Any]:
     project = services.require_project(pid)
+    _check_upload_size(files)
     trigger = project["settings"].get("trigger", "")
     entries: list[storage.Entry] = []
     zips: list[UploadFile] = []
@@ -497,7 +529,7 @@ async def upload(pid: str, files: list[UploadFile] = File(...),
         if name.lower().endswith(".zip"):
             zips.append(f)  # zip 直接從暫存檔讀取，不整包載入記憶體
         else:
-            entries.append(storage.bytes_entry(name, await f.read()))
+            entries.append(_upload_entry(name, f))
 
     def work() -> dict[str, Any]:
         result = storage.import_entries(pid, entries, trigger=trigger)
@@ -664,13 +696,14 @@ async def finder_upload(sid: str, role: FinderRole = Query(...), files: list[Upl
                         paths: list[str] | None = Form(None, description="Relative paths (same order as files)")
                         ) -> dict[str, Any]:
     finder.require_session(sid)
+    _check_upload_size(files)
     entries, zips = [], []
     for i, f in enumerate(files):
         name = (paths[i] if paths and i < len(paths) and paths[i] else f.filename) or f"file_{i}"
         if name.lower().endswith(".zip"):
             zips.append((name, f.file))
         else:
-            entries.append(storage.bytes_entry(name, await f.read()))
+            entries.append(_upload_entry(name, f))
     return await run_in_threadpool(finder.add_uploads, sid, role, entries, zips)
 
 
@@ -786,9 +819,7 @@ def finder_to_project(sid: str, body: FinderToProject) -> dict[str, Any]:
     if body.project_id:
         pid = body.project_id
     elif body.new_project:
-        np_ = body.new_project
-        pid = services.create_project(np_.name, np_.profile, np_.lora_type, np_.trigger, np_.class_word,
-                                      **(np_.settings or {}))["id"]
+        pid = _create_project(body.new_project)["id"]
     else:
         raise HTTPException(400, t("msg.finder_need_project"))
     result = finder.to_project(sid, body.ids, pid, allow_duplicates=body.allow_duplicates)
@@ -934,8 +965,9 @@ def _export(pid: str, body: ExportRequest):
 @router.get("/projects/{pid}/export", operation_id="download_dataset_zip", response_class=FileResponse,
             summary="Build and download the training zip (Civitai: images + same-name .txt)")
 def export_get(pid: str, format: Literal["civitai", "kohya", "jsonl"] = "civitai",
-               image_format: Literal["original", "png", "jpg", "webp"] = "original", max_side: int = 0,
-               repeats: int = 10, naming: Literal["original", "sequential"] = "original",
+               image_format: Literal["original", "png", "jpg", "webp"] = "original",
+               max_side: int = Query(0, ge=0),  # 範圍和 ExportRequest 相同：錯的值回 422，不是 500
+               repeats: int = Query(10, ge=1), naming: Literal["original", "sequential"] = "original",
                only_done: bool = False) -> FileResponse:
     path, excluded = _export(pid, ExportRequest(format=format, image_format=image_format, max_side=max_side,
                                                 repeats=repeats, naming=naming, only_done=only_done))
@@ -975,6 +1007,7 @@ async def quick_tag_upload(file: UploadFile = File(...), profile: str = Form("il
                            vlm_nsfw: bool | None = Form(None), vlm_tags: VlmTagMode | None = Form(None)) -> dict[str, Any]:
     if profile not in PROFILES:
         raise HTTPException(400, t("msg.unknown_profile", profile=profile, available=", ".join(PROFILES)))
+    _check_upload_size([file])
     im = services.decode_image(await file.read())
     return await run_in_threadpool(_quick, im, profile=profile, lora_type=lora_type, trigger=trigger,
                                    caption_mode=caption_mode, use_vlm=use_vlm, vlm_nsfw=vlm_nsfw, vlm_tags=vlm_tags)
@@ -1109,7 +1142,10 @@ class LocalTrainRequest(BaseModel):
     train_text_encoder: bool | None = Field(None, description="SD family only")
     text_encoder_lr: float | None = Field(None, gt=0, le=1, description="SD family only; used when train_text_encoder")
     continue_from: str = Field("", description="Continue from an earlier run of this training project: <run id>:<epoch>")
-    resolutions: list[int] | None = Field(None, description="Training resolutions (bucket sizes)")
+    # 每個解析度都要在合理範圍內（0、負數、超大值要在這裡擋下，不能等 AI Toolkit 開始訓練才失敗）
+    resolutions: list[Annotated[int, Field(ge=256, le=4096)]] | None = Field(
+        None, description="Training resolutions (bucket sizes), 256–4096 each; GET /aitoolkit → resolutions lists the "
+                          "usual ones")
     cache_latents: bool = Field(True, description="Cache image latents to disk (faster, more disk)")
     cache_text: bool = Field(False, description="Cache text embeddings (faster). Ignored with shuffle_tokens or train_text_encoder")
     max_side: int = Field(2048, ge=512, le=4096, description="Images larger than this long side are downscaled in the snapshot")

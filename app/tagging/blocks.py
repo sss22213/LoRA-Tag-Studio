@@ -17,6 +17,7 @@ CELL_WHITE = 0.97  # 格子裡白色像素的比例
 MIN_AREA = 0.04  # 矩形至少佔整張圖的比例
 MIN_W, MIN_H = 0.08, 0.15  # 矩形最小寬高（比例）
 MAX_RECTS = 4
+MAX_TRIES = 16  # 最多找幾次最大矩形（太扁的白條不算，但要繼續往下找）
 
 
 def _largest_rect(grid: np.ndarray) -> tuple[int, int, int, int, int]:
@@ -48,13 +49,17 @@ def detect_white_blocks(im: Image.Image) -> dict[str, Any]:
     rects: list[list[float]] = []
     total = GRID_W * GRID_H
     area_sum = 0
-    for _ in range(MAX_RECTS):
+    for _ in range(MAX_TRIES):
         area, x, y, w, h = _largest_rect(grid)
-        if area / total < MIN_AREA or w < GRID_W * MIN_W or h < GRID_H * MIN_H:
+        if area / total < MIN_AREA:  # 剩下的都更小
             break
+        grid[y:y + h, x:x + w] = False
+        if w < GRID_W * MIN_W or h < GRID_H * MIN_H:
+            continue  # 太扁（滿版白邊、白色字幕條）：不算色塊，但後面可能還有真正的色塊
         rects.append([round(x / GRID_W, 3), round(y / GRID_H, 3), round(w / GRID_W, 3), round(h / GRID_H, 3)])
         area_sum += area
-        grid[y:y + h, x:x + w] = False
+        if len(rects) >= MAX_RECTS:
+            break
     return {"rects": rects, "area": round(area_sum / total, 3)}
 
 

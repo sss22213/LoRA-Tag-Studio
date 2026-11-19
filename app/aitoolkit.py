@@ -75,10 +75,13 @@ RESOLUTIONS = (512, 768, 1024, 1280, 1536)
 SOURCES = ("project", "folder")
 TRAIN_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")  # AI Toolkit 只讀這些，其他格式在快照裡轉成 JPEG
 STOP_RETRY_S = 30  # 停止後這麼久還沒結束，再按一次就直接標記為停止
+CANCEL_RECHECK_S = 1.5  # 取消剛排進佇列的工作後，隔多久確認 AI Toolkit 沒有剛好啟動它（它的 worker 每秒看一次佇列）
+CANCEL_CHECKS = 3
 ACTIVE = ("preparing", "queued", "running", "stopping")
 # AI Toolkit 的工作狀態 → LTS 的狀態
 JOB_STATUS = {"queued": "queued", "running": "running", "stopping": "stopping", "completed": "succeeded", "error": "failed",
               "stopped": "canceled"}
+_JOB_ACTIVE = ("queued", "running", "stopping")  # AI Toolkit 這邊還會（或正在）跑的工作狀態
 _STATUS_TTL = 5.0
 _BASE_TTL = 60.0
 _status_cache: dict[str, Any] = {"at": 0.0, "value": None}
@@ -487,27 +490,77 @@ def _prepare(rid: str, p: dict[str, Any], tp: dict[str, Any], params: dict[str, 
             if r.status_code != 200:
                 raise AIToolkitError(t("msg.aitoolkit_failed", error=f"HTTP {r.status_code} {r.text[:200]}"))
             job_id = r.json()["id"]
-            db.train_run_update(rid, job_id=job_id, status="queued", summary=summary)
+            # 先記下 job_id，狀態維持 preparing：AI Toolkit 剛建立的工作是 stopped，/start 之前去查會被當成已停止
+            # 送出工作要一點時間，這段時間也可能按了停止：工作還沒開始，直接刪掉
+            if not db.train_run_update(rid, when=("preparing",), job_id=job_id, summary=summary):
+                try:
+                    _request("GET", f"/api/jobs/{job_id}/delete")
+                except AIToolkitError as e:
+                    log.warning("刪除已停止的 AI Toolkit 工作 %s 失敗：%s", job_id, e)
+                shutil.rmtree(dest, ignore_errors=True)
+                return
             for path in (f"/api/jobs/{job_id}/start", f"/api/queue/{settings.aitoolkit_gpu}/start"):
                 r = _request("GET", path)
                 if r.status_code != 200:
                     raise AIToolkitError(t("msg.aitoolkit_failed", error=f"HTTP {r.status_code} {r.text[:200]}"))
+            # 排進佇列之後才改成 queued；/start 的這段時間按了停止的話，取消剛排進佇列的工作
+            if not db.train_run_update(rid, when=("preparing",), status="queued"):
+                _cancel_job(job_id)
         except Exception as e:  # noqa: BLE001  顯示在訓練紀錄上
             log.exception("本機訓練 %s 準備失敗", rid)
-            db.train_run_update(rid, status="failed", error=str(e) or e.__class__.__name__)
+            # 已經按了停止的不改成失敗（停止的狀態優先）
+            failed = db.train_run_update(rid, when=("preparing",), status="failed", error=str(e) or e.__class__.__name__)
+            cur = db.train_run_get(rid)
+            if cur is not None and cur["job_id"]:
+                # 工作可能已經排進佇列（例如 /start 成功、啟動佇列失敗），LTS 不再追蹤它，不能讓它之後自己開始
+                _cancel_job(cur["job_id"])
+            elif cur is None or not failed:  # 還沒交給 AI Toolkit 就停止：快照直接刪掉
+                shutil.rmtree(dest, ignore_errors=True)
+
+
+def _job(job_id: str) -> dict[str, Any] | None:
+    """AI Toolkit 的工作資料（status、pid…）；工作不見了是 None。"""
+    r = _request("GET", "/api/jobs", params={"id": job_id})
+    if r.status_code != 200:
+        raise AIToolkitError(t("msg.aitoolkit_failed", error=f"HTTP {r.status_code}"))
+    return r.json()
+
+
+def _cancel_job(job_id: str) -> None:
+    """取消已經交給 AI Toolkit、但 LTS 這邊已經停止或失敗的工作（在背景執行緒裡跑，會等幾秒確認）。
+    AI Toolkit 的 /stop 只對已經在跑（有 pid）的工作有用；還在佇列裡的工作 /stop 會被忽略、之後照樣開始，
+    要用 mark_stopped 把狀態改成 stopped，worker 才不會啟動它。worker 剛好在這時啟動的話，下一輪再用 /stop 停掉。"""
+    try:
+        job = _job(job_id)
+        for _ in range(CANCEL_CHECKS):
+            if not job or job.get("status") not in _JOB_ACTIVE:
+                return
+            _request("GET", f"/api/jobs/{job_id}/{'stop' if job.get('pid') else 'mark_stopped'}")
+            time.sleep(CANCEL_RECHECK_S)
+            job = _job(job_id)
+        if job and job.get("status") in _JOB_ACTIVE:
+            log.warning("AI Toolkit 工作 %s 取消後仍在執行（%s）", job_id, job.get("status"))
+    except (AIToolkitError, ValueError) as e:
+        log.warning("取消 AI Toolkit 工作 %s 失敗：%s", job_id, e)
 
 
 # ------------------------------------------------------------------ 進度與結果
 def _refresh(run: dict[str, Any]) -> dict[str, Any]:
     """還在跑的訓練，向 AI Toolkit 查最新狀態。服務連不上時維持原狀，畫面會提示。"""
-    if run["status"] not in ACTIVE or not run["job_id"]:
+    # 準備中（含剛送出、還沒 /start）不查：AI Toolkit 剛建立的工作是 stopped，會被誤當成已停止
+    if run["status"] not in ACTIVE or run["status"] == "preparing" or not run["job_id"]:
         return run
     try:
         r = _request("GET", "/api/jobs", params={"id": run["job_id"]})
+        # 暫時的錯誤（HTTP 500、回應不是 JSON）不能當成工作不見：維持原狀，之後再查
+        if r.status_code != 200:
+            raise AIToolkitError(t("msg.aitoolkit_failed", error=f"HTTP {r.status_code}"))
+        job = r.json()
     except AIToolkitError as e:
         return {**run, "offline": str(e)}
-    job = r.json() if r.status_code == 200 else None
-    if not job:  # 工作不見了：AI Toolkit 的資料庫被清掉
+    except ValueError:
+        return {**run, "offline": t("msg.aitoolkit_failed", error=r.text[:200])}
+    if not job:  # 工作不見了（AI Toolkit 回 null）：AI Toolkit 的資料庫被清掉
         db.train_run_update(run["id"], status="failed", error=t("msg.train_job_gone"))
         return db.train_run_get(run["id"])
     new = JOB_STATUS.get(job.get("status"), run["status"])
@@ -609,12 +662,19 @@ def stop_run(rid: str) -> dict[str, Any]:
     run = _refresh(_require_run(rid))
     if run["status"] not in ACTIVE:
         raise BadRequest(t("msg.train_not_active"))
-    if not run["job_id"]:  # 還在準備資料：_prepare 看到就會停下
-        db.train_run_update(rid, status="canceled")
-        return get_run(rid)
-    # 再按一次：訓練行程可能已經不在了（例如 AI Toolkit 容器重啟過），這時要直接標記，佇列才不會一直等它
+    if run["status"] == "preparing":  # 還在準備資料或正在送出：_prepare 看到就會停下，已經送出的工作由它取消
+        if db.train_run_update(rid, when=("preparing",), status="canceled"):
+            return get_run(rid)
+        run = _refresh(_require_run(rid))  # 剛好排進佇列了：照一般的方式停止
+        if run["status"] not in ACTIVE or not run["job_id"]:
+            raise BadRequest(t("msg.train_not_active"))
     asked = run["summary"].get("stop_requested_at")
-    action = "mark_stopped" if asked and time.time() - asked > STOP_RETRY_S else "stop"
+    if run["status"] == "queued":
+        # 還在 AI Toolkit 的佇列裡：/stop 只停已經在跑的工作，排隊中的會被忽略、之後照樣開始，所以直接標記為停止
+        action = "mark_stopped"
+    else:
+        # 再按一次：訓練行程可能已經不在了（例如 AI Toolkit 容器重啟過），這時要直接標記，佇列才不會一直等它
+        action = "mark_stopped" if asked and time.time() - asked > STOP_RETRY_S else "stop"
     r = _request("GET", f"/api/jobs/{run['job_id']}/{action}")
     if r.status_code != 200:
         raise AIToolkitError(t("msg.aitoolkit_failed", error=f"HTTP {r.status_code} {r.text[:200]}"))

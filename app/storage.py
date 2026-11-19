@@ -95,6 +95,8 @@ def save_image_bytes(
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
+    except Image.DecompressionBombError:  # 像素多到可能是攻擊（不是 OSError）：這張略過，不中斷整批匯入
+        return None, t("msg.image_too_many_pixels", limit=f"{Image.MAX_IMAGE_PIXELS * 2:,}")
     except (UnidentifiedImageError, OSError) as e:
         return None, t("msg.cannot_read_image", error=e)
 
@@ -127,7 +129,7 @@ def save_image_bytes(
 
     tags, nl = parse_caption_file(caption_text, trigger) if caption_text else ([], "")
     rec = db.add_image(
-        pid, id=iid, filename=f"{iid}{ext}", original_name=Path(original_name).name, rel_path=rel_path,
+        pid, id=iid, filename=f"{iid}{ext}", original_name=base_name(original_name), rel_path=rel_path,
         width=final.width, height=final.height, size=len(data), sha1=sha1, tags=tags, nl_caption=nl, blocks=blocks,
     )
     return rec, None
@@ -153,6 +155,11 @@ def delete_project_files(pid: str) -> None:
 Entry = tuple[str, Callable[[], bytes]]
 
 
+def base_name(path: str) -> str:
+    """路徑的檔名：Windows 的反斜線也當成分隔符號（..\\..\\x.png → x.png），存進資料庫或放進 zip 都不會帶路徑。"""
+    return PurePosixPath(path.replace("\\", "/")).name
+
+
 def stem_key(path: str) -> str:
     p = PurePosixPath(path.replace("\\", "/"))
     return str(p.with_suffix("")).lower()
@@ -160,7 +167,8 @@ def stem_key(path: str) -> str:
 
 def _is_wanted(path: str) -> bool:
     name = PurePosixPath(path.replace("\\", "/"))
-    if any(part.startswith(".") or part == "__MACOSX" for part in name.parts):
+    # 「..」是上一層，不是隱藏檔：zip 裡的 ../x.png 照樣匯入（只用檔名，存檔一律用 <iid>）
+    if any((part.startswith(".") and part != "..") or part == "__MACOSX" for part in name.parts):
         return False
     return name.suffix.lower() in IMAGE_EXTS or name.suffix.lower() in (".txt", ".caption")
 
@@ -188,7 +196,7 @@ def import_entries(pid: str, entries: Iterable[Entry], trigger: str = "",
         except OSError as e:
             skipped.append({"file": path, "reason": t("msg.read_failed", error=e)})
             continue
-        rec, reason = save_image_bytes(pid, data, PurePosixPath(path).name, rel_path=path,
+        rec, reason = save_image_bytes(pid, data, base_name(path), rel_path=path,
                                        caption_text=caption, trigger=trigger, allow_duplicate=allow_duplicates)
         if rec:
             added.append(rec["id"])

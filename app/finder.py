@@ -309,8 +309,8 @@ def after_add(sid: str, role: str, added: int) -> None:
 
 def _is_image(name: str) -> bool:
     p = PurePosixPath(name.replace("\\", "/"))
-    return p.suffix.lower() in storage.IMAGE_EXTS and not any(
-        part.startswith(".") or part == "__MACOSX" for part in p.parts)
+    return p.suffix.lower() in storage.IMAGE_EXTS and not any(  # 「..」是上一層，不是隱藏檔（存檔一律用 <iid>）
+        (part.startswith(".") and part != "..") or part == "__MACOSX" for part in p.parts)
 
 
 def add_bytes(sid: str, role: str, name: str, data: bytes, rel_path: str = "") -> str | None:
@@ -322,7 +322,7 @@ def add_bytes(sid: str, role: str, name: str, data: bytes, rel_path: str = "") -
     dest = session_dir(sid) / f"{iid}{PurePosixPath(name).suffix.lower()}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
-    return db.finder_image_add(sid, role, PurePosixPath(name.replace("\\", "/")).name, str(dest),
+    return db.finder_image_add(sid, role, storage.base_name(name), str(dest),
                                rel_path=rel_path or name, sha1=sha1, iid=iid)
 
 
@@ -407,7 +407,9 @@ def add_from_project(sid: str, role: str, project_id: str, ids: list[str] | None
         iid = db.new_id()
         dest = session_dir(sid) / f"{iid}{src.suffix}"
         _link_or_copy(src, dest)
-        db.finder_image_add(sid, role, img["original_name"], str(dest), rel_path=img["rel_path"] or img["original_name"],
+        # 舊資料的 original_name 可能還帶著反斜線路徑（..\x.png）：只留檔名，篩選下載的 zip 才不會有路徑
+        db.finder_image_add(sid, role, storage.base_name(img["original_name"]), str(dest),
+                            rel_path=img["rel_path"] or img["original_name"],
                             sha1=img["sha1"], iid=iid)
         if storage.thumb_path(img).exists():  # 專案已有縮圖，直接沿用
             _link_or_copy(storage.thumb_path(img), session_dir(sid) / "thumbs" / f"{iid}.webp")
@@ -1104,7 +1106,8 @@ def _selected(sid: str, ids: list[str] | None) -> list[dict[str, Any]]:
 
 def _export_name(img: dict[str, Any], s: dict[str, Any]) -> str:
     """處理過的多人圖存成 PNG（不再壓縮一次）。"""
-    return f"{PurePosixPath(img['original_name']).stem}.png" if processed_mode(img, s) else img["original_name"]
+    name = storage.base_name(img["original_name"])  # zip 項目只用檔名，不能帶 ..\ 之類的路徑
+    return f"{PurePosixPath(name).stem}.png" if processed_mode(img, s) else name
 
 
 def _export_bytes(img: dict[str, Any], s: dict[str, Any]) -> bytes:
@@ -1136,7 +1139,9 @@ def download(sid: str, ids: list[str] | None = None) -> tuple[Path, int]:
     imgs = _selected(sid, ids)
     settings.exports_dir.mkdir(parents=True, exist_ok=True)
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in s["name"]).strip("_") or "finder"
-    out = settings.exports_dir / f"{safe}_finder_{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    from .exporter import unique_zip_name
+
+    out = settings.exports_dir / unique_zip_name(f"{safe}_finder")  # 同一秒內下載兩次也不會同名
     count = 0
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as zf:  # 圖片本來就壓縮過
         for img, name in zip(imgs, _unique_names([_export_name(i, s) for i in imgs])):

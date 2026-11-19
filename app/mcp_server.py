@@ -7,14 +7,15 @@ from __future__ import annotations
 import base64
 import binascii
 import functools
+import logging
 from typing import Any, Callable
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
 
 from . import aitoolkit, civitai, db, exporter, jobs, services, storage
 from .pipeline import quick_tag
-from .i18n import use_lang
+from .i18n import t, use_lang
 from .profiles import PROFILES, guide_markdown, list_profiles as _list_profiles
 from .tagging.vlm import VLMError
 
@@ -41,8 +42,12 @@ For a single image without a project use quick_tag_image.
 mcp = MCPServer(name="lora-tag-studio", title="LoRA Tag Studio", instructions=INSTRUCTIONS)
 
 
+log = logging.getLogger(__name__)
+
+
 def _tool(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """註冊 MCP 工具；可預期的錯誤轉成 ToolError，讓 LLM 看得到原因。"""
+    """註冊 MCP 工具；可預期的錯誤直接回傳 isError 結果，讓 LLM 看得到原因。
+    不用 raise ToolError：MCP SDK 會在訊息前加上英文的「Error executing tool <名稱>: 」。"""
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -50,7 +55,8 @@ def _tool(fn: Callable[..., Any]) -> Callable[..., Any]:
             return fn(*args, **kwargs)
         except (services.NotFound, services.BadRequest, civitai.CivitaiError, ValueError, KeyError, VLMError,
                 binascii.Error) as e:
-            raise ToolError(str(e)) from e
+            log.info("Tool %r failed: %r", fn.__name__, str(e))
+            return CallToolResult(content=[TextContent(type="text", text=str(e))], is_error=True)
 
     return mcp.tool()(wrapper)
 
@@ -68,7 +74,7 @@ def get_tagging_guide(profile: str, language: str = "") -> str:
     language: en | zh-TW | zh-CN | ja | ko (empty = server default).
     """
     if profile not in PROFILES:
-        raise ValueError(f"unknown profile {profile}; available: {', '.join(PROFILES)}")
+        raise services.BadRequest(t("msg.unknown_profile", profile=profile, available=", ".join(PROFILES)))
     with use_lang(language or None):
         return guide_markdown(profile)
 
@@ -93,14 +99,18 @@ def quick_tag_image(
               | merge (WD14 + all VLM tags) | only (VLM tags only). Empty = off.
     """
     if profile not in PROFILES:
-        raise ValueError(f"unknown profile {profile}")
+        raise services.BadRequest(t("msg.unknown_profile", profile=profile, available=", ".join(PROFILES)))
     if image_base64:
         data = image_base64.split(",", 1)[1] if image_base64.startswith("data:") else image_base64
-        im = services.decode_image(base64.b64decode(data))
+        try:
+            raw = base64.b64decode(data)
+        except binascii.Error as e:
+            raise services.BadRequest(t("msg.invalid_base64")) from e
+        im = services.decode_image(raw)
     elif image_url:
         im = services.fetch_image(image_url)
     else:
-        raise ValueError("image_url or image_base64 is required")
+        raise services.BadRequest(t("msg.image_required"))
     overrides: dict[str, Any] = {"trigger": trigger}
     if caption_mode:
         overrides["caption_mode"] = caption_mode
@@ -199,7 +209,7 @@ def get_job_status(job_id: str) -> dict[str, Any]:
     done | cancelled | error)."""
     job = jobs.get(job_id)
     if job is None:
-        raise ValueError("job not found")
+        raise services.NotFound(t("msg.job_not_found"))
     return job.to_dict()
 
 
@@ -274,6 +284,7 @@ def get_tag_stats(project_id: str, top: int = 100) -> dict[str, Any]:
 def export_dataset(project_id: str, format: str = "civitai", image_format: str = "original", max_side: int = 0,
                    repeats: int = 10) -> dict[str, Any]:
     """Build the training zip. format: civitai (images + .txt) | kohya | jsonl. Returns a download URL."""
+    services.require_project(project_id)  # 和 REST 相同的 msg.project_not_found
     path, excluded = exporter.export_dataset(project_id, format, image_format, max_side, repeats)
     return {"download_url": services.absolute_url(f"/api/exports/{path.name}"),
             "size_bytes": path.stat().st_size, "excluded": excluded}

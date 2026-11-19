@@ -194,7 +194,10 @@ def connect() -> sqlite3.Connection:
                         _conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
             _conn.execute("DROP INDEX IF EXISTS idx_images_sha")  # 舊版的唯一索引（同一個專案不能有一樣的圖）
             # 服務重啟時，未完成的工作已不存在（訓練是 AI Toolkit 在跑，只有還在準備資料的會中斷）
-            _conn.execute("UPDATE train_runs SET status='failed', error='interrupted' WHERE status='preparing'")
+            _conn.execute("UPDATE train_runs SET status='failed', error='interrupted' "
+                          "WHERE status='preparing' AND (job_id IS NULL OR job_id='')")
+            # 已經送出給 AI Toolkit 的（中斷在 /start 前後）交給查詢更新：沒開始的會顯示為已停止，排進佇列的照常追蹤
+            _conn.execute("UPDATE train_runs SET status='queued' WHERE status='preparing' AND job_id IS NOT NULL AND job_id<>''")
             _conn.execute(f"UPDATE images SET status={_RESTORED_STATUS} WHERE status IN ('queued','processing')")
         return _conn
 
@@ -685,12 +688,16 @@ def train_runs_with_status(statuses: Iterable[str]) -> list[dict[str, Any]]:
     return [_train_run(r) for r in _q(f"SELECT * FROM train_runs WHERE status IN ({marks}) ORDER BY created_at", tuple(statuses))]
 
 
-def train_run_update(rid: str, **fields: Any) -> None:
-    """fields：job_id、image_count、status、summary、error。"""
+def train_run_update(rid: str, when: Iterable[str] | None = None, **fields: Any) -> bool:
+    """fields：job_id、image_count、status、summary、error。when：只在目前的狀態是其中之一時才更新
+    （例如準備資料時被按了停止，不能再改回 queued）。回傳有沒有更新。"""
     if "summary" in fields:
         fields["summary"] = json.dumps(fields["summary"], ensure_ascii=False)
     cols = ", ".join(f"{k}=?" for k in fields)
-    _x(f"UPDATE train_runs SET {cols}, updated_at=? WHERE id=?", (*fields.values(), time.time(), rid))
+    statuses = list(when or ())
+    cond = f" AND status IN ({','.join('?' * len(statuses))})" if statuses else ""
+    return _x(f"UPDATE train_runs SET {cols}, updated_at=? WHERE id=?{cond}",
+              (*fields.values(), time.time(), rid, *statuses)) > 0
 
 
 def train_run_delete(rid: str) -> None:

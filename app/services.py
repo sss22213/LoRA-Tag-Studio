@@ -113,10 +113,32 @@ def require_project(pid: str) -> dict[str, Any]:
     return p
 
 
+_NUMERIC_SETTINGS = {"general_threshold": float, "character_threshold": float, "max_tags": int}
+
+
+def _check_settings(patch: dict[str, Any]) -> None:
+    """數值設定的型別不對（例如門檻送成文字）或底模不存在時回 400，不寫入；其他設定由 normalize_settings 修正成預設值。"""
+    for key, conv in _NUMERIC_SETTINGS.items():
+        value = patch.get(key)
+        if value is None:
+            continue
+        try:
+            conv(value)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise BadRequest(t("msg.bad_setting", setting=key, value=value)) from e
+    for key in ("profile", "lora_type"):  # 用來查表，不是文字會變成 500
+        if patch.get(key) is not None and not isinstance(patch[key], str):
+            raise BadRequest(t("msg.bad_setting", setting=key, value=patch[key]))
+    if patch.get("profile") is not None and patch["profile"] not in PROFILES:
+        # 不存在的底模直接報錯，不默默改回預設底模（有沒有 reset_to_profile 都一樣）
+        raise BadRequest(t("msg.unknown_profile", profile=patch["profile"], available=", ".join(PROFILES)))
+
+
 def create_project(name: str, profile: str = "illustrious", lora_type: str = "character", trigger: str = "",
                    class_word: str = "", **overrides: Any) -> dict[str, Any]:
     if profile not in PROFILES:
         raise BadRequest(t("msg.unknown_profile", profile=profile, available=", ".join(PROFILES)))
+    _check_settings(overrides)
     name = (name or "").strip() or t("msg.untitled_project")
     s = default_settings(profile, lora_type, trigger=trigger.strip(), class_word=class_word.strip(), **overrides)
     return project_out(db.create_project(name, normalize_settings(s)))
@@ -127,6 +149,7 @@ def update_project(pid: str, name: str | None = None, patch: dict[str, Any] | No
     p = require_project(pid)
     s = normalize_settings(p["settings"])
     if patch:
+        _check_settings(patch)
         if reset_to_profile and patch.get("profile"):
             # 切換底模：套用新底模的預設值，但保留 trigger 等專案資訊
             keep = {k: s[k] for k in ("trigger", "class_word", "blacklist", "vlm_engine", "vlm_cli_model")}
@@ -286,13 +309,35 @@ def _check_host(request: httpx.Request) -> None:
         raise BadRequest(t("msg.cannot_resolve_host", host=host)) from e
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        # 只允許公網位址：is_private 不含 CGNAT（100.64.0.0/10，Tailscale 常用）等非公網範圍，所以用 is_global
+        if not ip.is_global or ip.is_multicast:
             raise BadRequest(t("msg.private_url_blocked", host=host))
 
 
 def _http_client() -> httpx.Client:
     return httpx.Client(timeout=60, follow_redirects=True, headers={"User-Agent": "lora-tag-studio/1.0"},
                         event_hooks={"request": [_check_host]})
+
+
+URL_MAX_BYTES = 50 * 1024 * 1024  # 從網址下載的單一檔案上限（msg.file_too_large）
+
+
+def _download(client: httpx.Client, url: str) -> bytes:
+    """邊下載邊檢查大小，超過上限就中斷（不先把整個檔案讀進記憶體）。"""
+    with client.stream("GET", url) as r:
+        r.raise_for_status()
+        try:
+            declared = int(r.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        if declared > URL_MAX_BYTES:
+            raise BadRequest(t("msg.file_too_large"))
+        buf = bytearray()
+        for chunk in r.iter_bytes():
+            buf += chunk
+            if len(buf) > URL_MAX_BYTES:
+                raise BadRequest(t("msg.file_too_large"))
+        return bytes(buf)
 
 
 def import_urls(pid: str, urls: list[str]) -> dict[str, Any]:
@@ -305,14 +350,11 @@ def import_urls(pid: str, urls: list[str]) -> dict[str, Any]:
                 skipped.append({"file": url, "reason": t("msg.http_only")})
                 continue
             try:
-                r = client.get(url)
-                r.raise_for_status()
-                if len(r.content) > 50 * 1024 * 1024:
-                    raise ValueError(t("msg.file_too_large"))
+                data = _download(client, url)
                 name = PurePosixPath(urlparse(url).path).name or "image"
                 if not PurePosixPath(name).suffix:
                     name += ".png"
-                entries.append(storage.bytes_entry(name, r.content))
+                entries.append(storage.bytes_entry(name, data))
             except Exception as e:  # noqa: BLE001
                 skipped.append({"file": url, "reason": str(e)})
     result = storage.import_entries(pid, entries, trigger=trigger)
@@ -334,11 +376,10 @@ def fetch_image(url: str) -> Image.Image:
         raise BadRequest(t("msg.http_only"))
     try:
         with _http_client() as client:
-            r = client.get(url)
-            r.raise_for_status()
+            data = _download(client, url)
     except httpx.HTTPError as e:
         raise BadRequest(t("msg.download_failed", error=e)) from e
-    return decode_image(r.content)
+    return decode_image(data)
 
 
 # ------------------------------------------------------------------ 標註

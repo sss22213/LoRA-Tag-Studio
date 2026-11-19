@@ -87,16 +87,50 @@ const state = {
 };
 
 /* ---------------------------------------------------------------- API */
+// 422（FastAPI 的欄位驗證錯誤）的 detail 是清單：欄位名稱換成表單上的標籤（沒有的照原名），錯誤類型換成各語言的句子
+const FIELD_LABELS = {
+  steps: 'civitai.steps', epochs: 'civitai.epochs', lr: 'civitai.lr', network_dim: 'civitai.dim', network_alpha: 'civitai.alpha',
+  noise_offset: 'civitai.noise_offset', keep_tokens: 'civitai.keep_tokens', min_snr_gamma: 'civitai.min_snr',
+  text_encoder_lr: 'civitai.te_lr', sample_prompts: 'civitai.samples', sample_cfg: 'civitai.sample_cfg',
+  sample_strength: 'civitai.sample_strength', max_side: 'train.max_side', resolutions: 'train.resolutions',
+  repeats: 'export.repeats', name: 'train.name', instructions: 'refine.instructions', port: 'smb.port',
+};
+const VALID_TYPES = {
+  missing: 'missing', greater_than_equal: 'ge', greater_than: 'gt', less_than_equal: 'le', less_than: 'lt',
+  literal_error: 'choice', enum: 'choice', int_parsing: 'int', int_type: 'int', int_from_float: 'int',
+  float_parsing: 'number', float_type: 'number', bool_parsing: 'bool', bool_type: 'bool',
+  string_too_long: 'text_max', string_too_short: 'text_min', too_long: 'list_max', too_short: 'list_min', json_invalid: 'json',
+};
+/** 錯誤回應的 detail → 給使用者看的文字（一般是後端翻好的句子，422 是欄位清單）。 */
+function errorText(detail) {
+  if (typeof detail === 'string') return detail;
+  if (!Array.isArray(detail)) return detail == null ? '' : JSON.stringify(detail);
+  return detail.map((d) => {
+    const name = [...(d.loc || [])].reverse().find((x) => typeof x === 'string' && !['body', 'query', 'path'].includes(x));
+    const field = name ? (FIELD_LABELS[name] ? t(FIELD_LABELS[name]) : name) : t('valid.value');
+    const c = d.ctx || {};
+    const key = VALID_TYPES[d.type];
+    if (!key) return t('valid.invalid', { field, error: d.msg || d.type || '' });
+    const n = c.ge ?? c.gt ?? c.le ?? c.lt ?? c.max_length ?? c.min_length ?? '';
+    const choices = String(c.expected ?? '').split(/,\s*|\s+or\s+/).join(', ');  // "'a', 'b' or 'c'" → "'a', 'b', 'c'"
+    return t(`valid.${key}`, { field, n, choices });
+  }).join(t('valid.sep'));
+}
+
 let keyPrompt = null;
 async function api(path, { method = 'GET', body, form } = {}) {
   const opts = { method, headers: { 'X-Lang': i18n.lang } };
   if (form) opts.body = form;
   else if (body !== undefined) { opts.body = JSON.stringify(body); opts.headers['Content-Type'] = 'application/json'; }
-  const res = await fetch('/api' + path, opts);
+  let res;
+  try { res = await fetch('/api' + path, opts); } catch (e) {
+    // 伺服器停止或網路中斷：瀏覽器只給英文的 "Failed to fetch"
+    throw Object.assign(new Error(t('common.server_unreachable', { error: e.message })), { status: 0, unreachable: true });
+  }
   if (res.status === 401) { await askApiKey(); return api(path, { method, body, form }); }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
-    try { const j = await res.json(); msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch { /* 非 JSON */ }
+    try { const j = await res.json(); msg = errorText(j.detail) || msg; } catch { /* 非 JSON */ }
     throw Object.assign(new Error(msg), { status: res.status });
   }
   const ct = res.headers.get('content-type') || '';
@@ -133,10 +167,14 @@ function uploadXHR(url, files, paths, onProgress) {
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded, e.total);
     xhr.onload = async () => {
       if (xhr.status === 401) { await askApiKey(); resolve(uploadXHR(url, files, paths, onProgress)); return; }
-      if (xhr.status >= 400) { let m = xhr.statusText; try { m = JSON.parse(xhr.responseText).detail; } catch { /* */ } reject(new Error(m)); return; }
+      if (xhr.status >= 400) {
+        let m = `${xhr.status} ${xhr.statusText}`;
+        try { m = errorText(JSON.parse(xhr.responseText).detail) || m; } catch { /* 非 JSON */ }
+        reject(Object.assign(new Error(m), { status: xhr.status })); return;
+      }
       resolve(JSON.parse(xhr.responseText));
     };
-    xhr.onerror = () => reject(new Error(t('common.network_error')));
+    xhr.onerror = () => reject(Object.assign(new Error(t('common.server_unreachable', { error: t('common.network_error') })), { status: 0, unreachable: true }));
     xhr.send(fd);
   });
 }
@@ -217,6 +255,15 @@ function dropdown(anchor, items) {
     menu.append(b);
   }
   anchor.closest('.dropdown').append(menu);
+  // 選單預設對齊按鈕右緣；超出畫面左右邊時（手機上按鈕在畫面中間或換行）移回畫面內，比畫面寬時縮成畫面寬
+  const vw = document.documentElement.clientWidth, pad = 8;
+  if (menu.offsetWidth > vw - pad * 2) { menu.style.minWidth = '0'; menu.style.width = `${vw - pad * 2}px`; }
+  const r = menu.getBoundingClientRect();
+  const shift = r.left < pad ? pad - r.left : r.right > vw - pad ? vw - pad - r.right : 0;
+  if (shift) {
+    menu.style.left = `${r.left + shift - menu.offsetParent.getBoundingClientRect().left}px`;
+    menu.style.right = 'auto';
+  }
   setTimeout(() => document.addEventListener('click', function off(e) {
     if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener('click', off); }
   }), 0);
@@ -236,27 +283,47 @@ async function loadSystem() {
   renderSysStatus();
 }
 
-function renderSysStatus() {
+/** 右上角的 WD14 / VLM 狀態：dot = 狀態點的 class，text = 顯示文字，help = 說明（VLM 的錯誤訊息等） */
+function sysSummary() {
   const s = state.system;
-  if (!s) return;
   const gpu = s.wd14.available_providers.includes('CUDAExecutionProvider');
   const v = s.vlm;
   const sleeping = !!v.sleep?.sleeping;
+  return [
+    { dot: gpu ? 'ok' : 'warn', text: t(gpu ? 'sys.wd14_gpu' : 'sys.wd14_cpu'), help: t('sys.wd14_title') },
+    { dot: sleeping ? '' : v.available ? 'ok' : v.backend === 'none' ? '' : 'err',
+      text: `VLM · ${v.backend === 'none' ? t('sys.vlm_off') : (v.model || v.backend)}${sleeping ? ` · ${t('vram.sleeping_short')}` : ''}`,
+      help: v.message || '' },
+  ];
+}
+
+// 手機 / 平板（和 style.css 的斷點相同）：右上角只放狀態點和 ▾，狀態文字移到選單裡
+const compactSys = () => window.matchMedia('(max-width: 980px)').matches;
+
+function renderSysStatus() {
+  if (!state.system) return;
+  const sum = sysSummary();
   $('#sysStatus').innerHTML = `
-    <span class="pill" title="${esc(t('sys.wd14_title'))}"><span class="dot ${gpu ? 'ok' : 'warn'}"></span>${esc(t(gpu ? 'sys.wd14_gpu' : 'sys.wd14_cpu'))}</span>
-    <span class="pill" title="${esc(v.message || '')}"><span class="dot ${sleeping ? '' : v.available ? 'ok' : v.backend === 'none' ? '' : 'err'}"></span>
-      VLM · ${esc(v.backend === 'none' ? t('sys.vlm_off') : (v.model || v.backend))}${sleeping ? ` · ${esc(t('vram.sleeping_short'))}` : ''}</span>
-    <span class="dropdown"><button class="pill pill-btn" id="vramBtn" title="${esc(t('vram.button_help'))}">${esc(t('vram.button'))} ▾</button></span>`;
-  $('#vramBtn').onclick = (e) => { e.stopPropagation(); vramMenu(e.currentTarget); };
+    ${sum.map((x) => `<span class="pill sys-full" title="${esc(x.help)}"><span class="dot ${x.dot}"></span>${esc(x.text)}</span>`).join('')}
+    <span class="dropdown"><button class="pill pill-btn" id="vramBtn" title="${esc(t('vram.button_help'))}"><span class="sys-dots" aria-hidden="true">${
+      sum.map((x) => `<span class="dot ${x.dot}"></span>`).join('')}</span><span class="sys-vram">${esc(t('vram.button'))}</span> ▾</button></span>`;
+  $('#vramBtn').onclick = (e) => { e.stopPropagation(); vramMenu(e.currentTarget, compactSys()); };
 }
 
 /* ---------------------------------------------------------------- VRAM：WD14 釋放 / 載入、JoyCaption 休眠 / 喚醒 */
 const gb = (mb) => (mb / 1024).toFixed(1);
 
-async function vramMenu(anchor) {
+async function vramMenu(anchor, withStatus = false) {
   let g;
   try { g = await api('/gpu'); } catch (e) { toast(e.message, 'err'); return; }
   const items = [];
+  if (withStatus && state.system) {  // 精簡版：右上角看不到的 WD14 / VLM 狀態放在選單最上面
+    for (const x of sysSummary()) {
+      items.push({ info: x.text, cls: x.dot });
+      if (x.dot === 'err' && x.help) items.push({ info: x.help });  // VLM 連不上的原因
+    }
+    items.push('-');
+  }
   if (g.memory) items.push({ info: t('vram.memory', { used: gb(g.memory.used_mb), total: gb(g.memory.total_mb) }) });
   const wd = g.wd14.loaded;
   const device = wd.some((m) => m.providers.includes('CUDAExecutionProvider')) ? 'GPU' : 'CPU';
@@ -1369,7 +1436,7 @@ function watchJob(jobId) {
     bar.classList.remove('hidden');
     bar.innerHTML = `<span>${esc(job.message || '')} ${job.done}/${job.total}${job.failed ? esc(t('job.failed_suffix', { n: job.failed })) : ''}</span>
       <div class="progress"><i style="width:${pct}%"></i></div><button class="btn sm" id="cancelJob">${esc(t('common.cancel'))}</button>`;
-    $('#cancelJob').onclick = () => api(`/jobs/${jobId}/cancel`, { method: 'POST' });
+    $('#cancelJob').onclick = () => api(`/jobs/${jobId}/cancel`, { method: 'POST' }).catch((e) => toast(e.message, 'err'));
     ticks++;
     if (job.done !== lastDone && (ticks % 2 === 0 || finished)) { lastDone = job.done; await reloadImages(); refreshEditor(); }
     if (finished) {
@@ -1507,6 +1574,8 @@ function settingsWarnings(s) {
     if ((vlmUsed || vlmTags) && s.vlm_nsfw) out.push(['info', t('settings.cli_nsfw')]);
   }
   if (s.use_vlm && !vlmUsed) out.push(['warn', t('settings.warn_vlm_ignored')]);
+  // 自然語句模式卻沒開 VLM：不會產生句子，沒有句子的圖片 caption 會退回成標籤（build_caption 的 nl or body）
+  if (s.caption_mode === 'natural' && !s.use_vlm) out.push(['warn', t('settings.warn_natural_no_vlm')]);
   if (s.include_rating && !s.use_wd14) out.push(['warn', t('settings.warn_rating_needs_wd14')]);
   if (s.caption_mode === 'natural' && vlmUsed && (s.use_wd14 || vlmTags)) out.push(['info', t('settings.warn_natural_tags_unused')]);
   return out;
@@ -3194,7 +3263,7 @@ function finderRunBar(job = null) {
     const pct = job.total ? (job.done / job.total) * 100 : 0;
     bar.innerHTML = `<div class="row"><span>${esc(job.message || '')} ${job.total ? `${job.done}/${job.total}` : ''}</span><span class="spacer"></span>
       <button class="btn sm" id="fdCancel">${esc(t('common.cancel'))}</button></div><div class="progress"><i style="width:${pct}%"></i></div>`;
-    $('#fdCancel').onclick = () => api(`/jobs/${job.id}/cancel`, { method: 'POST' });
+    $('#fdCancel').onclick = () => api(`/jobs/${job.id}/cancel`, { method: 'POST' }).catch((e) => toast(e.message, 'err'));
     return;
   }
   const wantTags = store.get('finderTags', true);
@@ -4051,10 +4120,15 @@ async function renderGuide(key) {
 }
 
 /* ================================================================ API / MCP */
+// 與 app/mcp_server.py 註冊的工具一致（順序相同）；工具數也從這裡算
 const MCP_TOOLS = [
   'list_profiles', 'get_tagging_guide', 'quick_tag_image', 'list_projects', 'create_project', 'update_project_settings',
-  'add_images_from_urls', 'import_server_folder', 'start_tagging', 'list_captions', 'update_image_caption',
-  'bulk_edit_tags', 'get_tag_stats', 'export_dataset',
+  'get_project', 'add_images_from_urls', 'list_server_import_folders', 'import_server_folder', 'start_tagging',
+  'tag_with_claude_or_codex', 'refine_captions', 'get_job_status', 'list_captions', 'get_image', 'update_image_caption',
+  'detect_white_blocks', 'upscale_images', 'restore_upscaled_images', 'bulk_edit_tags', 'get_tag_stats', 'export_dataset',
+  'get_civitai_training_types', 'prepare_civitai_training', 'get_civitai_preparation', 'submit_civitai_training',
+  'get_local_training_info', 'get_training_project_for_tag_project', 'start_local_training', 'get_local_training',
+  'stop_local_training', 'get_civitai_training', 'list_active_civitai_trainings', 'import_lora_to_a1111',
 ];
 
 function renderApi() {
@@ -4064,13 +4138,14 @@ function renderApi() {
   const snip = (title, code) => `<div class="field"><div class="lbl">${esc(title)}</div><div class="copy-wrap"><pre><code>${esc(code)}</code></pre><button class="btn sm copy" data-copy>${esc(t('common.copy'))}</button></div></div>`;
   const mcpJson = JSON.stringify({ mcpServers: { 'lora-tag-studio': { type: 'http', url: `${o}/mcp`, ...(auth ? { headers: { Authorization: 'Bearer <API_KEY>' } } : {}) } } }, null, 2);
   const mcpRemote = JSON.stringify({ mcpServers: { 'lora-tag-studio': { command: 'npx', args: ['-y', 'mcp-remote', `${o}/mcp`, ...(auth ? ['--header', 'Authorization: Bearer <API_KEY>'] : [])] } } }, null, 2);
+  // 工具表的名稱在底線後可以換行（<wbr>），手機上長名稱不會把表格撐出畫面
   $('#view').innerHTML = `<section class="page">
     <div class="page-head"><h1>${esc(t('api.title'))}</h1><span class="spacer"></span>
       <a class="btn" href="/docs" target="_blank">Swagger UI</a><a class="btn" href="/openapi.json" target="_blank">openapi.json</a><a class="btn" href="/llms.txt" target="_blank">llms.txt</a></div>
     <div class="alert ${auth ? 'info' : 'warn'}" style="margin-bottom:16px">${th(auth ? 'api.auth_on_html' : 'api.auth_off_html')}</div>
     <div class="card-grid">
       <div class="doc"><h2 style="margin-top:0">${esc(t('api.mcp_title'))}</h2>
-        <p>${th('api.mcp_desc_html', { url: `${o}/mcp`, n: 18 })}</p>
+        <p>${th('api.mcp_desc_html', { url: `${o}/mcp`, n: MCP_TOOLS.length })}</p>
         ${snip('Claude Code', `claude mcp add --transport http lora-tag-studio ${o}/mcp${auth ? ' \\\n  --header "Authorization: Bearer <API_KEY>"' : ''}`)}
         ${snip(t('api.mcp_http_clients'), mcpJson)}
         ${snip(t('api.mcp_claude_desktop'), mcpRemote)}
@@ -4091,7 +4166,7 @@ function renderApi() {
       ${snip(t('api.step5'), `curl -OJ "${o}/api/projects/<id>/export?format=civitai"${auth ? ' -H "Authorization: Bearer $API_KEY"' : ''}`)}
     </div>
     <div class="doc" style="margin-top:16px"><h2 style="margin-top:0">${esc(t('api.tools_title'))}</h2>
-      <table><tr><th>${esc(t('api.tool'))}</th><th>${esc(t('api.purpose'))}</th></tr>${MCP_TOOLS.map((n) => `<tr><td class="mono">${n}</td><td>${esc(t(`api.tools.${n}`))}</td></tr>`).join('')}</table>
+      <table><tr><th>${esc(t('api.tool'))}</th><th>${esc(t('api.purpose'))}</th></tr>${MCP_TOOLS.map((n) => `<tr><td class="mono">${n.replace(/_/g, '_<wbr>')}</td><td>${esc(t(`api.tools.${n}`))}</td></tr>`).join('')}</table>
     </div></section>`;
   bindCopy($('#view'));
 }
@@ -4113,7 +4188,7 @@ function initTheme() {
     await loadI18n();
     await loadSystem();
   } catch (e) {
-    $('#view').innerHTML = `<section class="page"><div class="alert err">${esc(t('common.server_unreachable', { error: e.message }))}</div></section>`;
+    $('#view').innerHTML = `<section class="page"><div class="alert err">${esc(e.unreachable ? e.message : t('common.server_unreachable', { error: e.message }))}</div></section>`;
     return;
   }
   window.addEventListener('hashchange', route);

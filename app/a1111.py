@@ -96,12 +96,14 @@ def import_epoch(workflow_id: str, epoch: int, overwrite: bool = False) -> dict[
     notes = ", ".join(f"{k}={params[k]}" for k in ("steps", "epochs", "lr", "networkDim", "networkAlpha", "optimizerType")
                       if params.get(k) is not None)
     preview = next((u for u in ep.get("samples") or [] if not _VIDEO.search(u)), None) or next(iter(ep.get("samples") or []), None)
+    # civitai_runs.ecosystem 存的是訓練類型 id（flux1-dev、wan-2.2…），FORGE_ARCH 以 ecosystem（flux1、wan…）為鍵
+    ecosystem = civitai.TRAINING_TYPES.get(run["ecosystem"], {}).get("ecosystem", run["ecosystem"])
     body = {
         "url": ep["url"],
         "filename": f"{_slug(trigger or project['name'])}_{_run_tag(workflow_id)}_e{epoch:02d}",
         "subfolder": settings.a1111_lora_subfolder,
         "activation_text": trigger,
-        "sd_version": FORGE_ARCH.get(run["ecosystem"], "Unknown"),
+        "sd_version": FORGE_ARCH.get(ecosystem, "Unknown"),
         "description": t("msg.a1111_description", project=project["name"], epoch=epoch, total=total, id=workflow_id),
         "notes": notes,
         "preview_url": preview,

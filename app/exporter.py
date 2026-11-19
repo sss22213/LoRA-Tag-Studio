@@ -6,6 +6,7 @@ import json
 import re
 import time
 import unicodedata
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any, Callable
@@ -97,8 +98,21 @@ def _training_readme(project: dict[str, Any], s: dict[str, Any], n: int, fmt: st
 def cleanup_exports(max_age_s: int = 6 * 3600) -> None:
     now = time.time()
     for f in settings.exports_dir.glob("*.zip"):
-        if now - f.stat().st_mtime > max_age_s:
-            f.unlink(missing_ok=True)
+        try:
+            if now - f.stat().st_mtime > max_age_s:
+                f.unlink(missing_ok=True)
+        except FileNotFoundError:  # 同時匯出時另一個請求已經刪掉了
+            pass
+
+
+def unique_zip_name(prefix: str) -> str:
+    """匯出 zip 的檔名：時間只到秒，同一秒內的兩次匯出（連點、MCP 與網頁同時）再加亂數，不會互相覆蓋。"""
+    return f"{prefix}_{time.strftime('%Y%m%d-%H%M%S')}_{uuid.uuid4().hex[:8]}.zip"
+
+
+def _folder_part(text: str) -> str:
+    """kohya 資料夾名稱裡的 trigger / class_word：/ 和 \\ 換掉，zip 裡不會多出路徑層級或 .. 區段。"""
+    return re.sub(r"[/\\]+", "_", text)
 
 
 def dataset_images(project_id: str, only_done: bool = False) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]],
@@ -143,12 +157,13 @@ def export_dataset(
 
     settings.exports_dir.mkdir(parents=True, exist_ok=True)
     cleanup_exports()
-    zip_name = f"{slugify(project['name'], project_id)}_{fmt}_{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    zip_name = unique_zip_name(f"{slugify(project['name'], project_id)}_{fmt}")
     out = settings.exports_dir / zip_name
 
     trigger = s["trigger"] or slugify(project["name"], "lora")
     class_word = s["class_word"] or {"character": "person", "style": "style", "concept": "concept"}[s["lora_type"]]
-    folder = {"civitai": "", "kohya": f"img/{max(1, repeats)}_{trigger} {class_word}/", "jsonl": "train/"}[fmt]
+    kohya_dir = f"{max(1, repeats)}_{_folder_part(trigger)} {_folder_part(class_word)}"
+    folder = {"civitai": "", "kohya": f"img/{kohya_dir}/", "jsonl": "train/"}[fmt]
 
     used: set[str] = set()
     meta_lines = []

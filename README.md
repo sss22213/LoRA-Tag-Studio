@@ -257,7 +257,7 @@ The "VRAM ▾" button in the top-right corner frees the VRAM held by the local m
 - Ollama unloads its model by itself after `OLLAMA_KEEP_ALIVE` (default 10 minutes) and cannot be put to sleep from here.
 - The menu also shows the GPU's total VRAM use (all programs) when `nvidia-smi` is available.
 - **CCIP** (character finder): loaded only while a search runs and freed automatically.
-- API: `GET /api/gpu`, `POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip}`, `PATCH /api/gpu` (`vlm_sleep_level`: 1 or 2).
+- API: `GET /api/gpu`, `POST /api/gpu/{release_wd14|load_wd14|sleep_vlm|wake_vlm|release_waifu2x|release_ccip|unload_forge}` (`unload_forge` moves Forge's checkpoint out of VRAM, needs `A1111_URL`), `PATCH /api/gpu` (`vlm_sleep_level`: 1 or 2).
 
 ## Civitai cloud training
 
@@ -394,7 +394,7 @@ claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
 { "mcpServers": { "lora-tag-studio": { "type": "http", "url": "http://localhost:7870/mcp" } } }
 ```
 
-30 tools:
+35 tools:
 
 | Area | Tools |
 |---|---|
@@ -404,6 +404,7 @@ claude mcp add --transport http lora-tag-studio http://localhost:7870/mcp
 | Upscaling | `upscale_images`, `restore_upscaled_images` |
 | Export | `export_dataset` |
 | Civitai training | `get_civitai_training_types`, `prepare_civitai_training`, `get_civitai_preparation`, `submit_civitai_training`, `get_civitai_training`, `list_active_civitai_trainings`, `import_lora_to_a1111` |
+| Local training | `get_local_training_info`, `get_training_project_for_tag_project`, `start_local_training`, `get_local_training`, `stop_local_training` |
 
 ### REST / OpenAPI
 
@@ -451,6 +452,8 @@ When `API_KEY` is set, every `/api` and `/mcp` request needs `Authorization: Bea
 | `CLAUDE_CREDS_DIR` / `CODEX_CREDS_DIR` | – | Host folders of your logged-in Claude Code / Codex (`/home/<you>/.claude`, `/home/<you>/.codex`), see [Claude / Codex](#claude--codex-your-subscription) |
 | `CLAUDE_MODELS` / `CODEX_MODELS` / `CLI_EFFORT` | `sonnet,opus,haiku,fable` / from Codex's model list / `low` | Models offered for Claude / Codex and their reasoning effort |
 | `ALLOW_PRIVATE_URLS` | `0` | Allow private network addresses in "Import from URL" (off to prevent SSRF) |
+| `MAX_UPLOAD_MB` | `2048` | Largest single uploaded file in MB (a zip counts as one file; any number of files per upload; `0` = no limit) |
+| `AITOOLKIT_URL` | `http://aitoolkit:8675` in Docker Compose, empty otherwise | Local training: address of the AI Toolkit service. Without Docker it must be set (for example `http://localhost:8675`), otherwise the Training page always says it is not set up |
 | `AI_TOOLKIT_AUTH` | empty | Local training: password between LoRA Tag Studio and AI Toolkit, required with the `aitoolkit` profile |
 | `AITOOLKIT_BASE_MODELS_DIR` | `./data/aitoolkit/base-models` | Checkpoint folder for local training (Forge's `models/Stable-diffusion`) |
 | `AITOOLKIT_GPU` | `0` | GPU used for local training |
