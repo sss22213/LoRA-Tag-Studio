@@ -7,7 +7,9 @@ A1111_URL 沒設定時不顯示這個功能。
 """
 from __future__ import annotations
 
+import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,7 @@ import httpx
 
 from . import civitai, db
 from .config import settings
-from .i18n import t
+from .i18n import get_lang, t, use_lang
 from .services import BadRequest, NotFound
 
 # Civitai 訓練的 ecosystem → Forge 的底模類型（卡片的 "sd version"，Forge 用來依預設篩選 LoRA）
@@ -24,7 +26,11 @@ FORGE_ARCH = {"sd1": "sd", "sdxl": "xl", "flux1": "flux", "flux2klein": "klein",
               "zimageturbo": "zit", "zimagebase": "zit", "wan": "wan", "anima": "anima", "ernie": "ernie",
               "krea2": "krea"}
 _VIDEO = re.compile(r"\.(mp4|webm)(\?|$)", re.IGNORECASE)
+log = logging.getLogger(__name__)
 _status_cache: dict[str, Any] = {"at": 0.0, "value": None}
+_status_lock = threading.Lock()
+_status_refreshing = False
+STATUS_CONNECT_S = 3  # 檢查 Forge 狀態時的連線逾時：Forge 沒開、封包被丟掉時不要等 15 秒
 
 
 class A1111Error(BadRequest):
@@ -39,20 +45,52 @@ def configured() -> bool:
     return bool(settings.a1111_url)
 
 
-def _client(read_timeout: float = 30) -> httpx.Client:
+def _client(read_timeout: float = 30, connect_timeout: float = 15) -> httpx.Client:
     auth = tuple(settings.a1111_api_auth.split(":", 1)) if ":" in settings.a1111_api_auth else None
-    return httpx.Client(base_url=settings.a1111_url, timeout=httpx.Timeout(15, read=read_timeout), auth=auth)
+    return httpx.Client(base_url=settings.a1111_url, timeout=httpx.Timeout(15, connect=connect_timeout, read=read_timeout),
+                        auth=auth)
 
 
-def status(max_age: float = 30) -> dict[str, Any]:
-    """Forge 連得上、而且有匯入 API 嗎（結果暫存 max_age 秒）。"""
+def status(max_age: float = 30, wait: bool = True) -> dict[str, Any]:
+    """Forge 連得上、而且有匯入 API 嗎（結果暫存 max_age 秒）。
+    wait=False（VRAM 選單）：暫存過期時直接回上一次的結果，在背景重新檢查，選單不用等 Forge 回應或逾時。"""
     if not configured():
         return {"configured": False}
-    if _status_cache["value"] is not None and time.time() - _status_cache["at"] < max_age:
-        return _status_cache["value"]
+    cached = _status_cache["value"]
+    if cached is not None and time.time() - _status_cache["at"] < max_age:
+        return cached
+    if cached is not None and not wait:
+        _refresh_status_in_background()
+        return cached
+    return _check_status()
+
+
+def _refresh_status_in_background() -> None:
+    """同一時間只跑一個背景檢查。"""
+    global _status_refreshing
+    with _status_lock:
+        if _status_refreshing:
+            return
+        _status_refreshing = True
+    lang = get_lang()  # 錯誤訊息用觸發檢查的請求的語言（和原本在請求裡檢查時一樣）
+
+    def run() -> None:
+        global _status_refreshing
+        try:
+            with use_lang(lang):
+                _check_status()
+        except Exception:  # noqa: BLE001  背景檢查失敗不影響畫面，下次再查
+            log.exception("檢查 Forge 狀態失敗")
+        finally:
+            _status_refreshing = False
+
+    threading.Thread(target=run, name="forge-status", daemon=True).start()
+
+
+def _check_status() -> dict[str, Any]:
     out: dict[str, Any] = {"configured": True, "url": settings.a1111_url, "subfolder": settings.a1111_lora_subfolder}
     try:
-        with _client(10) as c:
+        with _client(10, connect_timeout=STATUS_CONNECT_S) as c:
             r = c.get("/sdapi/v1/lora/import")
         if r.status_code == 200:
             out.update(available=True, lora_dir=r.json().get("lora_dir"))

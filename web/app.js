@@ -300,22 +300,43 @@ function sysSummary() {
 // 手機 / 平板（和 style.css 的斷點相同）：右上角只放狀態點和 ▾，狀態文字移到選單裡
 const compactSys = () => window.matchMedia('(max-width: 980px)').matches;
 
+// 狀態每 15 / 60 秒更新一次：只改有變的地方，VRAM 按鈕和它的選單不重建。
+// 重建的話，剛好在按的那一下會落空，正在等 /gpu 的選單會掛在已經被換掉的按鈕上而不出現，打開的選單也會不見
+let sysPills = '';
 function renderSysStatus() {
   if (!state.system) return;
   const sum = sysSummary();
-  $('#sysStatus').innerHTML = `
-    ${sum.map((x) => `<span class="pill sys-full" title="${esc(x.help)}"><span class="dot ${x.dot}"></span>${esc(x.text)}</span>`).join('')}
-    <span class="dropdown"><button class="pill pill-btn" id="vramBtn" title="${esc(t('vram.button_help'))}"><span class="sys-dots" aria-hidden="true">${
-      sum.map((x) => `<span class="dot ${x.dot}"></span>`).join('')}</span><span class="sys-vram">${esc(t('vram.button'))}</span> ▾</button></span>`;
-  $('#vramBtn').onclick = (e) => { e.stopPropagation(); vramMenu(e.currentTarget, compactSys()); };
+  const box = $('#sysStatus');
+  let btn = $('#vramBtn');
+  if (!btn) {
+    box.innerHTML = `<span class="dropdown"><button class="pill pill-btn" id="vramBtn"><span class="sys-dots" aria-hidden="true">${
+      sum.map(() => '<span class="dot"></span>').join('')}</span><span class="sys-vram"></span> ▾</button></span>`;
+    sysPills = '';
+    btn = $('#vramBtn');
+    btn.onclick = (e) => { e.stopPropagation(); vramMenu(e.currentTarget, compactSys()); };
+  }
+  const pills = sum.map((x) => `<span class="pill sys-full" title="${esc(x.help)}"><span class="dot ${x.dot}"></span>${esc(x.text)}</span>`).join('');
+  if (pills !== sysPills) {
+    box.querySelectorAll('.sys-full').forEach((n) => n.remove());
+    btn.closest('.dropdown').insertAdjacentHTML('beforebegin', pills);
+    sysPills = pills;
+  }
+  // 按鈕裡的元素不換掉，只改狀態點的 class 和文字：按下去的瞬間狀態剛好變了，這一下也不會落空
+  btn.querySelectorAll('.sys-dots .dot').forEach((d, i) => { d.className = `dot ${sum[i]?.dot || ''}`.trim(); });
+  btn.querySelector('.sys-vram').textContent = t('vram.button');
+  btn.title = t('vram.button_help');
 }
 
 /* ---------------------------------------------------------------- VRAM：WD14 釋放 / 載入、JoyCaption 休眠 / 喚醒 */
 const gb = (mb) => (mb / 1024).toFixed(1);
 
 async function vramMenu(anchor, withStatus = false) {
+  if (anchor.classList.contains('loading')) return;  // 還在讀取：連按不重複送
+  anchor.classList.add('loading');  // 讀取中的游標，按下去馬上看得到有反應
   let g;
-  try { g = await api('/gpu'); } catch (e) { toast(e.message, 'err'); return; }
+  try { g = await api('/gpu'); } catch (e) { toast(e.message, 'err'); return; } finally { anchor.classList.remove('loading'); }
+  if (!anchor.isConnected) anchor = $('#vramBtn');  // 讀取時標題列被重畫過（例如切換語言）
+  if (!anchor) return;
   const items = [];
   if (withStatus && state.system) {  // 精簡版：右上角看不到的 WD14 / VLM 狀態放在選單最上面
     for (const x of sysSummary()) {

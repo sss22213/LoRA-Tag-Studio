@@ -561,7 +561,8 @@ def gpu_status() -> dict[str, Any]:
     from .tagging.wd14 import loaded_models
 
     return {
-        "forge": a1111.status() if a1111.configured() else {"configured": False},
+        # 不等 Forge：連不上時檢查要等到逾時，VRAM 選單會好幾秒打不開
+        "forge": a1111.status(wait=False) if a1111.configured() else {"configured": False},
         "wd14": {"loaded": loaded_models(), "default_model": settings.wd14_default_model},
         "waifu2x": {"loaded": upscale.loaded_models()},
         "ccip": {"loaded": finder.loaded_models()},
